@@ -7,10 +7,9 @@ const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
 
 function describe(selection: Selection | undefined, model: ExtensionContext["model"]): string {
-  if (!selection) return "none (Pi's default prompt)";
-  if (selection.source === "session") return `${selection.name} (chosen for this session)`;
-  if (selection.source === "model") return `${selection.name} (modelSouls for ${model?.provider}/${model?.id})`;
-  return `${selection.name} (defaultSoul)`;
+  if (!selection) return "none";
+  if (selection.source === "model") return `${selection.name} (${model?.provider}/${model?.id})`;
+  return `${selection.name} (${selection.source})`;
 }
 
 export default function soulsExtension(pi: ExtensionAPI) {
@@ -19,11 +18,11 @@ export default function soulsExtension(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => { cwd = ctx.cwd; });
 
   pi.registerCommand("soul", {
-    description: "Switch persona: /soul <name> for this session, /soul clear to follow defaults, /soul to list",
+    description: "Switch soul: /soul [name|clear]",
     getArgumentCompletions: (prefix) => {
       try {
         const souls = listSouls(readConfig(pi.getSettings(), cwd).dir).map((name) => ({ value: name, label: name }));
-        const items = [...souls, { value: "clear", label: "clear", description: "Drop the session soul, follow modelSouls / defaultSoul" }];
+        const items = [...souls, { value: "clear", label: "clear", description: "Follow defaults" }];
         const matches = items.filter((item) => item.value.startsWith(prefix.trim()));
         return matches.length ? matches : null;
       } catch {
@@ -33,7 +32,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const notify = (text: string) => ctx.ui.notify(text, "info");
       if (!ctx.isIdle()) {
-        ctx.ui.notify("Souls can't change mid-run. Try again once the agent is idle.", "warning");
+        ctx.ui.notify("Busy. Switch souls after this run.", "warning");
         return;
       }
       try {
@@ -45,30 +44,30 @@ export default function soulsExtension(pi: ExtensionAPI) {
         if (name === "clear") {
           let selected = true; // A corrupted selection counts as something to clear.
           try { selected = override() !== undefined; } catch {}
-          if (!selected) return notify(`No session soul to clear. Soul: ${now()}`);
+          if (!selected) return notify(`No session soul. Soul: ${now()}`);
           pi.appendEntry(ENTRY_TYPE, { version: 1, name: null });
-          return notify(`Session soul cleared. Soul: ${now()}`);
+          return notify(`Cleared. Soul: ${now()}`);
         }
 
         const available = listSouls(config.dir);
         if (name) {
-          if (override() === name) return notify(`Already using ${name} for this session.`);
+          if (override() === name) return notify(`Already ${name}.`);
           if (!available.includes(name)) {
-            throw new Error(`No soul named "${name}" in ${tilde(config.dir)}. Available: ${available.join(", ") || "none"}`);
+            throw new Error(`No soul "${name}". Souls: ${available.join(", ") || "none"}`);
           }
           loadSoul(config.dir, name); // Validate content before changing durable session state.
           pi.appendEntry(ENTRY_TYPE, { version: 1, name });
-          return notify(`Soul set to ${name} for this session.`);
+          return notify(`Soul: ${name}`);
         }
 
         const selection = resolveSoul(config, override(), ctx.model);
-        const missing = selection && !available.includes(selection.name) ? " (file not found)" : "";
+        const missing = selection && !available.includes(selection.name) ? " (missing)" : "";
         const ignored = unmatchableModelKeys(config);
         notify([
           `Soul: ${describe(selection, ctx.model)}${missing}`,
-          `Available: ${available.join(", ") || "none"}`,
-          `Folder: ${tilde(config.dir)}`,
-          ...(ignored.length ? [`Ignored modelSouls keys (need provider/modelId): ${ignored.join(", ")}`] : []),
+          `Souls: ${available.join(", ") || "none"}`,
+          `Dir: ${tilde(config.dir)}`,
+          ...(ignored.length ? [`Ignored keys: ${ignored.join(", ")}`] : []),
         ].join("\n"));
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");

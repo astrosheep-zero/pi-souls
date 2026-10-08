@@ -24,10 +24,10 @@ function object(value: unknown): value is Record<string, unknown> {
 
 /** Only the shape is checked here; soul names are checked when used, so one bad entry never disables the rest. */
 export function readConfig(settings: unknown, cwd: string): SoulConfig {
-  if (!object(settings)) throw new Error("Pi settings are not an object");
+  if (!object(settings)) throw new Error("Invalid Pi settings");
   const { defaultSoul, modelSouls = {}, soulsDir = "~/.agents/souls" } = settings;
-  if (!object(modelSouls)) throw new Error('modelSouls must be an object like { "provider/modelId": "soul" }');
-  if (typeof soulsDir !== "string" || !soulsDir.trim()) throw new Error("soulsDir must be a directory path");
+  if (!object(modelSouls)) throw new Error("modelSouls must be an object");
+  if (typeof soulsDir !== "string" || !soulsDir.trim()) throw new Error("soulsDir must be a path");
   const dir = soulsDir === "~" || soulsDir.startsWith("~/") ? join(homedir(), soulsDir.slice(2)) : resolve(cwd, soulsDir);
   return { defaultSoul, modelSouls, dir };
 }
@@ -43,7 +43,7 @@ export function sessionSoul(branch: readonly SessionEntry[]): string | undefined
     const entry = branch[i];
     if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
     if (!object(entry.data) || entry.data.version !== 1 || !(entry.data.name === null || isSoulName(entry.data.name))) {
-      throw new Error("This session has a corrupted soul selection; run /soul clear to reset it");
+      throw new Error("Corrupted soul entry. Run /soul clear");
     }
     return entry.data.name ?? undefined;
   }
@@ -51,7 +51,7 @@ export function sessionSoul(branch: readonly SessionEntry[]): string | undefined
 }
 
 function named(name: unknown, source: Selection["source"], setting: string): Selection {
-  if (!isSoulName(name)) throw new Error(`${setting} must be a soul file name, got ${JSON.stringify(name)}`);
+  if (!isSoulName(name)) throw new Error(`${setting}: invalid soul ${JSON.stringify(name)}`);
   return { name, source };
 }
 
@@ -80,10 +80,10 @@ export function loadSoul(dir: string, name: string): string {
   try {
     text = readFileSync(path, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Soul "${name}" not found: ${path} does not exist`);
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Soul "${name}" not found: ${path}`);
     throw error;
   }
   const body = stripFrontmatter(text).trim();
-  if (!body) throw new Error(`Soul "${name}" is empty: ${path}`);
+  if (!body) throw new Error(`Soul "${name}" is empty`);
   return body;
 }

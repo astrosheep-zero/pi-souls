@@ -65,7 +65,7 @@ test("projection replaces identity only, including old deltas, without mutating 
     assert.ok(before.role === "system" && after.role === "system");
     assert.deepEqual(after, { ...before, sections: { ...before.sections, preamble: "Faye" } });
   }
-  assert.throws(() => applySoul([{ role: "system", content: "opaque", timestamp: 0 }], "Faye"), /structured/);
+  assert.throws(() => applySoul([{ role: "system", content: "opaque", timestamp: 0 }], "Faye"), /fully replaced/);
 });
 
 test("registered command persists selection, refuses missing files, skips no-ops, and completes names", async () => {
@@ -96,11 +96,11 @@ test("registered command persists selection, refuses missing files, skips no-ops
     const afterSelect = entries();
     await command.handler("faye", ctx);
     assert.equal(entries(), afterSelect);
-    assert.match(notices.at(-1)!, /Already using faye/);
+    assert.match(notices.at(-1)!, /Already faye/);
 
     await command.handler("missing", ctx);
     assert.equal(sessionSoul(session.getBranch()), "faye");
-    assert.match(notices.at(-1)!, /No soul named "missing".*Available: faye/);
+    assert.match(notices.at(-1)!, /No soul "missing". Souls: faye/);
     assert.ok(project({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx));
 
     await command.handler("clear", ctx);
@@ -108,12 +108,12 @@ test("registered command persists selection, refuses missing files, skips no-ops
     const afterClear = entries();
     await command.handler("clear", ctx);
     assert.equal(entries(), afterClear);
-    assert.match(notices.at(-1)!, /No session soul to clear/);
+    assert.match(notices.at(-1)!, /No session soul/);
     assert.equal(project({ messages: [] }, ctx), undefined);
 
     session.appendCustomEntry(ENTRY_TYPE, { version: 99 });
     await command.handler("", ctx);
-    assert.match(notices.at(-1)!, /corrupted.*\/soul clear/);
+    assert.match(notices.at(-1)!, /Corrupted.*\/soul clear/);
     await command.handler("clear", ctx);
     assert.equal(sessionSoul(session.getBranch()), undefined);
   } finally { rmSync(dir, { recursive: true, force: true }); }
