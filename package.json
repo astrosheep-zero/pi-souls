@@ -1,0 +1,23 @@
+{
+  "name": "@astrosheep/pi-souls",
+  "version": "0.1.0",
+  "description": "Session souls with model-specific defaults for Pi",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "publishConfig": { "access": "public" },
+  "files": ["src", "README.md"],
+  "pi": { "extensions": ["./src/index.ts"] },
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check:load": "pi --no-extensions -e ./src/index.ts --list-models __load_check__"
+  },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "@earendil-works/pi-agent-core": "*" },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-agent-core": "1.1.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^6.0.3"
+  }
+}
