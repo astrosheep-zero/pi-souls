@@ -1,13 +1,13 @@
 import { homedir } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { applySoul } from "./prompt.ts";
-import { ENTRY_TYPE, listSouls, loadSoul, readConfig, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection } from "./souls.ts";
+import { ENTRY_TYPE, effectiveSoul, listSouls, loadSoul, readConfig, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection } from "./souls.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
 
-function describe(selection: Selection | undefined, model: ExtensionContext["model"]): string {
-  if (!selection) return "none";
+function describe(selection: Selection | undefined, model: ExtensionContext["model"], suppressed = false): string {
+  if (!selection) return suppressed ? "none (custom prompt)" : "none";
   if (selection.source === "model") return `${selection.name} (${model?.provider}/${model?.id})`;
   return `${selection.name} (${selection.source})`;
 }
@@ -16,6 +16,9 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // Argument completion has no context; remember where the session runs for relative soulsDir.
   let cwd = process.cwd();
   pi.on("session_start", (_event, ctx) => { cwd = ctx.cwd; });
+  // context_with_system cannot read prompt options; before_agent_start can, and runs first.
+  let customPrompt: string | undefined;
+  pi.on("before_agent_start", (event) => { customPrompt = event.systemPromptOptions.customPrompt; });
 
   pi.registerCommand("soul", {
     description: "Switch soul: /soul [name|clear]",
@@ -38,8 +41,14 @@ export default function soulsExtension(pi: ExtensionAPI) {
       try {
         const name = args.trim();
         const config = readConfig(pi.getSettings(), ctx.cwd);
+        const prompt = ctx.getSystemPromptOptions().customPrompt;
         const override = () => sessionSoul(ctx.sessionManager.getBranch());
-        const now = () => describe(resolveSoul(config, override(), ctx.model), ctx.model);
+        const resolved = () => resolveSoul(config, override(), ctx.model);
+        const now = () => {
+          const configured = resolved();
+          const active = effectiveSoul(configured, prompt);
+          return describe(active, ctx.model, active === undefined && configured !== undefined);
+        };
 
         if (name === "clear") {
           let selected = true; // A corrupted selection counts as something to clear.
@@ -60,11 +69,12 @@ export default function soulsExtension(pi: ExtensionAPI) {
           return notify(`Soul: ${name}`);
         }
 
-        const selection = resolveSoul(config, override(), ctx.model);
+        const configured = resolved();
+        const selection = effectiveSoul(configured, prompt);
         const missing = selection && !available.includes(selection.name) ? " (missing)" : "";
         const ignored = unmatchableModelKeys(config);
         notify([
-          `Soul: ${describe(selection, ctx.model)}${missing}`,
+          `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined)}${missing}`,
           `Souls: ${available.join(", ") || "none"}`,
           `Dir: ${tilde(config.dir)}`,
           ...(ignored.length ? [`Ignored keys: ${ignored.join(", ")}`] : []),
@@ -77,7 +87,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
 
   pi.on("context_with_system", (event, ctx) => {
     const config = readConfig(pi.getSettings(), ctx.cwd);
-    const selection = resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model);
+    const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model), customPrompt);
     if (!selection) return;
     return { messages: applySoul(event.messages, loadSoul(config.dir, selection.name)) };
   });

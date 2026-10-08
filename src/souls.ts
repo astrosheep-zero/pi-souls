@@ -63,6 +63,11 @@ export function resolveSoul(config: SoulConfig, override: string | undefined, mo
   return undefined;
 }
 
+/** A settings soul is only a default: the user's explicit system prompt outranks it, a session choice does not. */
+export function effectiveSoul(selection: Selection | undefined, customPrompt: string | undefined): Selection | undefined {
+  return selection?.source === "session" || !customPrompt ? selection : undefined;
+}
+
 export function listSouls(dir: string): string[] {
   try {
     return readdirSync(dir).filter((file) => file.endsWith(".md")).map((file) => file.slice(0, -3)).filter(isSoulName).sort();

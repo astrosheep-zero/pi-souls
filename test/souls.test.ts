@@ -7,7 +7,7 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earen
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
 import { applySoul } from "../src/prompt.ts";
-import { ENTRY_TYPE, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, unmatchableModelKeys } from "../src/souls.ts";
+import { ENTRY_TYPE, effectiveSoul, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, unmatchableModelKeys } from "../src/souls.ts";
 
 const model = { provider: "provider", id: "model" };
 const config = readConfig({ defaultSoul: "global", modelSouls: { "provider/model": "specific" } }, "/tmp");
@@ -83,7 +83,7 @@ test("registered command persists selection, refuses missing files, skips no-ops
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
-    const ctx = { cwd: dir, model, sessionManager: session, isIdle: () => true, ui: { notify: (text: string) => notices.push(text) } } as unknown as ExtensionContext;
+    const ctx = { cwd: dir, model, sessionManager: session, isIdle: () => true, getSystemPromptOptions: () => ({ cwd: dir }), ui: { notify: (text: string) => notices.push(text) } } as unknown as ExtensionContext;
     const project = handlers.get("context_with_system")!;
     const entries = () => session.getBranch().length;
 
@@ -116,5 +116,54 @@ test("registered command persists selection, refuses missing files, skips no-ops
     assert.match(notices.at(-1)!, /Corrupted.*\/soul clear/);
     await command.handler("clear", ctx);
     assert.equal(sessionSoul(session.getBranch()), undefined);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("customPrompt keeps settings souls off, leaves the session choice and status truthful", async () => {
+  assert.equal(effectiveSoul({ name: "global", source: "default" }, "My prompt"), undefined);
+  assert.deepEqual(effectiveSoul({ name: "faye", source: "session" }, "My prompt"), { name: "faye", source: "session" });
+  assert.deepEqual(effectiveSoul({ name: "global", source: "default" }, undefined), { name: "global", source: "default" });
+
+  const dir = mkdtempSync(join(tmpdir(), "souls-prompt-"));
+  try {
+    writeFileSync(join(dir, "faye.md"), "Faye");
+    writeFileSync(join(dir, "global.md"), "Global");
+    const session = SessionManager.inMemory();
+    const notices: string[] = [];
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
+    const pi = {
+      getSettings: () => ({ soulsDir: dir, defaultSoul: "global" }),
+      appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
+      registerCommand: (_name: string, registered: typeof command) => { command = registered; },
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
+    } as unknown as ExtensionAPI;
+    extension(pi);
+    const options = { cwd: dir, customPrompt: "My prompt" };
+    const ctx = {
+      cwd: dir, model, sessionManager: session, isIdle: () => true,
+      getSystemPromptOptions: () => ({ cwd: dir, customPrompt: options.customPrompt }),
+      ui: { notify: (text: string) => notices.push(text) },
+    } as unknown as ExtensionContext;
+    const start = handlers.get("before_agent_start")!;
+    const project = handlers.get("context_with_system")!;
+    const system = (): AgentMessage[] => [{ role: "system", content: "", sections: { preamble: "My prompt" }, timestamp: 0 }];
+
+    start({ systemPromptOptions: { cwd: dir, customPrompt: options.customPrompt } }, ctx);
+    assert.equal(project({ messages: system() }, ctx), undefined);
+    await command.handler("", ctx);
+    assert.match(notices.at(-1)!, /Soul: none \(custom prompt\)/);
+    assert.match(notices.at(-1)!, /Souls: faye, global/);
+
+    await command.handler("faye", ctx);
+    const applied = project({ messages: system() }, ctx) as { messages: AgentMessage[] };
+    assert.deepEqual(applied.messages[0], { ...system()[0], sections: { preamble: "Faye" } });
+
+    options.customPrompt = "";
+    start({ systemPromptOptions: { cwd: dir, customPrompt: options.customPrompt } }, ctx);
+    await command.handler("clear", ctx);
+    assert.match(notices.at(-1)!, /Soul: global \(default\)/);
+    const fallback = project({ messages: system() }, ctx) as { messages: AgentMessage[] };
+    assert.equal((fallback.messages[0] as { sections: Record<string, string> }).sections.preamble, "Global");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
