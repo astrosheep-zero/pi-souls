@@ -5,8 +5,8 @@ import { stripFrontmatter, type SessionEntry } from "@earendil-works/pi-coding-a
 
 export const ENTRY_TYPE = "pi-souls:selection";
 export interface SoulConfig {
-  defaultSoul?: string;
-  modelSouls: Record<string, string>;
+  defaultSoul?: unknown;
+  modelSouls: Record<string, unknown>;
   dir: string;
 }
 export interface Selection {
@@ -22,16 +22,19 @@ function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Only the shape is checked here; soul names are checked when used, so one bad entry never disables the rest. */
 export function readConfig(settings: unknown, cwd: string): SoulConfig {
-  if (!object(settings)) throw new Error("Invalid Pi settings");
+  if (!object(settings)) throw new Error("Pi settings are not an object");
   const { defaultSoul, modelSouls = {}, soulsDir = "~/.agents/souls" } = settings;
-  if (defaultSoul !== undefined && !isSoulName(defaultSoul)) throw new Error("defaultSoul must be a soul name");
-  if (!object(modelSouls) || Object.entries(modelSouls).some(([key, value]) => !/^[^/]+\/.+$/.test(key) || !isSoulName(value))) {
-    throw new Error("modelSouls must map exact provider/modelId keys to soul names");
-  }
+  if (!object(modelSouls)) throw new Error('modelSouls must be an object like { "provider/modelId": "soul" }');
   if (typeof soulsDir !== "string" || !soulsDir.trim()) throw new Error("soulsDir must be a directory path");
-  const dir = soulsDir.startsWith("~/") ? join(homedir(), soulsDir.slice(2)) : resolve(cwd, soulsDir);
-  return { defaultSoul, modelSouls: modelSouls as Record<string, string>, dir };
+  const dir = soulsDir === "~" || soulsDir.startsWith("~/") ? join(homedir(), soulsDir.slice(2)) : resolve(cwd, soulsDir);
+  return { defaultSoul, modelSouls, dir };
+}
+
+/** Keys that can never match a model; surfaced by /soul instead of failing every request. */
+export function unmatchableModelKeys(config: SoulConfig): string[] {
+  return Object.keys(config.modelSouls).filter((key) => !/^[^/]+\/.+$/.test(key));
 }
 
 /** Read the active branch, never the whole session file or a second in-memory authority. */
@@ -40,26 +43,29 @@ export function sessionSoul(branch: readonly SessionEntry[]): string | undefined
     const entry = branch[i];
     if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
     if (!object(entry.data) || entry.data.version !== 1 || !(entry.data.name === null || isSoulName(entry.data.name))) {
-      throw new Error("Invalid soul selection in session branch");
+      throw new Error("This session has a corrupted soul selection; run /soul clear to reset it");
     }
     return entry.data.name ?? undefined;
   }
   return undefined;
 }
 
+function named(name: unknown, source: Selection["source"], setting: string): Selection {
+  if (!isSoulName(name)) throw new Error(`${setting} must be a soul file name, got ${JSON.stringify(name)}`);
+  return { name, source };
+}
+
 export function resolveSoul(config: SoulConfig, override: string | undefined, model?: { provider: string; id: string }): Selection | undefined {
   if (override) return { name: override, source: "session" };
-  const modelSoul = model && config.modelSouls[`${model.provider}/${model.id}`];
-  if (modelSoul) return { name: modelSoul, source: "model" };
-  if (config.defaultSoul) return { name: config.defaultSoul, source: "default" };
+  const key = model && `${model.provider}/${model.id}`;
+  if (key && Object.hasOwn(config.modelSouls, key)) return named(config.modelSouls[key], "model", `modelSouls["${key}"]`);
+  if (config.defaultSoul !== undefined) return named(config.defaultSoul, "default", "defaultSoul");
   return undefined;
 }
 
 export function listSouls(dir: string): string[] {
   try {
-    return readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".md"))
-      .map((entry) => entry.name.slice(0, -3)).filter(isSoulName).sort();
+    return readdirSync(dir).filter((file) => file.endsWith(".md")).map((file) => file.slice(0, -3)).filter(isSoulName).sort();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
@@ -70,7 +76,14 @@ export function listSouls(dir: string): string[] {
 export function loadSoul(dir: string, name: string): string {
   if (!isSoulName(name)) throw new Error(`Invalid soul name: ${name}`);
   const path = join(dir, `${name}.md`);
-  const body = stripFrontmatter(readFileSync(path, "utf8")).trim();
-  if (!body) throw new Error(`Soul file is empty: ${path}`);
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Soul "${name}" not found: ${path} does not exist`);
+    throw error;
+  }
+  const body = stripFrontmatter(text).trim();
+  if (!body) throw new Error(`Soul "${name}" is empty: ${path}`);
   return body;
 }

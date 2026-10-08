@@ -1,32 +1,38 @@
 # pi-souls
 
-Persona ("soul") switching for [Pi](https://github.com/earendil-works/pi): swap the identity section of the system prompt per session, per model, or globally — without touching tools, rules, skills, or project context.
+Give [Pi](https://github.com/earendil-works/pi) a different persona per session, per model, or by default. A soul replaces only the identity part of the system prompt; tools, rules, skills, and project context stay exactly as Pi renders them.
 
 ## Install
 
 ```bash
 pi install npm:@astrosheep/pi-souls
-# or a local checkout
+# or from a local checkout
 pi install ./pi-souls
 ```
 
 ## Usage
 
 ```text
-/soul          # Current soul, its source, and available souls
-/soul faye     # Use faye.md for this session (persists across resume/fork)
-/soul clear    # Back to model-specific / global defaults
+/soul          # Show the current soul, where it comes from, and what's available
+/soul faye     # Use faye for this session (kept across resume and fork)
+/soul clear    # Drop the session choice and follow modelSouls / defaultSoul again
 ```
 
-A soul is a single Markdown file. Its body replaces Pi's default coding-assistant preamble; everything else in the system prompt stays exactly as Pi renders it.
+Soul names tab-complete after `/soul `.
+
+## Writing a soul
+
+A soul is one Markdown file. Its body takes the place of Pi's default "coding assistant" introduction:
 
 ```text
 ~/.agents/souls/
-├── faye.md          # body = who you are, how you speak
+├── faye.md          # who the agent is and how it talks
 └── reviewer.md
 ```
 
-Optional frontmatter (e.g. `name:`) is stripped before injection.
+Frontmatter (such as `name:`) is optional and stripped before use. Edits apply on the next request, with no `/reload` needed.
+
+File names may use letters, digits, `_`, `-`, and `.` (not as the first character). `clear` is reserved.
 
 ## Configuration
 
@@ -36,7 +42,7 @@ In `settings.json` (user or project level):
 {
   "defaultSoul": "faye",
   "modelSouls": {
-    "anthropic/claude-sonnet-4-5": "reviewer"
+    "anthropic/claude-sonnet-5": "reviewer"
   },
   "soulsDir": "~/.agents/souls"
 }
@@ -44,18 +50,20 @@ In `settings.json` (user or project level):
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `defaultSoul` | string | none | Soul used when nothing else applies. |
-| `modelSouls` | object | `{}` | Per-model souls keyed by exact `provider/modelId`. |
-| `soulsDir` | string | `~/.agents/souls` | Directory of soul `.md` files. Relative paths resolve from the project; `~` from home. |
+| `defaultSoul` | string | none | Used when nothing more specific applies. |
+| `modelSouls` | object | `{}` | Souls for specific models, keyed by exact `provider/modelId`. |
+| `soulsDir` | string | `~/.agents/souls` | Folder of soul files. `~` means your home folder; other relative paths start from the project. |
 
-Precedence: **session selection (`/soul <name>`) > `modelSouls` > `defaultSoul` > Pi default.**
+Which soul wins: **`/soul <name>` for the session > `modelSouls` > `defaultSoul` > Pi's own prompt.**
 
-The session selection is stored as a session entry, so resume, fork, and tree navigation keep the right soul for that branch. Switching models re-resolves from `modelSouls` only when the session has no explicit selection.
+The session choice is saved in the session itself, so resume, fork, and tree navigation each keep the soul of their branch. Without a session choice, switching models picks up that model's `modelSouls` entry.
+
+## When something is wrong
+
+- A broken setting only affects the case that uses it. A typo in one `modelSouls` entry won't take souls away from other models, and `/soul` lists keys that can never match a model.
+- If a soul can't be applied (missing file, invalid name), Pi shows the error and sends that request with its own prompt.
+- If the whole system prompt has been replaced (`SYSTEM.md` or `customPrompt`), there is no identity section left to swap, so pi-souls reports an error instead of mixing the two.
 
 ## How it works
 
-- Souls replace only the `preamble` section of Pi's structured system prompt, via a request-time projection (`context_with_system`). Tool declarations, tool rules, docs, skills, cwd, and project context are untouched, and the transcript keeps its original sections.
-- Soul files are re-read on every request, so edits apply immediately — no `/reload` needed.
-- If Pi's system prompt is fully replaced by an opaque prompt (`SYSTEM.md` / `customPrompt`), pi-souls refuses to combine with it and reports an error instead of guessing.
-
-`soul` names must match `[\p{L}\p{N}_-][\p{L}\p{N}_.-]*`; `clear` is reserved.
+Right before each request, pi-souls rewrites the `preamble` section of Pi's structured system prompt (via `context_with_system`). Tool declarations, tool rules, docs, skills, cwd, and project context are left alone, and the stored transcript is never modified.

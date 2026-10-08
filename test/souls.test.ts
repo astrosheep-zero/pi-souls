@@ -7,12 +7,12 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earen
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
 import { applySoul } from "../src/prompt.ts";
-import { ENTRY_TYPE, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls } from "../src/souls.ts";
+import { ENTRY_TYPE, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, unmatchableModelKeys } from "../src/souls.ts";
 
 const model = { provider: "provider", id: "model" };
 const config = readConfig({ defaultSoul: "global", modelSouls: { "provider/model": "specific" } }, "/tmp");
 
-test("session > exact model > global; clear and branch navigation replay from the session", () => {
+test("session > exact model > default; clear and branch navigation replay from the session", () => {
   const session = SessionManager.inMemory();
   const root = session.appendCustomEntry("unrelated", {});
   assert.equal(resolveSoul(config, sessionSoul(session.getBranch()), model)?.name, "specific");
@@ -26,6 +26,14 @@ test("session > exact model > global; clear and branch navigation replay from th
   assert.equal(resolveSoul(readConfig({}, "/tmp"), undefined, model), undefined);
 });
 
+test("a bad setting only fails where it is used", () => {
+  const messy = readConfig({ defaultSoul: 42, modelSouls: { "provider/model": "specific", "provider/broken": "../x", typo: "faye" } }, "/tmp");
+  assert.equal(resolveSoul(messy, undefined, model)?.name, "specific");
+  assert.throws(() => resolveSoul(messy, undefined, { ...model, id: "broken" }), /modelSouls\["provider\/broken"\]/);
+  assert.throws(() => resolveSoul(messy, undefined, { ...model, id: "other" }), /defaultSoul/);
+  assert.deepEqual(unmatchableModelKeys(messy), ["typo"]);
+});
+
 test("loader reads one body, strips metadata, observes edits and rejects unsafe names", () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-"));
   try {
@@ -35,10 +43,10 @@ test("loader reads one body, strips metadata, observes edits and rejects unsafe 
     writeFileSync(join(dir, "faye.md"), "Changed");
     assert.equal(loadSoul(dir, "faye"), "Changed");
     assert.throws(() => loadSoul(dir, "../secret"), /Invalid soul/);
-    assert.throws(() => loadSoul(dir, "missing"), /ENOENT/);
+    assert.throws(() => loadSoul(dir, "missing"), /Soul "missing" not found/);
     writeFileSync(join(dir, "empty.md"), "  ");
     assert.throws(() => loadSoul(dir, "empty"), /empty/);
-    assert.throws(() => readConfig({ modelSouls: { model: "faye" } }, dir), /provider\/modelId/);
+    assert.throws(() => readConfig({ modelSouls: ["faye"] }, dir), /modelSouls must be an object/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -60,30 +68,53 @@ test("projection replaces identity only, including old deltas, without mutating 
   assert.throws(() => applySoul([{ role: "system", content: "opaque", timestamp: 0 }], "Faye"), /structured/);
 });
 
-test("registered command persists selection, refuses missing files, and clear follows defaults", async () => {
+test("registered command persists selection, refuses missing files, skips no-ops, and completes names", async () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-command-"));
   try {
     writeFileSync(join(dir, "faye.md"), "Faye");
     const session = SessionManager.inMemory();
     const notices: string[] = [];
-    let handler: (args: string, ctx: unknown) => Promise<void>;
-    let project: (event: unknown, ctx: unknown) => unknown;
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    let command!: { handler: (args: string, ctx: unknown) => Promise<void>; getArgumentCompletions: (prefix: string) => { value: string }[] | null };
     const pi = {
       getSettings: () => ({ soulsDir: dir }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
-      registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; },
-      on: (_name: string, callback: typeof project) => { project = callback; },
+      registerCommand: (_name: string, registered: typeof command) => { command = registered; },
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const ctx = { cwd: dir, model, sessionManager: session, isIdle: () => true, ui: { notify: (text: string) => notices.push(text) } } as unknown as ExtensionContext;
-    await handler!("faye", ctx);
+    const project = handlers.get("context_with_system")!;
+    const entries = () => session.getBranch().length;
+
+    assert.deepEqual(command.getArgumentCompletions("f")?.map((item) => item.value), ["faye"]);
+    assert.deepEqual(command.getArgumentCompletions("")?.map((item) => item.value), ["faye", "clear"]);
+    assert.equal(command.getArgumentCompletions("zzz"), null);
+
+    await command.handler("faye", ctx);
     assert.equal(sessionSoul(session.getBranch()), "faye");
-    await handler!("missing", ctx);
+    const afterSelect = entries();
+    await command.handler("faye", ctx);
+    assert.equal(entries(), afterSelect);
+    assert.match(notices.at(-1)!, /Already using faye/);
+
+    await command.handler("missing", ctx);
     assert.equal(sessionSoul(session.getBranch()), "faye");
-    assert.match(notices.at(-1)!, /ENOENT/);
-    assert.ok(project!({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx));
-    await handler!("clear", ctx);
+    assert.match(notices.at(-1)!, /No soul named "missing".*Available: faye/);
+    assert.ok(project({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx));
+
+    await command.handler("clear", ctx);
     assert.equal(sessionSoul(session.getBranch()), undefined);
-    assert.equal(project!({ messages: [] }, ctx), undefined);
+    const afterClear = entries();
+    await command.handler("clear", ctx);
+    assert.equal(entries(), afterClear);
+    assert.match(notices.at(-1)!, /No session soul to clear/);
+    assert.equal(project({ messages: [] }, ctx), undefined);
+
+    session.appendCustomEntry(ENTRY_TYPE, { version: 99 });
+    await command.handler("", ctx);
+    assert.match(notices.at(-1)!, /corrupted.*\/soul clear/);
+    await command.handler("clear", ctx);
+    assert.equal(sessionSoul(session.getBranch()), undefined);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
