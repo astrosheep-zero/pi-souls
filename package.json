@@ -4,6 +4,7 @@
   "description": "Session souls with model-specific defaults for Pi",
   "type": "module",
   "keywords": ["pi-package"],
+  "repository": { "type": "git", "url": "https://github.com/astrosheep-zero/pi-souls.git" },
   "publishConfig": { "access": "public" },
   "files": ["src", "README.md"],
   "pi": { "extensions": ["./src/index.ts"] },
