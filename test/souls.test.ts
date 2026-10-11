@@ -73,7 +73,7 @@ test("projection replaces identity only, including old deltas, without mutating 
   assert.throws(() => applySoul([{ role: "system", content: "plain", timestamp: 0 }], "Faye"), /no preamble/);
 });
 
-test("a problem is reported once until it changes; a forced prompt is read from the run's live options", () => {
+test("a problem is shown once until it changes, thrown without a UI; a forced prompt is read from the run's live options", () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-problems-"));
   try {
     const session = SessionManager.inMemory();
@@ -84,16 +84,20 @@ test("a problem is reported once until it changes; a forced prompt is read from 
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
-    const ctx = { cwd: dir, model, sessionManager: session } as unknown as ExtensionContext;
+    const notices: string[] = [];
+    const ctx = { cwd: dir, model, sessionManager: session, hasUI: true, ui: { notify: (text: string, type: string) => notices.push(`${type}: ${text}`) } };
     const request = () => handlers.get("context_with_system")!({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx);
     const options: Record<string, unknown> = { cwd: dir };
     handlers.get("before_agent_start")!({ systemPromptOptions: options }, ctx);
 
-    assert.throws(request, /Soul "faye" not found/);
     assert.equal(request(), undefined);
+    assert.equal(request(), undefined);
+    assert.equal(notices.length, 1);
+    assert.match(notices[0], /^warning: Soul "faye" not found/);
     writeFileSync(join(dir, "faye.md"), "Faye");
     assert.ok(request());
 
+    ctx.hasUI = false; // Print mode: Pi prints thrown errors to stderr.
     options.forceSystemPrompt = "Forced"; // Set by a handler that runs after ours.
     assert.throws(request, /replaced the whole prompt/);
     assert.equal(request(), undefined);

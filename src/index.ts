@@ -107,11 +107,13 @@ export default function soulsExtension(pi: ExtensionAPI) {
       reported = undefined;
       return messages && { messages };
     } catch (error) {
-      // Pi reports a thrown error and sends its own prompt; an unchanged problem skips quietly.
+      // The request goes out with Pi's own prompt; an unchanged problem skips quietly.
       const problem = error instanceof Error ? error.message : String(error);
       if (problem === reported) return;
       reported = problem;
-      throw error;
+      // Without a UI (print mode), only a thrown error reaches the user, on stderr.
+      if (!ctx.hasUI) throw error;
+      ctx.ui.notify(problem, "warning");
     }
   });
 }
