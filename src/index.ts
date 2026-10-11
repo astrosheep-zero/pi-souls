@@ -62,7 +62,6 @@ export default function soulsExtension(pi: ExtensionAPI) {
           try { selected = override() !== undefined; } catch {}
           if (!selected) return notify(`No session soul. Soul: ${now()}`);
           pi.appendEntry(ENTRY_TYPE, { version: 1, name: null });
-          reported = undefined; // The old soul's problem says nothing about the new one.
           return notify(`Cleared. Soul: ${now()}`);
         }
 
@@ -74,7 +73,6 @@ export default function soulsExtension(pi: ExtensionAPI) {
           }
           loadSoul(config.dir, name); // Validate content before changing durable session state.
           pi.appendEntry(ENTRY_TYPE, { version: 1, name });
-          reported = undefined;
           return notify(`Soul: ${name}`);
         }
 
@@ -87,8 +85,6 @@ export default function soulsExtension(pi: ExtensionAPI) {
           `Souls: ${available.join(", ") || "none"}`,
           `Dir: ${tilde(config.dir)}`,
           ...(ignored.length ? [`Ignored keys: ${ignored.join(", ")}`] : []),
-          // Whether the next run is forced is unknown while idle; only the last request is a fact.
-          ...(reported ? [`Last request: ${reported}`] : []),
         ].join("\n"));
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
