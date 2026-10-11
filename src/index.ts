@@ -19,16 +19,13 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // A problem is reported when it appears or changes, not on every request of a tool loop.
   let reported: string | undefined;
   pi.on("session_start", (_event, ctx) => { cwd = ctx.cwd; reported = undefined; });
-  // context_with_system cannot read prompt options. Hold the run's live options, not a copy:
-  // handlers after ours may still set customPrompt or forceSystemPrompt.
-  let run: BuildSystemPromptOptions | undefined;
-  // A forced prompt ends with its run; customPrompt is session configuration and outlives it.
-  let customPrompt: string | undefined;
-  pi.on("before_agent_start", (event) => { run = event.systemPromptOptions; });
-  pi.on("agent_settled", () => {
-    if (run) customPrompt = run.customPrompt;
-    run = undefined;
-  });
+  // context_with_system cannot read prompt options. Hold the last run's live options, not a copy:
+  // handlers after ours may still set customPrompt or forceSystemPrompt. customPrompt is session
+  // configuration and stays valid; a forced prompt only applies while its run is going.
+  let options: BuildSystemPromptOptions | undefined;
+  let running = false;
+  pi.on("before_agent_start", (event) => { options = event.systemPromptOptions; running = true; });
+  pi.on("agent_settled", () => { running = false; });
 
   pi.registerCommand("soul", {
     description: "Switch soul: /soul [name|clear]",
@@ -97,11 +94,10 @@ export default function soulsExtension(pi: ExtensionAPI) {
 
   const project = (messages: AgentMessage[], ctx: ExtensionContext): AgentMessage[] | undefined => {
     const config = readConfig(pi.getSettings(), ctx.cwd);
-    const prompt = run ? run.customPrompt : customPrompt;
-    const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model), prompt);
+    const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model), options?.customPrompt);
     if (!selection) return undefined;
     // Pi projects a forced prompt after this hook, over whatever it returns.
-    if (run?.forceSystemPrompt !== undefined) throw new Error("Soul skipped: another extension replaced the whole prompt");
+    if (running && options?.forceSystemPrompt !== undefined) throw new Error("Soul skipped: another extension replaced the whole prompt");
     return applySoul(messages, loadSoul(config.dir, selection.name));
   };
 
