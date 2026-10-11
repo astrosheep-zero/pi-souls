@@ -73,18 +73,24 @@ test("projection replaces identity only, including old deltas, without mutating 
   assert.throws(() => applySoul([{ role: "system", content: "plain", timestamp: 0 }], "Faye"), /no preamble/);
 });
 
-test("a problem is reported once until it changes; a forced prompt is read from the run's live options", () => {
+test("a problem is reported once until it changes and stays visible in /soul; a forced prompt is read from the run's live options", async () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-problems-"));
   try {
     const session = SessionManager.inMemory();
+    const notices: string[] = [];
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
     const pi = {
       getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
-      registerCommand: () => {},
+      registerCommand: (_name: string, registered: typeof command) => { command = registered; },
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
-    const ctx = { cwd: dir, model, sessionManager: session } as unknown as ExtensionContext;
+    const ctx = {
+      cwd: dir, model, sessionManager: session, isIdle: () => true, getSystemPromptOptions: () => ({ cwd: dir }),
+      ui: { notify: (text: string) => notices.push(text) },
+    } as unknown as ExtensionContext;
+    const status = async () => { await command.handler("", ctx); return notices.at(-1)!; };
     const request = () => handlers.get("context_with_system")!({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx);
     const options: Record<string, unknown> = { cwd: dir };
     handlers.get("before_agent_start")!({ systemPromptOptions: options }, ctx);
@@ -98,7 +104,9 @@ test("a problem is reported once until it changes; a forced prompt is read from 
     assert.throws(request, /replaced the whole prompt/);
     assert.equal(request(), undefined);
     handlers.get("agent_settled")!({ aborted: false }, ctx);
+    assert.match(await status(), /Soul: faye[^\n]*\n[\s\S]*Last request: Soul skipped: another extension replaced the whole prompt/);
     assert.ok(request());
+    assert.doesNotMatch(await status(), /Last request/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
