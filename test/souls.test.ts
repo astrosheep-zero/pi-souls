@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -46,6 +46,8 @@ test("loader reads one body, strips metadata, observes edits and rejects unsafe 
     assert.throws(() => loadSoul(dir, "missing"), /Soul "missing" not found/);
     writeFileSync(join(dir, "empty.md"), "  ");
     assert.throws(() => loadSoul(dir, "empty"), /empty/);
+    mkdirSync(join(dir, "folder.md"));
+    assert.throws(() => loadSoul(dir, "folder"), /Soul "folder" unreadable: .*folder\.md/);
     assert.throws(() => readConfig({ modelSouls: ["faye"] }, dir), /modelSouls must be an object/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -65,7 +67,39 @@ test("projection replaces identity only, including old deltas, without mutating 
     assert.ok(before.role === "system" && after.role === "system");
     assert.deepEqual(after, { ...before, sections: { ...before.sections, preamble: "Faye" } });
   }
-  assert.throws(() => applySoul([{ role: "system", content: "opaque", timestamp: 0 }], "Faye"), /fully replaced/);
+  // Sessions older than system messages declare the prompt after the conversation starts.
+  const legacy = applySoul([{ role: "user", content: "hi", timestamp: 0 }, { role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 1 }], "Faye");
+  assert.deepEqual(legacy[1], { role: "system", content: "", sections: { preamble: "Faye" }, timestamp: 1 });
+  assert.throws(() => applySoul([{ role: "system", content: "plain", timestamp: 0 }], "Faye"), /no preamble/);
+});
+
+test("a problem is reported once until it changes; a forced prompt is read from the run's live options", () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-problems-"));
+  try {
+    const session = SessionManager.inMemory();
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const pi = {
+      getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
+      registerCommand: () => {},
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
+    } as unknown as ExtensionAPI;
+    extension(pi);
+    const ctx = { cwd: dir, model, sessionManager: session } as unknown as ExtensionContext;
+    const request = () => handlers.get("context_with_system")!({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx);
+    const options: Record<string, unknown> = { cwd: dir };
+    handlers.get("before_agent_start")!({ systemPromptOptions: options }, ctx);
+
+    assert.throws(request, /Soul "faye" not found/);
+    assert.equal(request(), undefined);
+    writeFileSync(join(dir, "faye.md"), "Faye");
+    assert.ok(request());
+
+    options.forceSystemPrompt = "Forced"; // Set by a handler that runs after ours.
+    assert.throws(request, /replaced the whole prompt/);
+    assert.equal(request(), undefined);
+    handlers.get("agent_settled")!({ aborted: false }, ctx);
+    assert.ok(request());
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("registered command persists selection, refuses missing files, skips no-ops, and completes names", async () => {

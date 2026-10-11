@@ -85,8 +85,9 @@ export function loadSoul(dir: string, name: string): string {
   try {
     text = readFileSync(path, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Soul "${name}" not found: ${path}`);
-    throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new Error(`Soul "${name}" not found: ${path}`);
+    throw new Error(`Soul "${name}" unreadable: ${path} (${code ?? String(error)})`);
   }
   const body = stripFrontmatter(text).trim();
   if (!body) throw new Error(`Soul "${name}" is empty`);

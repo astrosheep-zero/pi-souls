@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { applySoul } from "./prompt.ts";
 import { ENTRY_TYPE, effectiveSoul, listSouls, loadSoul, readConfig, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection } from "./souls.ts";
 
@@ -15,10 +16,19 @@ function describe(selection: Selection | undefined, model: ExtensionContext["mod
 export default function soulsExtension(pi: ExtensionAPI) {
   // Argument completion has no context; remember where the session runs for relative soulsDir.
   let cwd = process.cwd();
-  pi.on("session_start", (_event, ctx) => { cwd = ctx.cwd; });
-  // context_with_system cannot read prompt options; before_agent_start can, and runs first.
+  // A problem is reported when it appears or changes, not on every request of a tool loop.
+  let reported: string | undefined;
+  pi.on("session_start", (_event, ctx) => { cwd = ctx.cwd; reported = undefined; });
+  // context_with_system cannot read prompt options. Hold the run's live options, not a copy:
+  // handlers after ours may still set customPrompt or forceSystemPrompt.
+  let run: BuildSystemPromptOptions | undefined;
+  // A forced prompt ends with its run; customPrompt is session configuration and outlives it.
   let customPrompt: string | undefined;
-  pi.on("before_agent_start", (event) => { customPrompt = event.systemPromptOptions.customPrompt; });
+  pi.on("before_agent_start", (event) => { run = event.systemPromptOptions; });
+  pi.on("agent_settled", () => {
+    if (run) customPrompt = run.customPrompt;
+    run = undefined;
+  });
 
   pi.registerCommand("soul", {
     description: "Switch soul: /soul [name|clear]",
@@ -85,10 +95,27 @@ export default function soulsExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("context_with_system", (event, ctx) => {
+  const project = (messages: AgentMessage[], ctx: ExtensionContext): AgentMessage[] | undefined => {
     const config = readConfig(pi.getSettings(), ctx.cwd);
-    const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model), customPrompt);
-    if (!selection) return;
-    return { messages: applySoul(event.messages, loadSoul(config.dir, selection.name)) };
+    const prompt = run ? run.customPrompt : customPrompt;
+    const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model), prompt);
+    if (!selection) return undefined;
+    // Pi projects a forced prompt after this hook, over whatever it returns.
+    if (run?.forceSystemPrompt !== undefined) throw new Error("Soul skipped: another extension replaced the whole prompt");
+    return applySoul(messages, loadSoul(config.dir, selection.name));
+  };
+
+  pi.on("context_with_system", (event, ctx) => {
+    try {
+      const messages = project(event.messages, ctx);
+      reported = undefined;
+      return messages && { messages };
+    } catch (error) {
+      // Pi reports a thrown error and sends its own prompt; an unchanged problem skips quietly.
+      const problem = error instanceof Error ? error.message : String(error);
+      if (problem === reported) return;
+      reported = problem;
+      throw error;
+    }
   });
 }
