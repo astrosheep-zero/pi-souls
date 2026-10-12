@@ -7,13 +7,15 @@ import { ENTRY_TYPE, effectiveSoul, listSouls, loadSoul, readConfig, resolveSoul
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
 
-function describe(selection: Selection | undefined, model: ExtensionContext["model"], suppressed = false): string {
-  if (!selection) return suppressed ? "none (custom prompt)" : "none";
+function describe(selection: Selection | undefined, model: ExtensionContext["model"], suppressed = false, soulless = false): string {
+  if (!selection) return soulless ? "none (soulless)" : suppressed ? "none (custom prompt)" : "none";
   if (selection.source === "model") return `${selection.name} (${model?.provider}/${model?.id})`;
   return `${selection.name} (${selection.source})`;
 }
 
 export default function soulsExtension(pi: ExtensionAPI) {
+  pi.registerFlag("soulless", { description: "Skip default souls (session /soul still wins)", type: "boolean", default: false });
+  const soulless = () => pi.getFlag("soulless") === true || /^(1|true)$/i.test(process.env.SOULLESS ?? "");
   // Argument completion has no context; remember where the session runs for relative soulsDir.
   let cwd = process.cwd();
   // A problem is reported when it appears or changes, not on every request of a tool loop.
@@ -50,11 +52,11 @@ export default function soulsExtension(pi: ExtensionAPI) {
         const config = readConfig(pi.getSettings(), ctx.cwd);
         const prompt = ctx.getSystemPromptOptions().customPrompt;
         const override = () => sessionSoul(ctx.sessionManager.getBranch());
-        const resolved = () => resolveSoul(config, override(), ctx.model);
+        const resolved = () => resolveSoul(config, override(), ctx.model, soulless());
         const now = () => {
           const configured = resolved();
           const active = effectiveSoul(configured, prompt);
-          return describe(active, ctx.model, active === undefined && configured !== undefined);
+          return describe(active, ctx.model, active === undefined && configured !== undefined, soulless());
         };
 
         if (name === "clear") {
@@ -81,7 +83,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         const missing = selection && !available.includes(selection.name) ? " (missing)" : "";
         const ignored = unmatchableModelKeys(config);
         notify([
-          `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined)}${missing}`,
+          `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless())}${missing}`,
           `Souls: ${available.join(", ") || "none"}`,
           `Dir: ${tilde(config.dir)}`,
           ...(ignored.length ? [`Ignored keys: ${ignored.join(", ")}`] : []),
@@ -94,7 +96,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
 
   const project = (messages: AgentMessage[], ctx: ExtensionContext): AgentMessage[] | undefined => {
     const config = readConfig(pi.getSettings(), ctx.cwd);
-    const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model), options?.customPrompt);
+    const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model, soulless()), options?.customPrompt);
     if (!selection) return undefined;
     // Pi projects a forced prompt after this hook, over whatever it returns.
     if (running && options?.forceSystemPrompt !== undefined) throw new Error("Soul skipped: another extension replaced the whole prompt");

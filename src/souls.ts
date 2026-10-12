@@ -55,8 +55,9 @@ function named(name: unknown, source: Selection["source"], setting: string): Sel
   return { name, source };
 }
 
-export function resolveSoul(config: SoulConfig, override: string | undefined, model?: { provider: string; id: string }): Selection | undefined {
+export function resolveSoul(config: SoulConfig, override: string | undefined, model?: { provider: string; id: string }, soulless = false): Selection | undefined {
   if (override) return { name: override, source: "session" };
+  if (soulless) return undefined;
   const key = model && `${model.provider}/${model.id}`;
   if (key && Object.hasOwn(config.modelSouls, key)) return named(config.modelSouls[key], "model", `modelSouls["${key}"]`);
   if (config.defaultSoul !== undefined) return named(config.defaultSoul, "default", "defaultSoul");

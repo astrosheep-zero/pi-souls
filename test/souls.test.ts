@@ -26,6 +26,61 @@ test("session > exact model > default; clear and branch navigation replay from t
   assert.equal(resolveSoul(readConfig({}, "/tmp"), undefined, model), undefined);
 });
 
+test("soulless via CLI or env skips defaults; /soul wins and clear returns to soulless", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-less-"));
+  const previous = process.env.SOULLESS;
+  try {
+    writeFileSync(join(dir, "faye.md"), "Faye");
+    const session = SessionManager.inMemory();
+    const notices: string[] = [];
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    let flag = false;
+    let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
+    const pi = {
+      registerFlag: (name: string, options: { type: string }) => {
+        assert.equal(name, "soulless"); assert.equal(options.type, "boolean");
+      },
+      getFlag: () => flag,
+      getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
+      appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
+      registerCommand: (_name: string, registered: typeof command) => { command = registered; },
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
+    } as unknown as ExtensionAPI;
+    extension(pi);
+    const ctx = {
+      cwd: dir, model, sessionManager: session, isIdle: () => true,
+      getSystemPromptOptions: () => ({ cwd: dir }), ui: { notify: (text: string) => notices.push(text) },
+    };
+    const request = () => handlers.get("context_with_system")!({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx) as { messages: AgentMessage[] } | undefined;
+
+    process.env.SOULLESS = "0";
+    assert.ok(request());
+    process.env.SOULLESS = "1";
+    assert.equal(request(), undefined);
+    await command.handler("", ctx);
+    assert.match(notices.at(-1)!, /Soul: none \(soulless\)/);
+
+    process.env.SOULLESS = "0";
+    flag = true;
+    assert.equal(request(), undefined); // CLI still wins over SOULLESS=0.
+    await command.handler("faye", ctx);
+    const applied = request()!;
+    const head = applied.messages[0];
+    assert.ok(head.role === "system");
+    assert.equal(head.sections?.preamble, "Faye");
+    await command.handler("", ctx);
+    assert.match(notices.at(-1)!, /Soul: faye \(session\)/);
+    await command.handler("clear", ctx);
+    assert.match(notices.at(-1)!, /Soul: none \(soulless\)/);
+    assert.equal(request(), undefined);
+    // Suppressed defaults need not even contain a valid name.
+    assert.equal(resolveSoul(readConfig({ defaultSoul: 42 }, dir), undefined, model, true), undefined);
+  } finally {
+    if (previous === undefined) delete process.env.SOULLESS; else process.env.SOULLESS = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a bad setting only fails where it is used", () => {
   const messy = readConfig({ defaultSoul: 42, modelSouls: { "provider/model": "specific", "provider/broken": "../x", typo: "faye" } }, "/tmp");
   assert.equal(resolveSoul(messy, undefined, model)?.name, "specific");
@@ -79,6 +134,7 @@ test("a problem is shown once until it changes, thrown without a UI; a forced pr
     const session = SessionManager.inMemory();
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
     const pi = {
+      registerFlag: () => {}, getFlag: () => false,
       getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
       registerCommand: () => {},
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
@@ -115,6 +171,7 @@ test("registered command persists selection, refuses missing files, skips no-ops
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
     let command!: { handler: (args: string, ctx: unknown) => Promise<void>; getArgumentCompletions: (prefix: string) => { value: string }[] | null };
     const pi = {
+      registerFlag: () => {}, getFlag: () => false,
       getSettings: () => ({ soulsDir: dir }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
@@ -171,6 +228,7 @@ test("customPrompt keeps settings souls off, leaves the session choice and statu
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
     let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
     const pi = {
+      registerFlag: () => {}, getFlag: () => false,
       getSettings: () => ({ soulsDir: dir, defaultSoul: "global" }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
