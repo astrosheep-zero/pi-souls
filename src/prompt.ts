@@ -6,6 +6,14 @@ function hasPreamble(message: AgentMessage): message is SystemMessage {
   return message.role === "system" && typeof message.sections?.preamble === "string";
 }
 
+/** Forced prompts render the latest replayed preamble; leave appended instructions intact. */
+export function replaceForcedPreamble(messages: AgentMessage[], prompt: string, body: string): string {
+  const preamble = messages.findLast(hasPreamble)?.sections?.preamble;
+  if (!preamble || !prompt.includes(preamble)) throw new Error("Soul skipped: the forced prompt has no preamble");
+  // Use a callback so $ sequences in a soul are literal, not replacement patterns.
+  return prompt.replace(preamble, () => body);
+}
+
 /**
  * Request-only projection. Keep runtime sections, declaration deltas and conversation intact.
  * Pi replays every system message in order and the preamble can sit in a later one (sessions older

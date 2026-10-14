@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
-import { applySoul } from "../src/prompt.ts";
+import { applySoul, replaceForcedPreamble } from "../src/prompt.ts";
 import { ENTRY_TYPE, effectiveSoul, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, unmatchableModelKeys } from "../src/souls.ts";
 
 const model = { provider: "provider", id: "model" };
@@ -128,7 +128,7 @@ test("projection replaces identity only, including old deltas, without mutating 
   assert.throws(() => applySoul([{ role: "system", content: "plain", timestamp: 0 }], "Faye"), /no preamble/);
 });
 
-test("a problem is shown once until it changes, thrown without a UI; a forced prompt is read from the run's live options", () => {
+test("errors are deduplicated; forced prompts are patched from live options, with a warning rather than an error", () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-problems-"));
   try {
     const session = SessionManager.inMemory();
@@ -153,13 +153,57 @@ test("a problem is shown once until it changes, thrown without a UI; a forced pr
     writeFileSync(join(dir, "faye.md"), "Faye");
     assert.ok(request());
 
-    ctx.hasUI = false; // Print mode: Pi prints thrown errors to stderr.
-    options.forceSystemPrompt = "Forced"; // Set by a handler that runs after ours.
-    assert.throws(request, /replaced the whole prompt/);
-    assert.equal(request(), undefined);
-    handlers.get("agent_settled")!({ aborted: false }, ctx);
+    options.forceSystemPrompt = "Pi\n\nPaseo voice mode is now off."; // A later handler appends text.
     assert.ok(request());
+    assert.equal(options.forceSystemPrompt, "Faye\n\nPaseo voice mode is now off.");
+    assert.match(notices.at(-1)!, /^warning: Soul: another extension forced/);
+    const noticeCount = notices.length;
+    assert.ok(request()); // Tool-loop requests must not look for Pi in our patched output.
+    assert.equal(notices.length, noticeCount);
+    writeFileSync(join(dir, "faye.md"), "New Faye $&");
+    assert.ok(request());
+    assert.equal(options.forceSystemPrompt, "New Faye $&\n\nPaseo voice mode is now off.");
+
+    options.forceSystemPrompt = "Replacement without the identity";
+    assert.equal(request(), undefined);
+    assert.match(notices.at(-1)!, /forced prompt has no preamble/);
+    assert.equal(request(), undefined);
+    assert.equal(options.forceSystemPrompt, "Replacement without the identity");
+
+    handlers.get("agent_settled")!({ aborted: false }, ctx);
+    assert.ok(request()); // A stale force does not apply after the run.
+    ctx.hasUI = false;
+    handlers.get("before_agent_start")!({ systemPromptOptions: options }, ctx);
+    assert.throws(request, /forced prompt has no preamble/);
+    assert.equal(request(), undefined);
+
+    // Print mode warnings go to stderr, but a compatible force must not throw.
+    const warn = console.warn;
+    const warnings: string[] = [];
+    try {
+      console.warn = (text: string) => warnings.push(text);
+      handlers.get("session_start")!({}, ctx);
+      handlers.get("before_agent_start")!({ messageType: "custom", systemPromptOptions: options }, ctx);
+      options.forceSystemPrompt = "Pi\n\nExtra instructions";
+      assert.ok(request());
+      assert.ok(request());
+      assert.equal(warnings.length, 1);
+      assert.equal(options.forceSystemPrompt, "New Faye $&\n\nExtra instructions");
+    } finally { console.warn = warn; }
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("forced projection uses the latest preamble and preserves surrounding prompt text", () => {
+  const messages: AgentMessage[] = [
+    { role: "system", content: "", sections: { preamble: "Old identity" }, timestamp: 0 },
+    { role: "user", content: "hi", timestamp: 1 },
+    { role: "system", content: "", sections: { preamble: "Current identity" }, timestamp: 2 },
+  ];
+  assert.equal(
+    replaceForcedPreamble(messages, "Prefix\nCurrent identity\nTools and Paseo addendum", "Soul $& $$"),
+    "Prefix\nSoul $& $$\nTools and Paseo addendum",
+  );
+  assert.throws(() => replaceForcedPreamble(messages, "Old identity", "Soul"), /no preamble/);
 });
 
 test("registered command persists selection, refuses missing files, skips no-ops, and completes names", async () => {

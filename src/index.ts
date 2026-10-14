@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { applySoul } from "./prompt.ts";
+import { applySoul, replaceForcedPreamble } from "./prompt.ts";
 import { ENTRY_TYPE, effectiveSoul, listSouls, loadSoul, readConfig, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection } from "./souls.ts";
 
 const home = homedir();
@@ -20,13 +20,19 @@ export default function soulsExtension(pi: ExtensionAPI) {
   let cwd = process.cwd();
   // A problem is reported when it appears or changes, not on every request of a tool loop.
   let reported: string | undefined;
-  pi.on("session_start", (_event, ctx) => { cwd = ctx.cwd; reported = undefined; });
-  // context_with_system cannot read prompt options. Hold the last run's live options, not a copy:
-  // handlers after ours may still set customPrompt or forceSystemPrompt. customPrompt is session
-  // configuration and stays valid; a forced prompt only applies while its run is going.
+  // Hold live options: handlers after ours can still set customPrompt or forceSystemPrompt.
   let options: BuildSystemPromptOptions | undefined;
   let running = false;
-  pi.on("before_agent_start", (event) => { options = event.systemPromptOptions; running = true; });
+  let forceReported = false;
+  // Retain the original text so tool-loop requests and soul edits do not patch our own output.
+  let forcedProjection: { original: string; projected: string } | undefined;
+  pi.on("session_start", (_event, ctx) => {
+    cwd = ctx.cwd; reported = undefined; forceReported = false;
+    options = undefined; running = false; forcedProjection = undefined;
+  });
+  pi.on("before_agent_start", (event) => {
+    options = event.systemPromptOptions; running = true; forcedProjection = undefined;
+  });
   pi.on("agent_settled", () => { running = false; });
 
   pi.registerCommand("soul", {
@@ -98,9 +104,25 @@ export default function soulsExtension(pi: ExtensionAPI) {
     const config = readConfig(pi.getSettings(), ctx.cwd);
     const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model, soulless()), options?.customPrompt);
     if (!selection) return undefined;
-    // Pi projects a forced prompt after this hook, over whatever it returns.
-    if (running && options?.forceSystemPrompt !== undefined) throw new Error("Soul skipped: another extension replaced the whole prompt");
-    return applySoul(messages, loadSoul(config.dir, selection.name));
+    const body = loadSoul(config.dir, selection.name);
+    const projected = applySoul(messages, body);
+    // Pi projects forced text after this hook; patch that too, not just its transcript sections.
+    if (running && options?.forceSystemPrompt !== undefined) {
+      if (!forceReported) {
+        const warning = "Soul: another extension forced the prompt; attempting preamble replacement";
+        if (ctx.hasUI) ctx.ui.notify(warning, "warning");
+        else console.warn(warning);
+        forceReported = true;
+      }
+      const forced = options.forceSystemPrompt;
+      const original = forced === forcedProjection?.projected ? forcedProjection.original : forced;
+      const patched = replaceForcedPreamble(messages, original, body);
+      forcedProjection = { original, projected: patched };
+      options.forceSystemPrompt = patched;
+    } else {
+      forceReported = false;
+    }
+    return projected;
   };
 
   pi.on("context_with_system", (event, ctx) => {

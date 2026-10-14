@@ -45,4 +45,4 @@ One Markdown file per soul; the body becomes the identity. Frontmatter is stripp
 
 Precedence: `/soul <name>` > `--soulless` / `SOULLESS` / explicit system prompt > `modelSouls` (exact `provider/modelId`) > `defaultSoul` > Pi default.
 
-The session choice follows resume, fork, and tree navigation. `--system-prompt` and `SYSTEM.md` outrank a settings soul but not `/soul`. A bad entry only breaks the case that uses it. When a soul can't apply (a bad entry, a missing file, or another extension forcing the whole prompt), Pi's prompt is used and a warning shows once, not on every request.
+The session choice follows resume, fork, and tree navigation. `--system-prompt` and `SYSTEM.md` outrank a settings soul but not `/soul`. A bad entry only breaks the case that uses it. When another extension forces the whole prompt, souls warns but still replaces the latest preamble if its exact text remains in the forced prompt, preserving surrounding instructions. When a soul can't apply (a bad entry, a missing file, or no matching preamble), Pi's prompt is used and a warning shows once, not on every request.
