@@ -128,7 +128,7 @@ test("projection replaces identity only, including old deltas, without mutating 
   assert.throws(() => applySoul([{ role: "system", content: "plain", timestamp: 0 }], "Faye"), /no preamble/);
 });
 
-test("errors are deduplicated; forced prompts are patched from live options, with a warning rather than an error", () => {
+test("errors are deduplicated; forced prompts report successful replacement only after patching", () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-problems-"));
   try {
     const session = SessionManager.inMemory();
@@ -156,7 +156,7 @@ test("errors are deduplicated; forced prompts are patched from live options, wit
     options.forceSystemPrompt = "Pi\n\nPaseo voice mode is now off."; // A later handler appends text.
     assert.ok(request());
     assert.equal(options.forceSystemPrompt, "Faye\n\nPaseo voice mode is now off.");
-    assert.match(notices.at(-1)!, /^warning: Soul: another extension forced/);
+    assert.equal(notices.at(-1), "info: Soul: preamble replaced");
     const noticeCount = notices.length;
     assert.ok(request()); // Tool-loop requests must not look for Pi in our patched output.
     assert.equal(notices.length, noticeCount);
@@ -166,7 +166,7 @@ test("errors are deduplicated; forced prompts are patched from live options, wit
 
     options.forceSystemPrompt = "Replacement without the identity";
     assert.equal(request(), undefined);
-    assert.match(notices.at(-1)!, /forced prompt has no preamble/);
+    assert.equal(notices.at(-1), "warning: Soul: replacement failed — no preamble");
     assert.equal(request(), undefined);
     assert.equal(options.forceSystemPrompt, "Replacement without the identity");
 
@@ -174,7 +174,7 @@ test("errors are deduplicated; forced prompts are patched from live options, wit
     assert.ok(request()); // A stale force does not apply after the run.
     ctx.hasUI = false;
     handlers.get("before_agent_start")!({ systemPromptOptions: options }, ctx);
-    assert.throws(request, /forced prompt has no preamble/);
+    assert.throws(request, /replacement failed/);
     assert.equal(request(), undefined);
 
     // Print mode warnings go to stderr, but a compatible force must not throw.
@@ -184,10 +184,13 @@ test("errors are deduplicated; forced prompts are patched from live options, wit
       console.warn = (text: string) => warnings.push(text);
       handlers.get("session_start")!({}, ctx);
       handlers.get("before_agent_start")!({ messageType: "custom", systemPromptOptions: options }, ctx);
+      options.forceSystemPrompt = "Missing identity";
+      assert.throws(request, /replacement failed/);
+      assert.equal(warnings.length, 0); // No premature success notice on failure.
       options.forceSystemPrompt = "Pi\n\nExtra instructions";
       assert.ok(request());
       assert.ok(request());
-      assert.equal(warnings.length, 1);
+      assert.deepEqual(warnings, ["Soul: preamble replaced"]);
       assert.equal(options.forceSystemPrompt, "New Faye $&\n\nExtra instructions");
     } finally { console.warn = warn; }
   } finally { rmSync(dir, { recursive: true, force: true }); }

@@ -1,0 +1,20 @@
+{
+  "name": "pi-souls",
+  "version": "0.1.2",
+  "description": "Souls with model-specific defaults for Claude Code.",
+  "author": { "name": "AstroSheep" },
+  "userConfig": {
+    "defaultSoul": {
+      "type": "string",
+      "title": "Default soul",
+      "description": "Soul name to use by default (optional)."
+    },
+    "modelSouls": {
+      "type": "string",
+      "multiple": true,
+      "default": [],
+      "title": "Model souls",
+      "description": "Exact model=soul entries, such as claude-opus-5-5=faye."
+    }
+  }
+}

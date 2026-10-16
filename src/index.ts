@@ -108,17 +108,17 @@ export default function soulsExtension(pi: ExtensionAPI) {
     const projected = applySoul(messages, body);
     // Pi projects forced text after this hook; patch that too, not just its transcript sections.
     if (running && options?.forceSystemPrompt !== undefined) {
-      if (!forceReported) {
-        const warning = "Soul: another extension forced the prompt; attempting preamble replacement";
-        if (ctx.hasUI) ctx.ui.notify(warning, "warning");
-        else console.warn(warning);
-        forceReported = true;
-      }
       const forced = options.forceSystemPrompt;
       const original = forced === forcedProjection?.projected ? forcedProjection.original : forced;
       const patched = replaceForcedPreamble(messages, original, body);
       forcedProjection = { original, projected: patched };
       options.forceSystemPrompt = patched;
+      if (!forceReported) {
+        const notice = "Soul: preamble replaced";
+        if (ctx.hasUI) ctx.ui.notify(notice, "info");
+        else console.warn(notice);
+        forceReported = true;
+      }
     } else {
       forceReported = false;
     }

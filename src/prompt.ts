@@ -9,7 +9,7 @@ function hasPreamble(message: AgentMessage): message is SystemMessage {
 /** Forced prompts render the latest replayed preamble; leave appended instructions intact. */
 export function replaceForcedPreamble(messages: AgentMessage[], prompt: string, body: string): string {
   const preamble = messages.findLast(hasPreamble)?.sections?.preamble;
-  if (!preamble || !prompt.includes(preamble)) throw new Error("Soul skipped: the forced prompt has no preamble");
+  if (!preamble || !prompt.includes(preamble)) throw new Error("Soul: replacement failed — no preamble");
   // Use a callback so $ sequences in a soul are literal, not replacement patterns.
   return prompt.replace(preamble, () => body);
 }

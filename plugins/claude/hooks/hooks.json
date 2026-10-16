@@ -1,0 +1,4 @@
+{
+  "description": "Souls with model-specific defaults for Claude Code",
+  "modules": ["./register.ts"]
+}
