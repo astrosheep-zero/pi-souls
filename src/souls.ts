@@ -1,9 +1,13 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { stripFrontmatter, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter, type SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export const ENTRY_TYPE = "pi-souls:selection";
+export interface SoulFile {
+  body: string;
+  icon?: string;
+}
 export interface SoulConfig {
   defaultSoul?: unknown;
   modelSouls: Record<string, unknown>;
@@ -79,7 +83,7 @@ export function listSouls(dir: string): string[] {
 }
 
 /** Small local files are read fresh; no cache invalidation protocol or watchers needed. */
-export function loadSoul(dir: string, name: string): string {
+export function readSoul(dir: string, name: string): SoulFile {
   if (!isSoulName(name)) throw new Error(`Invalid soul name: ${name}`);
   const path = join(dir, `${name}.md`);
   let text: string;
@@ -90,7 +94,14 @@ export function loadSoul(dir: string, name: string): string {
     if (code === "ENOENT") throw new Error(`Soul "${name}" not found: ${path}`);
     throw new Error(`Soul "${name}" unreadable: ${path} (${code ?? String(error)})`);
   }
-  const body = stripFrontmatter(text).trim();
+  const parsed = parseFrontmatter<Record<string, unknown>>(text);
+  const body = parsed.body.trim();
   if (!body) throw new Error(`Soul "${name}" is empty`);
-  return body;
+  const raw = object(parsed.frontmatter) ? parsed.frontmatter.icon : undefined;
+  const icon = typeof raw === "string" ? raw.trim() : "";
+  return { body, ...(icon ? { icon } : {}) };
+}
+
+export function loadSoul(dir: string, name: string): string {
+  return readSoul(dir, name).body;
 }

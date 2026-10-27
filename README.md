@@ -25,13 +25,24 @@ Skip settings souls for this process. `SOULLESS=1` or `true` enables it; `0`, `f
 
 ## Souls
 
-One Markdown file per soul; the body becomes the identity. Frontmatter is stripped, and edits apply on the next request.
+One Markdown file per soul; the body becomes the identity. Frontmatter is stripped, and edits apply on the next request. An optional nonempty `icon` string is shown alone in the footer; without one, the footer shows the soul's file name.
 
 ```text
 ~/.agents/souls/
 ├── faye.md
 └── reviewer.md
 ```
+
+```md
+---
+icon: 🦈
+---
+Faye's identity body
+```
+
+## Presence
+
+The footer shows the effective soul, and is removed when no soul applies. Before the first request after startup, Pi does not expose the explicit system prompt to extensions, so a session `/soul` choice is shown but a settings or model soul waits until the first request confirms it applies. `/soul <name>` and `/soul clear` leave a compact durable divider in the transcript only when the effective identity actually changes: `── soul: faye ──`, or `── soulless ──` when nothing applies. `/soul clear` follows defaults, so it may land on another soul rather than soulless. Dividers keep the identity they recorded when replayed, and never enter model context. No divider appears for no-ops, failures, or a bare `/soul` status check.
 
 ## Settings
 

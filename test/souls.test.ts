@@ -44,12 +44,14 @@ test("soulless via CLI or env skips defaults; /soul wins and clear returns to so
       getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
+      registerEntryRenderer: () => {},
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const ctx = {
-      cwd: dir, model, sessionManager: session, isIdle: () => true,
-      getSystemPromptOptions: () => ({ cwd: dir }), ui: { notify: (text: string) => notices.push(text) },
+      cwd: dir, model, sessionManager: session, isIdle: () => true, hasUI: true,
+      getSystemPromptOptions: () => ({ cwd: dir }),
+      ui: { notify: (text: string) => notices.push(text), setStatus: () => {} },
     };
     const request = () => handlers.get("context_with_system")!({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx) as { messages: AgentMessage[] } | undefined;
 
@@ -137,11 +139,12 @@ test("errors are deduplicated; forced prompts report successful replacement only
       registerFlag: () => {}, getFlag: () => false,
       getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
       registerCommand: () => {},
+      registerEntryRenderer: () => {},
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const notices: string[] = [];
-    const ctx = { cwd: dir, model, sessionManager: session, hasUI: true, ui: { notify: (text: string, type: string) => notices.push(`${type}: ${text}`) } };
+    const ctx = { cwd: dir, model, sessionManager: session, hasUI: true, ui: { notify: (text: string, type: string) => notices.push(`${type}: ${text}`), setStatus: () => {} } };
     const request = () => handlers.get("context_with_system")!({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx);
     const options: Record<string, unknown> = { cwd: dir };
     handlers.get("before_agent_start")!({ systemPromptOptions: options }, ctx);
@@ -222,10 +225,11 @@ test("registered command persists selection, refuses missing files, skips no-ops
       getSettings: () => ({ soulsDir: dir }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
+      registerEntryRenderer: () => {},
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
-    const ctx = { cwd: dir, model, sessionManager: session, isIdle: () => true, getSystemPromptOptions: () => ({ cwd: dir }), ui: { notify: (text: string) => notices.push(text) } } as unknown as ExtensionContext;
+    const ctx = { cwd: dir, model, sessionManager: session, isIdle: () => true, hasUI: true, getSystemPromptOptions: () => ({ cwd: dir }), ui: { notify: (text: string) => notices.push(text), setStatus: () => {} } } as unknown as ExtensionContext;
     const project = handlers.get("context_with_system")!;
     const entries = () => session.getBranch().length;
 
@@ -279,14 +283,15 @@ test("customPrompt keeps settings souls off, leaves the session choice and statu
       getSettings: () => ({ soulsDir: dir, defaultSoul: "global" }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
+      registerEntryRenderer: () => {},
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const options = { cwd: dir, customPrompt: "My prompt" };
     const ctx = {
-      cwd: dir, model, sessionManager: session, isIdle: () => true,
+      cwd: dir, model, sessionManager: session, isIdle: () => true, hasUI: true,
       getSystemPromptOptions: () => ({ cwd: dir, customPrompt: options.customPrompt }),
-      ui: { notify: (text: string) => notices.push(text) },
+      ui: { notify: (text: string) => notices.push(text), setStatus: () => {} },
     } as unknown as ExtensionContext;
     const start = handlers.get("before_agent_start")!;
     const project = handlers.get("context_with_system")!;
