@@ -45,8 +45,31 @@ async function select($: Engine, options: PluginOptions, model: string, reported
   return name || undefined;
 }
 
+interface Identity {
+  model: string;
+  /** The soul the host actually put in the prompt, or undefined when it has not shown one. */
+  soul: string | null | undefined;
+}
+
+interface SessionState {
+  baseline?: Identity;
+  /** Only a successful prompt.compose replacement is evidence of the active soul. */
+  applied?: { model: string; soul: string };
+}
+
+function transitionLines(previous: Identity, current: Identity): string[] {
+  const lines: string[] = [];
+  if (previous.model !== current.model) lines.push(`new brain: ${current.model}`);
+  if (previous.soul !== undefined && current.soul !== undefined && previous.soul !== current.soul && current.soul !== null) {
+    lines.push(`new soul: ${current.soul}`);
+  }
+  return lines;
+}
+
 export function register(on: On, options: PluginOptions = {}) {
   const reported = new Set<string>();
+  // Transient, like the rest of this host's session state; the engine's framing wraps context.
+  const sessions = new Map<string, SessionState>();
   on("prompt.compose", async ($, e, next) => {
     const result = await next(e);
     try {
@@ -65,10 +88,63 @@ export function register(on: On, options: PluginOptions = {}) {
         await warnOnce($, reported, "Skipped: no matching opening paragraph");
         return result;
       }
+      const id = await $.session.id().catch(() => undefined);
+      if (id) {
+        const state = sessions.get(id) ?? {};
+        state.applied = { model: e.model, soul: name };
+        sessions.set(id, state);
+      }
       return { ...result, sections: result.sections.map((item, i) => i === index ? { ...item, text } : item) };
     } catch (error) {
       await warnOnce($, reported, `Skipped: ${error instanceof Error ? error.message : String(error)}`);
       return result;
     }
+  });
+
+  on("prompt.submit", async ($, e, next) => {
+    if (e.command || e.isMeta) return next(e);
+    let id: string;
+    let previous: Identity | undefined;
+    let current: Identity;
+    let state: SessionState;
+    try {
+      id = await $.session.id();
+      const model = await $.session.model();
+      state = sessions.get(id) ?? {};
+      sessions.set(id, state);
+      previous = state.baseline;
+      const applied = state.applied?.model === model ? state.applied.soul : undefined;
+      current = {
+        model,
+        soul: applied !== undefined ? applied : previous?.soul,
+      };
+    } catch {
+      return next(e);
+    }
+    if (!previous) {
+      const result = await next(e);
+      if (!("drop" in result)) state.baseline = current;
+      return result;
+    }
+    if (previous.model === current.model && previous.soul === current.soul) return next(e);
+    const lines = transitionLines(previous, current);
+    if (!lines.length) {
+      const result = await next(e);
+      if (!("drop" in result)) state.baseline = current;
+      return result;
+    }
+    const text = lines.join("\n");
+    // Let a downstream rejection propagate; calling next twice would submit twice.
+    const result = await next({ ...e, context: [...(e.context ?? []), text] });
+    // A dropped prompt or a downstream hook that strips the block did not deliver it.
+    if (!("drop" in result) && result.context?.includes(text)) state.baseline = current;
+    return result;
+  });
+
+  on("session.end", async ($, e, next) => {
+    try {
+      sessions.delete(await $.session.id());
+    } catch {}
+    return next(e);
   });
 }

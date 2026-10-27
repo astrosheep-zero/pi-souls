@@ -15,20 +15,34 @@ function host(options: PluginOptions = { defaultSoul: "faye", modelSouls: ["clau
   ]);
   const env = new Map<string, string>([["HOME", "/home"]]);
   const warnings: string[] = [];
+  let sessionId = "session-a";
+  let sessionModel = "claude-other";
   const $ = {
     env: { get: async (key: string) => env.get(key) },
     fs: {
       exists: async (path: string) => files.has(path),
       read: async (path: string) => { if (!files.has(path)) throw new Error("unreadable"); return files.get(path)!; },
     },
-    session: { id: async () => "session-a" },
+    session: { id: async () => sessionId, model: async () => sessionModel },
     ui: { log: (text: string) => { warnings.push(text); } },
   } as unknown as EngineInterface;
   register(((event: string, hook: Hook) => { hooks.set(event, hook); }) as unknown as On, options);
-  assert.deepEqual([...hooks.keys()], ["prompt.compose"]);
+  assert.deepEqual([...hooks.keys()], ["prompt.compose", "prompt.submit", "session.end"]);
   const compose = (result: PromptComposeResult, lean = false, model = "claude-other"): Promise<PromptComposeResult> =>
     hooks.get("prompt.compose")!($, { model, traits: lean ? ["lean"] : [] }, async () => result);
-  return { files, env, warnings, compose };
+  const submit = (input: { command?: { name: string; args: string }; isMeta?: true; context?: string[]; drop?: boolean; strip?: boolean; reject?: boolean } = {}) =>
+    hooks.get("prompt.submit")!($, { text: "hi", wait: false, origin: { kind: "composer" }, ...input }, async (e: any) => {
+      if (input.reject) throw new Error("blocked");
+      if (input.drop) return { drop: "no" };
+      return { text: e.text, context: input.strip ? input.context : e.context };
+    });
+  const end = () => hooks.get("session.end")!($, {}, async (e: any) => e);
+  return {
+    files, env, warnings, compose, submit, end,
+    setSession: (id: string) => { sessionId = id; },
+    setSessionModel: (model: string) => { sessionModel = model; },
+    options,
+  };
 }
 const original: PromptComposeResult = {
   sections: Object.freeze([
@@ -98,6 +112,111 @@ test("Claude unreadable/empty soul leaves core prompt intact and deduplicates th
   assert.match(h.warnings[0], /empty/);
   h.files.set("/home/.agents/souls/faye.md", "You are repaired.");
   assert.match((await h.compose(original)).sections[0].text, /repaired/);
+});
+
+test("Claude transition context is exact, separate per session, and quiet on the first prompt", async () => {
+  const h = host();
+  await h.compose(original); // host evidence: faye is actually in the prompt
+  assert.equal((await h.submit()).context, undefined); // baseline
+
+  h.setSessionModel("claude-test");
+  await h.compose(original, false, "claude-test"); // host evidence: reviewer is now in the prompt
+  assert.deepEqual((await h.submit()).context, ["new brain: claude-test\nnew soul: reviewer"]);
+  assert.equal((await h.submit()).context, undefined);
+});
+
+test("Claude omits a soul cue when prompt.compose has no evidence it applied one", async () => {
+  const h = host();
+  await h.compose(original);
+  await h.submit(); // baseline faye
+
+  h.setSessionModel("claude-test");
+  assert.deepEqual((await h.submit()).context, ["new brain: claude-test"]); // frozen snapshot: no compose evidence
+  assert.equal((await h.submit()).context, undefined);
+
+  await h.compose(original, false, "claude-test"); // now reviewer is actually composed
+  assert.deepEqual((await h.submit()).context, ["new soul: reviewer"]);
+});
+
+test("Claude does not trust a compose that skipped the opening or failed to load", async () => {
+  const h = host();
+  await h.compose(original);
+  await h.submit();
+  h.setSessionModel("claude-test");
+
+  const changed = { sections: [{ ...original.sections[0], text: "Changed opening\n\nKeep all of it" }] };
+  assert.equal(await h.compose(changed, false, "claude-test"), changed);
+  assert.deepEqual((await h.submit()).context, ["new brain: claude-test"]);
+
+  h.files.set("/home/.agents/souls/reviewer.md", "You are repaired.");
+  assert.match((await h.compose(original, false, "claude-test")).sections[0].text, /repaired/);
+  assert.deepEqual((await h.submit()).context, ["new soul: reviewer"]);
+});
+
+test("Claude command, meta, drop and stripped context do not consume the cue", async () => {
+  const h = host();
+  await h.compose(original);
+  await h.submit();
+  h.setSessionModel("claude-test");
+  await h.compose(original, false, "claude-test");
+
+  assert.equal((await h.submit({ command: { name: "compact", args: "" } })).context, undefined);
+  assert.equal((await h.submit({ isMeta: true })).context, undefined);
+  assert.deepEqual((await h.submit({ drop: true })).drop, "no");
+  await assert.rejects(h.submit({ reject: true }), /blocked/);
+  assert.equal((await h.submit({ strip: true })).context, undefined);
+  assert.deepEqual((await h.submit()).context, ["new brain: claude-test\nnew soul: reviewer"]);
+});
+
+test("Claude does not establish a baseline until the first prompt is accepted", async () => {
+  const dropped = host();
+  await dropped.compose(original);
+  assert.deepEqual((await dropped.submit({ drop: true })).drop, "no");
+  dropped.setSessionModel("claude-test");
+  await dropped.compose(original, false, "claude-test");
+  assert.equal((await dropped.submit()).context, undefined); // accepted prompt is the baseline
+  dropped.setSessionModel("claude-other");
+  await dropped.compose(original);
+  assert.deepEqual((await dropped.submit()).context, ["new brain: claude-other\nnew soul: faye"]);
+
+  const rejected = host();
+  await rejected.compose(original);
+  await assert.rejects(rejected.submit({ reject: true }), /blocked/);
+  rejected.setSessionModel("claude-test");
+  await rejected.compose(original, false, "claude-test");
+  assert.equal((await rejected.submit()).context, undefined);
+});
+
+test("Claude keeps one baseline per session and clears it at session end", async () => {
+  const h = host();
+  await h.compose(original);
+  await h.submit();
+  h.setSession("session-b");
+  h.setSessionModel("claude-test");
+  await h.compose(original, false, "claude-test");
+  assert.equal((await h.submit()).context, undefined);
+  h.setSession("session-a");
+  await h.compose(original, false, "claude-test");
+  assert.deepEqual((await h.submit()).context, ["new brain: claude-test\nnew soul: reviewer"]);
+  h.setSession("session-b");
+  assert.equal((await h.submit()).context, undefined);
+
+  await h.end();
+  h.setSessionModel("claude-other");
+  await h.compose(original);
+  assert.equal((await h.submit()).context, undefined);
+});
+
+test("Claude never announces a soul that failed to compose", async () => {
+  const h = host({ defaultSoul: "faye", modelSouls: ["claude-broken=missing"] });
+  await h.compose(original);
+  await h.submit();
+  h.setSessionModel("claude-broken");
+  assert.equal(await h.compose(original, false, "claude-broken"), original);
+  assert.deepEqual((await h.submit()).context, ["new brain: claude-broken"]);
+  h.files.set("/home/.agents/souls/missing.md", "You are missing.");
+  assert.match((await h.compose(original, false, "claude-broken")).sections[0].text, /missing/);
+  assert.deepEqual((await h.submit()).context, ["new soul: missing"]);
 });
 
 test("Claude hooks typecheck without Node globals", () => {

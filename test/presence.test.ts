@@ -22,7 +22,7 @@ function setup(files: Record<string, string>, settings: Record<string, unknown> 
   const session = SessionManager.inMemory();
   const statuses = new Map<string, string>();
   const notices: string[] = [];
-  const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+  const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
   const renderers = new Map<string, Renderer>();
   let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
   let flag = false;
@@ -37,7 +37,7 @@ function setup(files: Record<string, string>, settings: Record<string, unknown> 
     appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
     registerCommand: (_name: string, registered: typeof command) => { command = registered; },
     registerEntryRenderer: (type: string, renderer: unknown) => { renderers.set(type, renderer as Renderer); },
-    on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
+    on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
   } as unknown as ExtensionAPI;
   extension(pi);
 
@@ -50,7 +50,11 @@ function setup(files: Record<string, string>, settings: Record<string, unknown> 
     },
   } as unknown as ExtensionContext;
 
-  const fire = (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx);
+  const fire = (name: string, event: unknown = {}) => {
+    let result: unknown;
+    for (const handler of handlers.get(name) ?? []) result = handler(event, ctx) ?? result;
+    return result;
+  };
   const beforeAgent = (customPrompt?: string) => fire("before_agent_start", { systemPromptOptions: { cwd: dir, customPrompt } });
   const request = (messages: unknown[] = [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }]) => fire("context_with_system", { messages });
   const dividers = () => session.getBranch().flatMap((entry) => entry.type === "custom" && entry.customType === PRESENCE_ENTRY_TYPE ? [entry.data] : []);

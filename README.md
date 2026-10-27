@@ -58,6 +58,17 @@ Precedence: `/soul <name>` > `--soulless` / `SOULLESS` / explicit system prompt 
 
 The session choice follows resume, fork, and tree navigation. `--system-prompt` and `SYSTEM.md` outrank a settings soul but not `/soul`. A bad entry only breaks the case that uses it. When another extension forces the whole prompt, souls warns but still replaces the latest preamble if its exact text remains in the forced prompt, preserving surrounding instructions. When a soul can't apply (a bad entry, a missing file, or no matching preamble), Pi's prompt is used and a warning shows once, not on every request.
 
+## Transition reminders
+
+When the model or effective soul changes between prompts, the next user prompt carries one hidden system reminder:
+
+```text
+new brain: gpt-5.4
+new soul: faye
+```
+
+Only changed lines appear, brain first. The reminder is separate from clock/time messages and never written to the transcript, and the first prompt only records a baseline. With Pi the baseline lives on the active session branch; the reminder follows the final live prompt options, so resume, fork, tree navigation, and reload do not repeat it, and extension-triggered turns and commands do not consume it.
+
 ## Claude Code mod
 
 From a checkout, with Claude Code 2.1.299 or later:
@@ -84,6 +95,8 @@ Uses the same `~/.agents/souls/<name>.md` files and strips frontmatter. Configur
 `pi-souls@inline` is the key for `--plugin-dir`; a marketplace installation uses `pi-souls@<marketplace>` instead. Values come directly from Claude's official plugin configuration, with no separate souls settings file. `modelSouls` is a string list of exact `model=soul` entries; malformed entries warn once per session and are ignored individually. If a model appears more than once, the last valid entry wins.
 
 Precedence: `SOULLESS=1` / `true` > exact requested Claude model ID in `modelSouls` > `defaultSoul` > Claude default. Model IDs have no Pi provider prefix. Pi's own settings remain unchanged. File reads use the mods API, without a helper process or build step.
+
+The mod sends the same hidden transition reminder through `prompt.submit` context, which the engine wraps, and keeps a transient per-session baseline. A soul line appears only after `prompt.compose` actually replaced the opening for that model; a frozen prompt, a skipped compose, or `--system-prompt` leaves the last evidenced soul in place. The brain line still reports. Command/meta prompts, dropped prompts, and downstream-stripped context do not consume it.
 
 Only the first `You are…` paragraph of the normal or lean opening is replaced. Leading whitespace, the remaining text, and all other sections stay unchanged. A missing or unexpected opening leaves the prompt intact and warns once per session; unreadable souls also fall back to Claude's prompt.
 

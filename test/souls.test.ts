@@ -33,7 +33,7 @@ test("soulless via CLI or env skips defaults; /soul wins and clear returns to so
     writeFileSync(join(dir, "faye.md"), "Faye");
     const session = SessionManager.inMemory();
     const notices: string[] = [];
-    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
     let flag = false;
     let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
     const pi = {
@@ -45,7 +45,7 @@ test("soulless via CLI or env skips defaults; /soul wins and clear returns to so
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
       registerEntryRenderer: () => {},
-      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const ctx = {
@@ -53,7 +53,7 @@ test("soulless via CLI or env skips defaults; /soul wins and clear returns to so
       getSystemPromptOptions: () => ({ cwd: dir }),
       ui: { notify: (text: string) => notices.push(text), setStatus: () => {} },
     };
-    const request = () => handlers.get("context_with_system")!({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx) as { messages: AgentMessage[] } | undefined;
+    const request = () => handlers.get("context_with_system")![0]({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx) as { messages: AgentMessage[] } | undefined;
 
     process.env.SOULLESS = "0";
     assert.ok(request());
@@ -134,20 +134,21 @@ test("errors are deduplicated; forced prompts report successful replacement only
   const dir = mkdtempSync(join(tmpdir(), "souls-problems-"));
   try {
     const session = SessionManager.inMemory();
-    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
     const pi = {
       registerFlag: () => {}, getFlag: () => false,
       getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
+      appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: () => {},
       registerEntryRenderer: () => {},
-      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const notices: string[] = [];
     const ctx = { cwd: dir, model, sessionManager: session, hasUI: true, ui: { notify: (text: string, type: string) => notices.push(`${type}: ${text}`), setStatus: () => {} } };
-    const request = () => handlers.get("context_with_system")!({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx);
+    const request = () => handlers.get("context_with_system")![0]({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx);
     const options: Record<string, unknown> = { cwd: dir };
-    handlers.get("before_agent_start")!({ systemPromptOptions: options }, ctx);
+    handlers.get("before_agent_start")![0]({ systemPromptOptions: options }, ctx);
 
     assert.equal(request(), undefined);
     assert.equal(request(), undefined);
@@ -173,10 +174,10 @@ test("errors are deduplicated; forced prompts report successful replacement only
     assert.equal(request(), undefined);
     assert.equal(options.forceSystemPrompt, "Replacement without the identity");
 
-    handlers.get("agent_settled")!({ aborted: false }, ctx);
+    handlers.get("agent_settled")![0]({ aborted: false }, ctx);
     assert.ok(request()); // A stale force does not apply after the run.
     ctx.hasUI = false;
-    handlers.get("before_agent_start")!({ systemPromptOptions: options }, ctx);
+    handlers.get("before_agent_start")![0]({ systemPromptOptions: options }, ctx);
     assert.throws(request, /replacement failed/);
     assert.equal(request(), undefined);
 
@@ -185,8 +186,8 @@ test("errors are deduplicated; forced prompts report successful replacement only
     const warnings: string[] = [];
     try {
       console.warn = (text: string) => warnings.push(text);
-      handlers.get("session_start")!({}, ctx);
-      handlers.get("before_agent_start")!({ messageType: "custom", systemPromptOptions: options }, ctx);
+      handlers.get("session_start")![0]({}, ctx);
+      handlers.get("before_agent_start")![0]({ messageType: "custom", systemPromptOptions: options }, ctx);
       options.forceSystemPrompt = "Missing identity";
       assert.throws(request, /replacement failed/);
       assert.equal(warnings.length, 0); // No premature success notice on failure.
@@ -218,7 +219,7 @@ test("registered command persists selection, refuses missing files, skips no-ops
     writeFileSync(join(dir, "faye.md"), "Faye");
     const session = SessionManager.inMemory();
     const notices: string[] = [];
-    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
     let command!: { handler: (args: string, ctx: unknown) => Promise<void>; getArgumentCompletions: (prefix: string) => { value: string }[] | null };
     const pi = {
       registerFlag: () => {}, getFlag: () => false,
@@ -226,11 +227,11 @@ test("registered command persists selection, refuses missing files, skips no-ops
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
       registerEntryRenderer: () => {},
-      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const ctx = { cwd: dir, model, sessionManager: session, isIdle: () => true, hasUI: true, getSystemPromptOptions: () => ({ cwd: dir }), ui: { notify: (text: string) => notices.push(text), setStatus: () => {} } } as unknown as ExtensionContext;
-    const project = handlers.get("context_with_system")!;
+    const project = handlers.get("context_with_system")![0];
     const entries = () => session.getBranch().length;
 
     assert.deepEqual(command.getArgumentCompletions("f")?.map((item) => item.value), ["faye"]);
@@ -276,7 +277,7 @@ test("customPrompt keeps settings souls off, leaves the session choice and statu
     writeFileSync(join(dir, "global.md"), "Global");
     const session = SessionManager.inMemory();
     const notices: string[] = [];
-    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
     let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
     const pi = {
       registerFlag: () => {}, getFlag: () => false,
@@ -284,7 +285,7 @@ test("customPrompt keeps settings souls off, leaves the session choice and statu
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
       registerEntryRenderer: () => {},
-      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const options = { cwd: dir, customPrompt: "My prompt" };
@@ -293,8 +294,8 @@ test("customPrompt keeps settings souls off, leaves the session choice and statu
       getSystemPromptOptions: () => ({ cwd: dir, customPrompt: options.customPrompt }),
       ui: { notify: (text: string) => notices.push(text), setStatus: () => {} },
     } as unknown as ExtensionContext;
-    const start = handlers.get("before_agent_start")!;
-    const project = handlers.get("context_with_system")!;
+    const start = handlers.get("before_agent_start")![0];
+    const project = handlers.get("context_with_system")![0];
     const system = (): AgentMessage[] => [{ role: "system", content: "", sections: { preamble: "My prompt" }, timestamp: 0 }];
 
     start({ systemPromptOptions: { cwd: dir, customPrompt: options.customPrompt } }, ctx);

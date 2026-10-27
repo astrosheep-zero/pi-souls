@@ -4,6 +4,7 @@ import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@
 import { applySoul, replaceForcedPreamble } from "./prompt.ts";
 import { footerText, resolvePresence, selectionPresence, type Presence } from "./presence.ts";
 import { ENTRY_TYPE, effectiveSoul, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection } from "./souls.ts";
+import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, formatTransitionReminder, readTransition, sameTransition, transitionLines, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
 
 const home = homedir();
@@ -26,6 +27,11 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // Hold live options: handlers after ours can still set customPrompt or forceSystemPrompt.
   let options: BuildSystemPromptOptions | undefined;
   let running = false;
+  let userRun = false;
+  let transitionComputed = false;
+  let pendingReminder: string | undefined;
+  // What the projection handler learned for this request, read by the transition handler.
+  let projection: { known: boolean; soul: string | null } | undefined;
   let forceReported = false;
   // ExtensionContext has no system-prompt options before a run or command; track what the host told us.
   let promptKnown = false;
@@ -51,7 +57,8 @@ export default function soulsExtension(pi: ExtensionAPI) {
   };
   pi.on("session_start", (_event, ctx) => {
     cwd = ctx.cwd; reported = undefined; forceReported = false;
-    options = undefined; running = false; forcedProjection = undefined;
+    options = undefined; running = false; userRun = false; transitionComputed = false; pendingReminder = undefined;
+    projection = undefined; forcedProjection = undefined;
     promptKnown = false; seenPrompt = undefined;
     refreshFooter(ctx, undefined, ctx.model, false);
   });
@@ -59,10 +66,14 @@ export default function soulsExtension(pi: ExtensionAPI) {
   pi.on("session_tree", (_event, ctx) => refreshFooter(ctx, promptValue()));
   pi.on("before_agent_start", (event, ctx) => {
     options = event.systemPromptOptions; running = true; forcedProjection = undefined;
+    userRun = !("messageType" in event) || event.messageType === "user";
+    transitionComputed = false; pendingReminder = undefined;
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
   });
-  pi.on("agent_settled", () => { running = false; });
+  pi.on("agent_settled", () => {
+    running = false; userRun = false; transitionComputed = false; pendingReminder = undefined; projection = undefined;
+  });
 
   pi.registerCommand("soul", {
     description: "Switch soul: /soul [name|clear]",
@@ -198,30 +209,73 @@ export default function soulsExtension(pi: ExtensionAPI) {
     ctx.ui.notify(problem, "warning");
   };
 
+  // The request boundary sees the final live options, after every before_agent_start handler.
+  const transition = (ctx: ExtensionContext, soul: string | null | undefined): string | undefined => {
+    const branch = ctx.sessionManager.getBranch();
+    const previous = readTransition(branch);
+    const model = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null;
+    const current: Transition = { model, soul: soul === undefined ? previous?.soul ?? null : soul };
+    if (!previous) {
+      pi.appendEntry(TRANSITION_ENTRY_TYPE, { version: 1, ...current });
+      return;
+    }
+    if (sameTransition(previous, current)) return;
+    pi.appendEntry(TRANSITION_ENTRY_TYPE, { version: 1, ...current });
+    const lines = transitionLines(previous, current);
+    return lines.length ? formatTransitionReminder(lines) : undefined;
+  };
+
+  const reminder = (content: string): AgentMessage => ({
+    role: "custom",
+    customType: TRANSITION_MESSAGE_TYPE,
+    content,
+    display: false,
+    details: { version: 1 },
+    timestamp: Date.now(),
+  });
+
+  // First handler owns presence/projection and its existing error path, including the no-UI throw.
   pi.on("context_with_system", (event, ctx) => {
     if (options) {
       seenPrompt = options.customPrompt; promptKnown = true;
     }
+    projection = undefined;
     let presence: Presence | undefined;
     try {
       presence = presenceFor(ctx, options?.customPrompt);
     } catch (error) {
+      projection = { known: false, soul: null };
       setFooter(ctx, undefined);
       return report(error, ctx);
     }
     if (!presence) {
+      projection = { known: true, soul: null };
       setFooter(ctx, undefined);
       reported = undefined;
       return;
     }
     try {
       const messages = project(event.messages, presence.body, ctx);
+      projection = { known: true, soul: presence.selection.name };
       setFooter(ctx, footerText(presence));
       reported = undefined;
       return messages && { messages };
     } catch (error) {
+      projection = { known: false, soul: null };
       setFooter(ctx, undefined);
       report(error, ctx);
     }
+  });
+
+  // A separate handler still runs after the runner catches a projection throw.
+  pi.on("context_with_system", (event, ctx) => {
+    if (!running || !userRun) return;
+    if (!transitionComputed) {
+      // A failed soul load or projection never becomes the new soul; the brain still reports.
+      pendingReminder = transition(ctx, projection?.known ? projection.soul : undefined);
+      transitionComputed = true;
+    }
+    if (!pendingReminder) return;
+    return { messages: [...event.messages, reminder(pendingReminder)] };
   });
 }
