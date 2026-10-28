@@ -7,7 +7,7 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earen
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
 import { applySoul, replaceForcedPreamble } from "../src/prompt.ts";
-import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, unmatchableModelKeys } from "../src/souls.ts";
+import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulVoicePath, unmatchableModelKeys } from "../src/souls.ts";
 import { formatTimeReminder } from "../src/time.ts";
 
 const model = { provider: "provider", id: "model" };
@@ -107,6 +107,55 @@ test("loader reads one body, strips metadata, observes edits and rejects unsafe 
     mkdirSync(join(dir, "folder.md"));
     assert.throws(() => loadSoul(dir, "folder"), /Soul "folder" unreadable: .*folder\.md/);
     assert.throws(() => readConfig({ modelSouls: ["faye"] }, dir), /modelSouls must be an object/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("directory souls are listed, render from their own folder, and win over a same-named file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-dir-"));
+  try {
+    writeFileSync(join(dir, "flat.md"), "Flat");
+    mkdirSync(join(dir, "deep", "parts"), { recursive: true });
+    writeFileSync(join(dir, "deep", "soul.md"), "---\nicon: 🦈\n---\nDeep {{ cwd }}\n{% include 'parts/own' %}\n{% render 'parts/shared' %}");
+    writeFileSync(join(dir, "deep", "parts", "own.md"), "own-part");
+    mkdirSync(join(dir, "parts"), { recursive: true });
+    writeFileSync(join(dir, "parts", "shared.md"), "shared-part");
+    mkdirSync(join(dir, "empty"));
+    mkdirSync(join(dir, "both"));
+    writeFileSync(join(dir, "both", "soul.md"), "Nested wins");
+    writeFileSync(join(dir, "both.md"), "Flat loses");
+
+    // A directory only counts with soul.md inside it; the nested form wins over the file.
+    assert.deepEqual(listSouls(dir), ["both", "deep", "flat"]);
+    assert.equal(readSoul(dir, "both").body, "Nested wins");
+    assert.deepEqual(readSoul(dir, "deep", { model: { provider: "p", id: "m" }, cwd: "/work" }), {
+      body: "Deep /work\nown-part\nshared-part",
+      icon: "🦈",
+    });
+    assert.equal(loadSoul(dir, "deep", { model: { provider: "", id: "" }, cwd: "/here" }).includes("Deep /here"), true);
+    assert.equal(soulFile(dir, "deep").path, join(dir, "deep", "soul.md"));
+    assert.deepEqual(soulFile(dir, "deep").root, [join(dir, "deep"), dir]);
+    assert.deepEqual(soulFile(dir, "flat").root, [dir]);
+    assert.throws(() => loadSoul(dir, "empty"), /Soul "empty" not found/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a directory soul's voice is found by extension precedence and unsafe names never resolve", () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-voice-"));
+  try {
+    mkdirSync(join(dir, "faye"));
+    writeFileSync(join(dir, "faye", "soul.md"), "Faye");
+    assert.equal(soulVoicePath(dir, "faye"), undefined);
+
+    writeFileSync(join(dir, "faye", "voice.js"), "export const voice = () => undefined;");
+    assert.equal(soulVoicePath(dir, "faye"), join(dir, "faye", "voice.js"));
+    writeFileSync(join(dir, "faye", "voice.mjs"), "export const voice = () => undefined;");
+    assert.equal(soulVoicePath(dir, "faye"), join(dir, "faye", "voice.mjs"));
+    writeFileSync(join(dir, "faye", "voice.ts"), "export const voice = () => undefined;");
+    assert.equal(soulVoicePath(dir, "faye"), join(dir, "faye", "voice.ts"));
+
+    writeFileSync(join(dir, "flat.md"), "Flat");
+    assert.equal(soulVoicePath(dir, "flat"), undefined);
+    assert.equal(soulVoicePath(dir, "../escape"), undefined);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

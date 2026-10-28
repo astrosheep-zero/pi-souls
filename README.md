@@ -25,13 +25,20 @@ Skip settings souls for this process. `SOULLESS=1` or `true` enables it; `0`, `f
 
 ## Souls
 
-One Markdown file per soul; the body becomes the identity. Frontmatter is stripped, and edits apply on the next request. An optional nonempty `icon` string is shown alone in the footer; without one, the footer shows the soul's file name.
+A soul is one Markdown file, or a directory holding `soul.md` beside whatever it keeps with it. The body becomes the identity; frontmatter is stripped, and edits apply on the next request. An optional nonempty `icon` string is shown alone in the footer; without one, the footer shows the soul's name.
 
 ```text
 ~/.agents/souls/
-├── faye.md
-└── reviewer.md
+├── faye/
+│   ├── soul.md
+│   ├── parts/shared.md
+│   └── voice.ts
+├── reviewer.md
+└── parts/
+    └── shared.md
 ```
+
+`<dir>/<name>/soul.md` wins when both forms exist. A directory soul renders templates from its own folder first and `soulsDir` second, so `parts/` next to it beats the shared one. `<name>/voice.ts` is optional; see [Voice](#voice).
 
 ```md
 ---
@@ -65,6 +72,26 @@ Available variables: `model.provider`, `model.id`, and `cwd` (the session workin
 Put reusable Markdown fragments in `soulsDir/parts/`; both `{% include 'parts/shared' %}` and `{% render 'parts/shared' %}` load `parts/shared.md` and can access the host variables above. Fragments should have no frontmatter. Subdirectories don't appear in `/soul` completion. Soul files and fragments are read fresh on each request.
 
 Template syntax is processed even inside Markdown code fences. Wrap literal examples in `{% raw %}...{% endraw %}`. The Claude Code mod below still reads souls as literal Markdown; Liquid rendering is Pi-only.
+
+## Voice
+
+A directory soul may answer lifecycle moments with code. `<soulsDir>/<name>/voice.ts` (or `voice.mjs`, `voice.js`) exports `voice(moment, world)`, by name or as the default:
+
+```ts
+export function voice(moment, world) {
+  if (moment.kind === "human") return { text: "……", audience: "human" };
+  if (moment.kind === "tool" && moment.phase === "after") return { text: `${moment.toolName} ${moment.ok ? "ok" : "failed"}` };
+  return undefined; // silence is always allowed
+}
+```
+
+Moments: `wake` (`source`: `startup`, `resume`, `fork`, `clear`, `compact`), `human` (`text`), and `tool` (`phase` `before`/`after`, `category` `reading`/`running`/`writing`/`other`, `toolName`, `filePath`, `input`, `output`, `ok`). `brain` and `soul` name the remaining beats.
+
+`world` is `{ now, sessionId, cwd, absenceMs?, storeDir, facts }`. `facts` carries `hour`, `morning`, `afternoon`, `evening`, `night`, `weekday` (0 is Sunday) and `weekend`. `absenceMs` is the time since the human's previous message when that is known; `storeDir` defaults to `~/.local/share/pi-souls/<name>`.
+
+`audience` decides delivery. `human` is a notification the model never reads, `both` is a visible transcript message, and `model` (the default) is a hidden one. A module that fails to import, throws, or returns no text is ignored: voice never interrupts the host. Pi loads it once, so restart after editing `voice.ts`; the mod starts fresh on every moment.
+
+Pi imports the module in-process. The Claude Code mod runs it in a `node` child process (`--experimental-strip-types`), because its sandbox has no `import()` and no Node. `node` must be on the mod's `PATH`.
 
 ## Settings
 
@@ -100,7 +127,7 @@ From a checkout, with Claude Code 2.1.299 or later:
 claude --plugin-dir /path/to/pi-souls/plugins/claude
 ```
 
-Uses the same `~/.agents/souls/<name>.md` files and strips frontmatter. Configure the plugin's optional `userConfig` values in Claude's user `settings.json`:
+Uses the same `~/.agents/souls/` souls (`<name>.md`, or `<name>/soul.md` with an optional `voice.ts`) and strips frontmatter. Configure the plugin's optional `userConfig` values in Claude's user `settings.json`:
 
 ```json
 {
@@ -123,6 +150,8 @@ Precedence: `SOULLESS=1` / `true` > exact requested Claude model ID in `modelSou
 The mod sends the same hidden transition reminder through `prompt.submit` context, which the engine wraps, and keeps a transient per-session baseline. A soul line appears only after `prompt.compose` actually replaced the opening for that model; a frozen prompt, a skipped compose, or `--system-prompt` leaves the last evidenced soul in place. The brain line still reports. Command/meta prompts, dropped prompts, and downstream-stripped context do not consume it.
 
 Only the first `You are…` paragraph of the normal or lean opening is replaced. Leading whitespace, the remaining text, and all other sections stay unchanged. A missing or unexpected opening leaves the prompt intact and warns once per session; unreadable souls also fall back to Claude's prompt. Time awareness (`timeaware`) is on by default (`false` disables it). When a soul is active, `prompt.submit` attaches the same watch-style time reminder on the first user prompt and when at least 1 hour has passed since the previous reminder. The parenthetical appears only after a gap of at least 1 hour between user prompts.
+
+A directory soul's `voice.ts` answers `wake` on `SessionStart`, `human` on `prompt.submit`, and `tool` on `PreToolUse`/`PostToolUse`/`PostToolUseFailure`. Model-facing text joins the event's context; `human` (and `both`) also show a toast. `absenceMs` comes from `seconds_since_last_response` on resume/fork and from the session's previous prompt otherwise.
 
 Limitations:
 - The separate official identity, `You are Claude Code, Anthropic's official CLI…`, cannot be removed by this hook; it coexists with the soul.

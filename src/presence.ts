@@ -1,5 +1,5 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { effectiveSoul, isSoulName, readSoul, resolveSoul, sessionSoul, type Selection, type SoulConfig, type SoulVariables } from "./souls.ts";
+import { effectiveSoul, isSoulName, readSoul, resolveSoul, sessionSoul, soulVoicePath, type Selection, type SoulConfig, type SoulVariables } from "./souls.ts";
 
 export const FOOTER_KEY = "soul";
 export const PRESENCE_ENTRY_TYPE = "pi-souls:presence";
@@ -15,6 +15,13 @@ export function selectionPresence(config: SoulConfig, selection: Selection | und
   if (!selection) return undefined;
   const soul = readSoul(config.dir, selection.name, variables);
   return { selection, body: soul.body, ...(soul.icon ? { icon: soul.icon } : {}) };
+}
+
+/** The active soul's executable voice, when it ships one; resolved without rendering the body. */
+export function resolveVoice(config: SoulConfig, selection: Selection | undefined): { name: string; path: string } | undefined {
+  if (!selection) return undefined;
+  const path = soulVoicePath(config.dir, selection.name);
+  return path ? { name: selection.name, path } : undefined;
 }
 
 /** The soul Pi is actually using, after settings, session, custom prompt, and soulless precedence. */

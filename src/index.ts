@@ -1,12 +1,13 @@
 import { homedir } from "node:os";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { applySoul, replaceForcedPreamble } from "./prompt.ts";
-import { footerText, resolvePresence, selectionPresence, type Presence } from "./presence.ts";
+import { footerText, resolvePresence, resolveVoice, selectionPresence, type Presence } from "./presence.ts";
 import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
 import { formatTimeReminder } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, formatTransitionReminder, readTransition, sameTransition, transitionLines, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
+import { loadVoice, toolCategory, toolFilePath, toolText, VOICE_MESSAGE_TYPE, worldFor, type Moment, type Voice } from "./voice.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
@@ -14,6 +15,12 @@ const soulVariables = (ctx: ExtensionContext): SoulVariables => ({
   model: { provider: ctx.model?.provider ?? "", id: ctx.model?.id ?? "" },
   cwd: ctx.cwd,
 });
+/** `new` starts a fresh session (a clear); `reload` re-loads the extension, not the session. */
+const wakeSource = (reason: string): Extract<Moment, { kind: "wake" }>["source"] | undefined => {
+  if (reason === "new") return "clear";
+  if (reason === "startup" || reason === "resume" || reason === "fork") return reason;
+  return undefined;
+};
 
 function describe(selection: Selection | undefined, model: ExtensionContext["model"], suppressed = false, soulless = false): string {
   if (!selection) return soulless ? "none (soulless)" : suppressed ? "none (custom prompt)" : "none";
@@ -41,6 +48,42 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // ExtensionContext has no system-prompt options before a run or command; track what the host told us.
   let promptKnown = false;
   let seenPrompt: string | undefined;
+  // One loaded voice module per soul directory; a changing `voice.ts` needs a restart, like any module.
+  const voices = new Map<string, Voice>();
+  const voiceFor = (path: string): Voice => {
+    let voice = voices.get(path);
+    if (!voice) {
+      voice = loadVoice(path);
+      voices.set(path, voice);
+    }
+    return voice;
+  };
+  // Tool calls remember what the end event no longer carries, bounded so a long run cannot grow it.
+  const toolCalls = new Map<string, { filePath?: string; input?: string }>();
+  const absence = (branch: readonly SessionEntry[], now: number): number | undefined => {
+    const last = lastUserMessageTimestamp(branch);
+    return last === undefined ? undefined : Math.max(0, now - last);
+  };
+  /** Only an effective soul that ships a voice module may speak; everything else, and every failure, stays quiet. */
+  const speak = async (moment: Moment, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
+    try {
+      const config = readConfig(pi.getSettings(), ctx.cwd);
+      const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model, soulless()), customPrompt);
+      const target = resolveVoice(config, selection);
+      if (!target) return;
+      const now = Date.now();
+      const world = worldFor({ now, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, soul: target.name, absenceMs: absence(ctx.sessionManager.getBranch(), now) });
+      const said = await voiceFor(target.path)(moment, world);
+      if (!said) return;
+      if (said.audience === "human") {
+        if (ctx.hasUI) ctx.ui.notify(said.text, "info");
+        return;
+      }
+      pi.sendMessage({ customType: VOICE_MESSAGE_TYPE, content: said.text, display: said.audience === "both", details: { moment: moment.kind } });
+    } catch {
+      // Voice is decoration: a broken module or soul never breaks the host.
+    }
+  };
   // Retain the original text so tool-loop requests and soul edits do not patch our own output.
   let forcedProjection: { original: string; projected: string; body: string; basePreamble?: string } | undefined;
   // A failed render must not leave an earlier soul in a forced prompt another handler rebuilt.
@@ -72,13 +115,17 @@ export default function soulsExtension(pi: ExtensionAPI) {
       setFooter(ctx, undefined);
     }
   };
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     cwd = ctx.cwd; reported = undefined; forceReported = false;
     options = undefined; running = false; userRun = false; transitionComputed = false; pendingReminder = undefined;
     projection = undefined; forcedProjection = undefined;
     promptKnown = false; seenPrompt = undefined;
+    toolCalls.clear();
     refreshFooter(ctx, undefined, ctx.model, false);
+    const source = wakeSource(event.reason);
+    if (source) return speak({ kind: "wake", source }, ctx, undefined);
   });
+  pi.on("session_compact", (_event, ctx) => speak({ kind: "wake", source: "compact" }, ctx, options?.customPrompt));
   pi.on("model_select", (event, ctx) => refreshFooter(ctx, promptValue(), event.model));
   pi.on("session_tree", (_event, ctx) => refreshFooter(ctx, promptValue()));
   pi.on("before_agent_start", (event, ctx) => {
@@ -88,6 +135,8 @@ export default function soulsExtension(pi: ExtensionAPI) {
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
     if (!userRun) return;
+    // The handler stays synchronous: a pending voice answer arrives when it arrives.
+    void speak({ kind: "human", text: event.prompt }, ctx, options.customPrompt);
     try {
       const branch = ctx.sessionManager.getBranch();
       const config = readConfig(pi.getSettings(), ctx.cwd);
@@ -105,6 +154,21 @@ export default function soulsExtension(pi: ExtensionAPI) {
   });
   pi.on("agent_settled", () => {
     running = false; userRun = false; transitionComputed = false; pendingReminder = undefined; projection = undefined;
+  });
+  pi.on("tool_call", (event, ctx) => {
+    const filePath = toolFilePath(event.input);
+    const input = toolText(event.input);
+    const record = { ...(filePath ? { filePath } : {}), ...(input ? { input } : {}) };
+    toolCalls.delete(event.toolCallId);
+    toolCalls.set(event.toolCallId, record);
+    if (toolCalls.size > 64) toolCalls.delete(toolCalls.keys().next().value!);
+    return speak({ kind: "tool", phase: "before", category: toolCategory(event.toolName), toolName: event.toolName, ...record }, ctx, options?.customPrompt);
+  });
+  pi.on("tool_execution_end", (event, ctx) => {
+    const record = toolCalls.get(event.toolCallId);
+    toolCalls.delete(event.toolCallId);
+    const output = toolText(event.result);
+    return speak({ kind: "tool", phase: "after", category: toolCategory(event.toolName), toolName: event.toolName, ...record, ...(output ? { output } : {}), ok: !event.isError }, ctx, options?.customPrompt);
   });
   // The host copies the run options before each tool-loop request, so re-render them here:
   // a broken soul falls back to the base prompt instead of stalling the previous body.

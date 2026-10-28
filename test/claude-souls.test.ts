@@ -1,6 +1,9 @@
 /// <reference path="../plugins/claude/types/claude-code.d.ts" />
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import type { EngineInterface, On, PluginOptions, PromptComposeResult, PromptSubmitInput, PromptSubmitResult } from "claude-code";
 import { register, replaceIdentity } from "../plugins/claude/hooks/register.ts";
@@ -32,7 +35,10 @@ function host(options: PluginOptions = { defaultSoul: "faye", modelSouls: ["clau
     ui: { log: (text: string) => { warnings.push(text); } },
   } as unknown as EngineInterface;
   register(((event: string, hook: Hook) => { hooks.set(event, hook); }) as unknown as On, options);
-  assert.deepEqual([...hooks.keys()], ["prompt.compose", "prompt.submit", "session.end"]);
+  assert.deepEqual([...hooks.keys()], [
+    "classic.SessionStart", "classic.PreToolUse", "classic.PostToolUse", "classic.PostToolUseFailure",
+    "prompt.compose", "prompt.submit", "session.end",
+  ]);
   const compose = (result: PromptComposeResult, lean = false, model = "claude-other"): Promise<PromptComposeResult> =>
     hooks.get("prompt.compose")!($, { model, traits: lean ? ["lean"] : [] }, async () => result);
   const submit = (
@@ -276,6 +282,157 @@ test("Claude prompt.submit refreshes the watch hourly by default and notes the h
   const accepted = await h.submit();
   assert.equal(accepted.context?.length, 1);
   assert.match(accepted.context![0]!, /since \*human\* was last present\)$/);
+});
+
+test("Claude loads a directory soul and prefers its soul.md over a same-named file", async () => {
+  const h = host();
+  h.files.set("/home/.agents/souls/faye/soul.md", "---\nicon: \u{1F988}\n---\nYou are Directory Faye.");
+  assert.match((await h.compose(original)).sections[0].text, /Directory Faye/);
+  h.files.delete("/home/.agents/souls/faye/soul.md");
+  assert.match((await h.compose(original)).sections[0].text, /You are Faye/);
+});
+
+const VOICE = `export function voice(moment, world) {
+  return { text: JSON.stringify({ moment, world }), audience: moment.kind === "human" ? "both" : "model" };
+}
+`;
+
+// The voice path is a real file and a real child process: only the engine's IO is stubbed.
+function diskHost(voice: Record<string, string> | string, options: PluginOptions = { defaultSoul: "faye", timeaware: false }) {
+  const home = mkdtempSync(join(tmpdir(), "claude-voice-"));
+  const souls = join(home, ".agents", "souls", "faye");
+  mkdirSync(souls, { recursive: true });
+  writeFileSync(join(souls, "soul.md"), "You are Faye.");
+  for (const [name, text] of Object.entries(typeof voice === "string" ? { "voice.ts": voice } : voice)) writeFileSync(join(souls, name), text);
+  const hooks = new Map<string, Hook>();
+  const toasts: string[] = [];
+  const env = new Map<string, string>([["HOME", home]]);
+  let now = new Date(2026, 9, 27, 2, 14, 0).getTime();
+  const session = { id: "session-a", model: "claude-test", cwd: "/work" };
+  const $ = {
+    clock: { now: async () => now },
+    env: { get: async (key: string) => env.get(key) },
+    fs: { exists: async (path: string) => existsSync(path), read: async (path: string) => readFileSync(path, "utf8") },
+    session: { id: async () => session.id, model: async () => session.model, cwd: async () => session.cwd },
+    ui: { log: () => {}, toast: (text: string) => { toasts.push(text); } },
+    process: {
+      run: async (argv: readonly string[], init?: { cwd?: string; timeoutMs?: number }) => {
+        const child = spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8", cwd: init?.cwd, timeout: init?.timeoutMs ?? 20_000 });
+        return { exitCode: child.status ?? 1, stdout: child.stdout ?? "", stderr: child.stderr ?? "", isStdoutTruncated: false, isStderrTruncated: false };
+      },
+    },
+  } as unknown as EngineInterface;
+  register(((event: string, hook: Hook) => { hooks.set(event, hook); }) as unknown as On, options);
+  const classic = (name: string, event: Record<string, unknown>, answer: Record<string, unknown> = {}) =>
+    hooks.get(name)!($, event, async (_e: unknown) => ({ ...answer }));
+  return {
+    home, souls, toasts, env, session,
+    fire: (name: string, event: Record<string, unknown>) => hooks.get(name)!($, { session_id: session.id, transcript_path: "", cwd: session.cwd, ...event }, async (x: any) => x),
+    classic,
+    submit: (event: Partial<PromptSubmitInput> = {}) =>
+      hooks.get("prompt.submit")!($, { text: "hello", wait: false, origin: { kind: "composer" }, ...event }, async (x: any) => ({ text: x.text, context: x.context, origin: x.origin })),
+    at: (value: number) => { now = value; },
+    close: () => rmSync(home, { recursive: true, force: true }),
+  };
+}
+
+const momentOf = (entry: string | undefined) => JSON.parse(entry!).moment;
+
+test("Claude wakes a directory soul's voice with the world it can see", async () => {
+  const h = diskHost(VOICE);
+  try {
+    const result = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "resume", seconds_since_last_response: 120 });
+    assert.equal(result.additionalContext.length, 1);
+    assert.equal(h.toasts.length, 0);
+    const { moment, world } = JSON.parse(result.additionalContext[0]);
+    assert.deepEqual(moment, { kind: "wake", source: "resume" });
+    assert.equal(world.now, new Date(2026, 9, 27, 2, 14, 0).getTime());
+    assert.equal(world.sessionId, "session-a");
+    assert.equal(world.cwd, "/work");
+    assert.equal(world.absenceMs, 120_000);
+    assert.equal(world.storeDir, `${h.home}/.local/share/pi-souls/faye`);
+    assert.deepEqual([world.facts.hour, world.facts.night, world.facts.weekday, world.facts.weekend], [2, true, 2, false]);
+
+    // Nothing to resume: no absence is invented.
+    const fresh = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "clear" });
+    assert.equal(JSON.parse(fresh.additionalContext[0]).world.absenceMs, undefined);
+    assert.deepEqual(momentOf(fresh.additionalContext[0]), { kind: "wake", source: "clear" });
+  } finally { h.close(); }
+
+  // A plain ES module works the same way: the runner reads `voice` or the default export.
+  const esm = diskHost({ "voice.mjs": "export default (moment) => ({ text: `mjs:${moment.source}` });" });
+  try {
+    const result = await esm.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
+    assert.deepEqual(result.additionalContext, ["mjs:startup"]);
+  } finally { esm.close(); }
+});
+
+test("Claude hands the human's prompt to the voice and appends what the model should read", async () => {
+  const h = diskHost(VOICE);
+  try {
+    const result = await h.submit({ text: "what now", context: ["earlier"] });
+    assert.deepEqual(result.context?.slice(0, 1), ["earlier"]);
+    const said = JSON.parse(result.context!.at(-1)!);
+    assert.deepEqual(said.moment, { kind: "human", text: "what now" });
+    assert.equal(said.world.sessionId, "session-a");
+    assert.equal(h.toasts.length, 1); // `both` reaches the human too
+    assert.equal(JSON.parse(h.toasts[0]!).moment.text, "what now");
+
+    // The next prompt learns how long the human was away.
+    h.at(new Date(2026, 9, 27, 2, 14, 0).getTime() + 90_000);
+    const next = await h.submit({ text: "again" });
+    assert.equal(JSON.parse(next.context!.at(-1)!).world.absenceMs, 90_000);
+  } finally { h.close(); }
+});
+
+test("Claude answers tool calls on both phases and keeps the host's own context", async () => {
+  const h = diskHost(VOICE);
+  try {
+    const before = await h.classic("classic.PreToolUse", { tool: "Read", tool_use_id: "t1", file_path: "/work/a.md" }, { additionalContext: ["host"] });
+    assert.deepEqual(before.additionalContext[0], "host");
+    const pre = JSON.parse(before.additionalContext[1]);
+    assert.deepEqual(pre.moment, {
+      kind: "tool", phase: "before", category: "reading", toolName: "Read",
+      filePath: "/work/a.md", input: JSON.stringify({ file_path: "/work/a.md" }),
+    });
+
+    const after = await h.classic("classic.PostToolUse", {
+      hook_event_name: "PostToolUse", tool_name: "Edit", tool_input: { file_path: "/work/b.md", old_string: "a", new_string: "b" }, tool_response: "done", tool_use_id: "t2",
+    }, { additionalContext: ["host"] });
+    const post = JSON.parse(after.additionalContext[1]);
+    assert.equal(post.moment.phase, "after");
+    assert.equal(post.moment.category, "writing");
+    assert.equal(post.moment.filePath, "/work/b.md");
+    assert.equal(post.moment.output, "done");
+    assert.equal(post.moment.ok, true);
+
+    const failed = await h.classic("classic.PostToolUseFailure", {
+      hook_event_name: "PostToolUseFailure", tool_name: "Bash", tool_input: { command: "false" }, error: "exit 1", tool_use_id: "t3",
+    });
+    const fail = JSON.parse(failed.additionalContext[0]);
+    assert.deepEqual([fail.moment.phase, fail.moment.category, fail.moment.ok, fail.moment.output], ["after", "running", false, "exit 1"]);
+  } finally { h.close(); }
+});
+
+test("Claude keeps silence when soulless, voiceless, or the voice module is broken", async () => {
+  const soulless = diskHost(VOICE);
+  try {
+    soulless.env.set("SOULLESS", "1");
+    const result = await soulless.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
+    assert.equal(result.additionalContext, undefined);
+    assert.equal((await soulless.submit()).context, undefined);
+  } finally { soulless.close(); }
+
+  const voiceless = diskHost({});
+  try {
+    assert.equal((await voiceless.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" })).additionalContext, undefined);
+  } finally { voiceless.close(); }
+
+  const broken = diskHost({ "voice.ts": "export const voice = () => { throw new Error('boom'); };" });
+  try {
+    assert.equal((await broken.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" })).additionalContext, undefined);
+    assert.equal((await broken.submit()).context, undefined);
+  } finally { broken.close(); }
 });
 
 test("Claude hooks typecheck without Node globals", () => {

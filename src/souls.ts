@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseFrontmatter, type SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -109,19 +109,47 @@ export function effectiveSoul(selection: Selection | undefined, customPrompt: st
   return selection?.source === "session" || !customPrompt ? selection : undefined;
 }
 
+/** A single file soul is `<name>.md`; a directory soul is `<name>/soul.md` plus whatever it keeps beside it. */
+export function soulFile(dir: string, name: string): { path: string; root: string[] } {
+  const nested = join(dir, name, "soul.md");
+  if (existsSync(nested)) return { path: nested, root: [join(dir, name), dir] };
+  return { path: join(dir, `${name}.md`), root: [dir] };
+}
+
+const VOICE_EXTENSIONS = [".ts", ".mjs", ".js"] as const;
+
+/** The executable voice of a directory soul, if it ships one. */
+export function soulVoicePath(dir: string, name: string): string | undefined {
+  if (!isSoulName(name)) return undefined;
+  for (const extension of VOICE_EXTENSIONS) {
+    const path = join(dir, name, `voice${extension}`);
+    if (existsSync(path)) return path;
+  }
+  return undefined;
+}
+
+/** File souls and directory souls are one list of names, sorted once. */
 export function listSouls(dir: string): string[] {
+  let entries;
   try {
-    return readdirSync(dir).filter((file) => file.endsWith(".md")).map((file) => file.slice(0, -3)).filter(isSoulName).sort();
+    entries = readdirSync(dir, { withFileTypes: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
+  const names = new Set<string>();
+  for (const entry of entries) {
+    const name = entry.isDirectory() ? entry.name : entry.name.endsWith(".md") ? entry.name.slice(0, -3) : undefined;
+    if (name === undefined || !isSoulName(name)) continue;
+    if (entry.isDirectory() ? existsSync(join(dir, name, "soul.md")) : entry.isFile()) names.add(name);
+  }
+  return [...names].sort();
 }
 
 /** Small local files are read fresh; no cache invalidation protocol or watchers needed. */
 export function readSoul(dir: string, name: string, variables: SoulVariables = EMPTY_VARIABLES): SoulFile {
   if (!isSoulName(name)) throw new Error(`Invalid soul name: ${name}`);
-  const path = join(dir, `${name}.md`);
+  const { path, root } = soulFile(dir, name);
   let text: string;
   try {
     text = readFileSync(path, "utf8");
@@ -131,7 +159,8 @@ export function readSoul(dir: string, name: string, variables: SoulVariables = E
     throw new Error(`Soul "${name}" unreadable: ${path} (${code ?? String(error)})`);
   }
   const parsed = parseFrontmatter<Record<string, unknown>>(text);
-  const engine = new Liquid({ root: dir, extname: ".md", strictVariables: true, strictFilters: true, globals: variables });
+  // A directory soul renders from its own folder first, so `parts/` next to it wins over the shared one.
+  const engine = new Liquid({ root, extname: ".md", strictVariables: true, strictFilters: true, globals: variables });
   let body: string;
   try {
     body = engine.renderSync(engine.parse(parsed.body, path)).trim();
