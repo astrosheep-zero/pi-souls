@@ -2,8 +2,10 @@ import { readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseFrontmatter, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Liquid } from "liquidjs";
 
 export const ENTRY_TYPE = "pi-souls:selection";
+export const TIME_ENTRY_TYPE = "pi-souls:time";
 export interface SoulFile {
   body: string;
   icon?: string;
@@ -12,11 +14,18 @@ export interface SoulConfig {
   defaultSoul?: unknown;
   modelSouls: Record<string, unknown>;
   dir: string;
+  timeaware: boolean;
 }
 export interface Selection {
   name: string;
   source: "session" | "model" | "default";
 }
+export interface SoulVariables {
+  model: { provider: string; id: string };
+  cwd: string;
+}
+
+const EMPTY_VARIABLES: SoulVariables = { model: { provider: "", id: "" }, cwd: "" };
 
 export function isSoulName(value: unknown): value is string {
   return typeof value === "string" && /^[\p{L}\p{N}_-][\p{L}\p{N}_.-]*$/u.test(value) && value !== "clear";
@@ -33,7 +42,7 @@ export function readConfig(settings: unknown, cwd: string): SoulConfig {
   if (!object(modelSouls)) throw new Error("modelSouls must be an object");
   if (typeof soulsDir !== "string" || !soulsDir.trim()) throw new Error("soulsDir must be a path");
   const dir = soulsDir === "~" || soulsDir.startsWith("~/") ? join(homedir(), soulsDir.slice(2)) : resolve(cwd, soulsDir);
-  return { defaultSoul, modelSouls, dir };
+  return { defaultSoul, modelSouls, dir, timeaware: settings.timeaware !== false };
 }
 
 /** Keys that can never match a model; surfaced by /soul instead of failing every request. */
@@ -50,6 +59,33 @@ export function sessionSoul(branch: readonly SessionEntry[]): string | undefined
       throw new Error("Corrupted soul entry. Run /soul clear");
     }
     return entry.data.name ?? undefined;
+  }
+  return undefined;
+}
+
+/** Timestamp of the most recent time note on the active branch. */
+export function lastTimeNoteTimestamp(branch: readonly SessionEntry[]): number | undefined {
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry.type !== "custom_message" || entry.customType !== TIME_ENTRY_TYPE) continue;
+    const details = entry.details;
+    if (typeof details === "object" && details !== null && typeof (details as { timestamp?: unknown }).timestamp === "number") {
+      return (details as { timestamp: number }).timestamp;
+    }
+    const parsed = Date.parse(entry.timestamp);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+/** Timestamp of the most recent user message on the active branch before this run's prompt is appended. */
+export function lastUserMessageTimestamp(branch: readonly SessionEntry[]): number | undefined {
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry.type !== "message" || entry.message.role !== "user") continue;
+    if (typeof entry.message.timestamp === "number" && Number.isFinite(entry.message.timestamp)) return entry.message.timestamp;
+    const parsed = Date.parse(entry.timestamp);
+    if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
 }
@@ -83,7 +119,7 @@ export function listSouls(dir: string): string[] {
 }
 
 /** Small local files are read fresh; no cache invalidation protocol or watchers needed. */
-export function readSoul(dir: string, name: string): SoulFile {
+export function readSoul(dir: string, name: string, variables: SoulVariables = EMPTY_VARIABLES): SoulFile {
   if (!isSoulName(name)) throw new Error(`Invalid soul name: ${name}`);
   const path = join(dir, `${name}.md`);
   let text: string;
@@ -95,13 +131,19 @@ export function readSoul(dir: string, name: string): SoulFile {
     throw new Error(`Soul "${name}" unreadable: ${path} (${code ?? String(error)})`);
   }
   const parsed = parseFrontmatter<Record<string, unknown>>(text);
-  const body = parsed.body.trim();
+  const engine = new Liquid({ root: dir, extname: ".md", strictVariables: true, strictFilters: true, globals: variables });
+  let body: string;
+  try {
+    body = engine.renderSync(engine.parse(parsed.body, path)).trim();
+  } catch (error) {
+    throw new Error(`Soul "${name}" template: ${error instanceof Error ? error.message : String(error)}`);
+  }
   if (!body) throw new Error(`Soul "${name}" is empty`);
   const raw = object(parsed.frontmatter) ? parsed.frontmatter.icon : undefined;
   const icon = typeof raw === "string" ? raw.trim() : "";
   return { body, ...(icon ? { icon } : {}) };
 }
 
-export function loadSoul(dir: string, name: string): string {
-  return readSoul(dir, name).body;
+export function loadSoul(dir: string, name: string, variables?: SoulVariables): string {
+  return readSoul(dir, name, variables).body;
 }

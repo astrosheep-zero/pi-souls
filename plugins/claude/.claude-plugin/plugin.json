@@ -4,6 +4,12 @@
   "description": "Souls with model-specific defaults for Claude Code.",
   "author": { "name": "AstroSheep" },
   "userConfig": {
+    "timeaware": {
+      "type": "boolean",
+      "default": true,
+      "title": "Time awareness",
+      "description": "Enable watch-style time reminders when a soul is active."
+    },
     "defaultSoul": {
       "type": "string",
       "title": "Default soul",

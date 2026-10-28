@@ -3,12 +3,17 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { applySoul, replaceForcedPreamble } from "./prompt.ts";
 import { footerText, resolvePresence, selectionPresence, type Presence } from "./presence.ts";
-import { ENTRY_TYPE, effectiveSoul, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection } from "./souls.ts";
+import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
+import { formatTimeReminder } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, formatTransitionReminder, readTransition, sameTransition, transitionLines, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
+const soulVariables = (ctx: ExtensionContext): SoulVariables => ({
+  model: { provider: ctx.model?.provider ?? "", id: ctx.model?.id ?? "" },
+  cwd: ctx.cwd,
+});
 
 function describe(selection: Selection | undefined, model: ExtensionContext["model"], suppressed = false, soulless = false): string {
   if (!selection) return soulless ? "none (soulless)" : suppressed ? "none (custom prompt)" : "none";
@@ -37,9 +42,21 @@ export default function soulsExtension(pi: ExtensionAPI) {
   let promptKnown = false;
   let seenPrompt: string | undefined;
   // Retain the original text so tool-loop requests and soul edits do not patch our own output.
-  let forcedProjection: { original: string; projected: string } | undefined;
+  let forcedProjection: { original: string; projected: string; body: string; basePreamble?: string } | undefined;
+  // A failed render must not leave an earlier soul in a forced prompt another handler rebuilt.
+  const restoreForcedProjection = (): void => {
+    if (!running || !forcedProjection || !options || options.forceSystemPrompt === undefined) return;
+    if (options.forceSystemPrompt === forcedProjection.projected) {
+      options.forceSystemPrompt = forcedProjection.original;
+      return;
+    }
+    // The forced prompt may have been rebuilt from the projected text: put the base identity back.
+    if (forcedProjection.basePreamble !== undefined && options.forceSystemPrompt.includes(forcedProjection.body)) {
+      options.forceSystemPrompt = options.forceSystemPrompt.replace(forcedProjection.body, () => forcedProjection!.basePreamble!);
+    }
+  };
   const presenceFor = (ctx: ExtensionContext, customPrompt: string | undefined, model = ctx.model) =>
-    resolvePresence(readConfig(pi.getSettings(), ctx.cwd), ctx.sessionManager.getBranch(), model, customPrompt, soulless());
+    resolvePresence(readConfig(pi.getSettings(), ctx.cwd), ctx.sessionManager.getBranch(), model, customPrompt, soulless(), soulVariables(ctx));
   const promptValue = () => (options ? options.customPrompt : seenPrompt);
   const refreshFooter = (ctx: ExtensionContext, customPrompt: string | undefined, model = ctx.model, known = promptKnown): void => {
     try {
@@ -50,7 +67,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         setFooter(ctx, undefined);
         return;
       }
-      setFooter(ctx, footerText(selectionPresence(config, effectiveSoul(selection, customPrompt))));
+      setFooter(ctx, footerText(selectionPresence(config, effectiveSoul(selection, customPrompt), soulVariables(ctx))));
     } catch {
       setFooter(ctx, undefined);
     }
@@ -70,9 +87,46 @@ export default function soulsExtension(pi: ExtensionAPI) {
     transitionComputed = false; pendingReminder = undefined;
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
+    if (!userRun) return;
+    try {
+      const branch = ctx.sessionManager.getBranch();
+      const config = readConfig(pi.getSettings(), ctx.cwd);
+      if (!config.timeaware) return;
+      const selection = effectiveSoul(resolveSoul(config, sessionSoul(branch), ctx.model, soulless()), options?.customPrompt);
+      if (!selection) return;
+      readSoul(config.dir, selection.name, soulVariables(ctx));
+      const now = Date.now();
+      const content = formatTimeReminder(now, lastTimeNoteTimestamp(branch), lastUserMessageTimestamp(branch));
+      if (!content) return;
+      return { message: { customType: TIME_ENTRY_TYPE, content, display: true, details: { timestamp: now } } };
+    } catch {
+      return;
+    }
   });
   pi.on("agent_settled", () => {
     running = false; userRun = false; transitionComputed = false; pendingReminder = undefined; projection = undefined;
+  });
+  // The host copies the run options before each tool-loop request, so re-render them here:
+  // a broken soul falls back to the base prompt instead of stalling the previous body.
+  pi.on("turn_end", (_event, ctx) => {
+    const previous = forcedProjection;
+    if (!running || !previous || !options || options.forceSystemPrompt === undefined) return;
+    const basePreamble = previous.basePreamble;
+    try {
+      const config = readConfig(pi.getSettings(), ctx.cwd);
+      const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model, soulless()), options.customPrompt);
+      if (!selection || basePreamble === undefined) {
+        options.forceSystemPrompt = previous.original;
+        return;
+      }
+      const body = readSoul(config.dir, selection.name, soulVariables(ctx)).body;
+      const projected = previous.original.includes(basePreamble) ? previous.original.replace(basePreamble, () => body) : previous.original;
+      options.forceSystemPrompt = projected;
+      forcedProjection = { original: previous.original, projected, body, basePreamble };
+    } catch {
+      // The next request re-renders; keep the fallback until the file works again.
+      options.forceSystemPrompt = previous.original;
+    }
   });
 
   pi.registerCommand("soul", {
@@ -111,7 +165,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         const loadedName = (name: string | undefined) => {
           if (!name) return undefined;
           try {
-            readSoul(config.dir, name);
+            readSoul(config.dir, name, soulVariables(ctx));
             return name;
           } catch {
             return undefined;
@@ -152,7 +206,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
           if (!available.includes(name)) {
             throw new Error(`No soul "${name}". Souls: ${available.join(", ") || "none"}`);
           }
-          readSoul(config.dir, name); // Validate content before changing durable session state.
+          readSoul(config.dir, name, soulVariables(ctx)); // Validate content before changing durable session state.
           const before = loadedName(activeName());
           pi.appendEntry(ENTRY_TYPE, { version: 1, name });
           if (before !== name) appendDivider(pi, name);
@@ -179,13 +233,15 @@ export default function soulsExtension(pi: ExtensionAPI) {
   });
 
   const project = (messages: AgentMessage[], body: string, ctx: ExtensionContext): AgentMessage[] => {
+    const base = messages.findLast((message): message is Extract<AgentMessage, { role: "system" }> => message.role === "system" && typeof message.sections?.preamble === "string");
+    const basePreamble = base?.sections?.preamble ?? undefined;
     const projected = applySoul(messages, body);
     // Pi projects forced text after this hook; patch that too, not just its transcript sections.
     if (running && options?.forceSystemPrompt !== undefined) {
       const forced = options.forceSystemPrompt;
       const original = forced === forcedProjection?.projected ? forcedProjection.original : forced;
       const patched = replaceForcedPreamble(messages, original, body);
-      forcedProjection = { original, projected: patched };
+      forcedProjection = { original, projected: patched, body, basePreamble };
       options.forceSystemPrompt = patched;
       if (!forceReported) {
         const notice = "Soul: preamble replaced";
@@ -244,6 +300,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
     try {
       presence = presenceFor(ctx, options?.customPrompt);
     } catch (error) {
+      restoreForcedProjection();
       projection = { known: false, soul: null };
       setFooter(ctx, undefined);
       return report(error, ctx);
@@ -261,6 +318,8 @@ export default function soulsExtension(pi: ExtensionAPI) {
       reported = undefined;
       return messages && { messages };
     } catch (error) {
+      // A failed re-render must not leave a previous soul in the forced prompt.
+      restoreForcedProjection();
       projection = { known: false, soul: null };
       setFooter(ctx, undefined);
       report(error, ctx);

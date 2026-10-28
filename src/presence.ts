@@ -1,5 +1,5 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { effectiveSoul, isSoulName, readSoul, resolveSoul, sessionSoul, type Selection, type SoulConfig } from "./souls.ts";
+import { effectiveSoul, isSoulName, readSoul, resolveSoul, sessionSoul, type Selection, type SoulConfig, type SoulVariables } from "./souls.ts";
 
 export const FOOTER_KEY = "soul";
 export const PRESENCE_ENTRY_TYPE = "pi-souls:presence";
@@ -11,15 +11,15 @@ export interface Presence {
 }
 
 /** The file facts for a resolved selection; throws when the soul is missing or unreadable. */
-export function selectionPresence(config: SoulConfig, selection: Selection | undefined): Presence | undefined {
+export function selectionPresence(config: SoulConfig, selection: Selection | undefined, variables?: SoulVariables): Presence | undefined {
   if (!selection) return undefined;
-  const soul = readSoul(config.dir, selection.name);
+  const soul = readSoul(config.dir, selection.name, variables);
   return { selection, body: soul.body, ...(soul.icon ? { icon: soul.icon } : {}) };
 }
 
 /** The soul Pi is actually using, after settings, session, custom prompt, and soulless precedence. */
-export function resolvePresence(config: SoulConfig, branch: readonly SessionEntry[], model: { provider: string; id: string } | undefined, customPrompt: string | undefined, soulless = false): Presence | undefined {
-  return selectionPresence(config, effectiveSoul(resolveSoul(config, sessionSoul(branch), model, soulless), customPrompt));
+export function resolvePresence(config: SoulConfig, branch: readonly SessionEntry[], model: { provider: string; id: string } | undefined, customPrompt: string | undefined, soulless = false, variables?: SoulVariables): Presence | undefined {
+  return selectionPresence(config, effectiveSoul(resolveSoul(config, sessionSoul(branch), model, soulless), customPrompt), variables);
 }
 
 export function footerText(presence: Presence | undefined): string | undefined {

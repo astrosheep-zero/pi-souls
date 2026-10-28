@@ -7,7 +7,8 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earen
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
 import { applySoul, replaceForcedPreamble } from "../src/prompt.ts";
-import { ENTRY_TYPE, effectiveSoul, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, unmatchableModelKeys } from "../src/souls.ts";
+import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, unmatchableModelKeys } from "../src/souls.ts";
+import { formatTimeReminder } from "../src/time.ts";
 
 const model = { provider: "provider", id: "model" };
 const config = readConfig({ defaultSoul: "global", modelSouls: { "provider/model": "specific" } }, "/tmp");
@@ -315,4 +316,104 @@ test("customPrompt keeps settings souls off, leaves the session choice and statu
     const fallback = project({ messages: system() }, ctx) as { messages: AgentMessage[] };
     assert.equal((fallback.messages[0] as { sections: Record<string, string> }).sections.preamble, "Global");
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("time awareness refreshes the watch hourly and notes the human's absence only after >= 1h", () => {
+  const t0 = new Date(2026, 9, 27, 2, 14, 0).getTime();
+  // First-ever note: current time only.
+  assert.equal(formatTimeReminder(t0), "<system-reminder>\n⌚ 02:14 · Tue, Oct 27\n</system-reminder>");
+  // Clock refreshed recently: stay quiet even if the human has been away for hours.
+  assert.equal(formatTimeReminder(t0 + 59 * 60_000, t0), undefined);
+  assert.equal(formatTimeReminder(t0 + 3 * 3_600_000, t0 + 150 * 60_000, t0), undefined);
+  // Clock due, human present: one-liner, no parenthetical.
+  assert.equal(formatTimeReminder(t0 + 70 * 60_000, t0, t0 + 50 * 60_000), "<system-reminder>\n⌚ 03:24 · Tue, Oct 27\n</system-reminder>");
+  // Clock due, human away: parenthetical with the gap.
+  assert.match(formatTimeReminder(t0 + 60 * 60_000, t0, t0)!, /\(1h since \*human\* was last present\)/);
+  assert.match(formatTimeReminder(t0 + 6 * 3_600_000 + 20 * 60_000, t0, t0)!, /\(6h 20m since \*human\* was last present\)/);
+  assert.match(formatTimeReminder(t0 + 3 * 24 * 3_600_000 + 2 * 3_600_000, t0, t0)!, /\(3d 2h since \*human\* was last present\)/);
+
+  const dir = mkdtempSync(join(tmpdir(), "souls-time-"));
+  const realNow = Date.now;
+  try {
+    writeFileSync(join(dir, "faye.md"), "Faye");
+    const session = SessionManager.inMemory();
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    let soullessFlag = false;
+    let timeaware: boolean | undefined;
+    const pi = {
+      registerFlag: () => {},
+      getFlag: () => soullessFlag,
+      getSettings: () => ({ soulsDir: dir, defaultSoul: "faye", timeaware }),
+      appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
+      registerEntryRenderer: () => {},
+      registerCommand: () => {},
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
+    } as unknown as ExtensionAPI;
+    extension(pi);
+    const ctx = { cwd: dir, model, sessionManager: session, hasUI: true, ui: { notify: () => {}, setStatus: () => {} } };
+    const start = (extra: Record<string, unknown> = {}) =>
+      handlers.get("before_agent_start")!({ messageType: "user", prompt: "hi", systemPromptOptions: { cwd: dir }, ...extra }, ctx) as
+        | { message?: { customType: string; content: string; display: boolean; details: { timestamp: number } } }
+        | undefined;
+
+    let now = t0;
+    Date.now = () => now;
+
+    // Time reminders are on by default; false turns them off without affecting souls.
+    timeaware = false;
+    assert.equal(start(), undefined);
+    timeaware = undefined;
+
+    // First user prompt in a fresh session gets current time without elapsed phrasing.
+    const first = start();
+    assert.ok(first?.message);
+    assert.equal(first.message.customType, TIME_ENTRY_TYPE);
+    assert.equal(first.message.display, true);
+    assert.equal(first.message.details.timestamp, t0);
+    assert.equal(first.message.content, "<system-reminder>\n⌚ 02:14 · Tue, Oct 27\n</system-reminder>");
+
+    // Non-user runs (custom triggerTurn) do not get a time reminder.
+    assert.equal(start({ messageType: "custom" }), undefined);
+
+    // Persist the first user message and the time note, as Pi would after the run starts.
+    session.appendMessage({ role: "user", content: [{ type: "text", text: "hi" }], timestamp: t0 });
+    const firstNoteId = session.appendCustomMessageEntry(TIME_ENTRY_TYPE, first.message.content, true, { timestamp: t0 });
+    assert.equal(lastUserMessageTimestamp(session.getBranch()), t0);
+    assert.equal(lastTimeNoteTimestamp(session.getBranch()), t0);
+
+    // 30m later: clock refreshed recently, stay quiet (even though the human is around).
+    now = t0 + 30 * 60_000;
+    assert.equal(start(), undefined);
+
+    // 80m after the note, human replied 50m ago: refresh the watch, no parenthetical.
+    session.appendMessage({ role: "user", content: [{ type: "text", text: "still here" }], timestamp: now });
+    now = t0 + 80 * 60_000;
+    const refresh = start();
+    assert.ok(refresh?.message);
+    assert.equal(refresh.message.content, "<system-reminder>\n⌚ 03:34 · Tue, Oct 27\n</system-reminder>");
+
+    // Note just refreshed, then the human vanishes for 2h: next prompt gets the parenthetical.
+    session.appendMessage({ role: "user", content: [{ type: "text", text: "back later" }], timestamp: now });
+    session.appendCustomMessageEntry(TIME_ENTRY_TYPE, refresh.message.content, true, { timestamp: now });
+    now += 2 * 3_600_000;
+    const later = start();
+    assert.ok(later?.message);
+    assert.match(later.message.content, /\(2h since \*human\* was last present\)/);
+
+    // Navigating back uses that branch’s clock and human timestamps, not abandoned notes.
+    session.branch(firstNoteId);
+    assert.equal(lastTimeNoteTimestamp(session.getBranch()), t0);
+    assert.equal(lastUserMessageTimestamp(session.getBranch()), t0);
+
+    // No active soul (soulless or customPrompt) -> no time reminder.
+    soullessFlag = true;
+    assert.equal(start(), undefined);
+    soullessFlag = false;
+    assert.equal(start({ systemPromptOptions: { cwd: dir, customPrompt: "Override" } }), undefined);
+    timeaware = false;
+    assert.equal(start(), undefined);
+  } finally {
+    Date.now = realNow;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

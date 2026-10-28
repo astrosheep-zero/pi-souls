@@ -44,19 +44,42 @@ Faye's identity body
 
 The footer shows the effective soul, and is removed when no soul applies. Before the first request after startup, Pi does not expose the explicit system prompt to extensions, so a session `/soul` choice is shown but a settings or model soul waits until the first request confirms it applies. `/soul <name>` and `/soul clear` leave a compact durable divider in the transcript only when the effective identity actually changes: `── soul: faye ──`, or `── soulless ──` when nothing applies. `/soul clear` follows defaults, so it may land on another soul rather than soulless. Dividers keep the identity they recorded when replayed, and never enter model context. No divider appears for no-ops, failures, or a bare `/soul` status check.
 
+### Templates (Pi)
+
+Soul bodies support [Liquid](https://liquidjs.com/) without extra configuration:
+
+```liquid
+You are Faye.
+{% if model.provider == "openai" %}
+Instructions for GPT.
+{% elsif model.provider == "anthropic" %}
+Instructions for Claude.
+{% endif %}
+Working in {{ cwd }} with {{ model.id }}.
+
+{% render 'parts/shared' %}
+```
+
+Available variables: `model.provider`, `model.id`, and `cwd` (the session working directory). Model fields are empty strings when no model is selected. Output is plain text, without HTML escaping. Undefined variables, unknown filters, invalid templates, and empty output use the normal warning/fallback behavior. `/soul <name>` validates the rendered result before saving the choice.
+
+Put reusable Markdown fragments in `soulsDir/parts/`; both `{% include 'parts/shared' %}` and `{% render 'parts/shared' %}` load `parts/shared.md` and can access the host variables above. Fragments should have no frontmatter. Subdirectories don't appear in `/soul` completion. Soul files and fragments are read fresh on each request.
+
+Template syntax is processed even inside Markdown code fences. Wrap literal examples in `{% raw %}...{% endraw %}`. The Claude Code mod below still reads souls as literal Markdown; Liquid rendering is Pi-only.
+
 ## Settings
 
 ```json
 {
   "defaultSoul": "faye",
   "modelSouls": { "anthropic/claude-sonnet-5": "reviewer" },
-  "soulsDir": "~/.agents/souls"
+  "soulsDir": "~/.agents/souls",
+  "timeaware": true
 }
 ```
 
 Precedence: `/soul <name>` > `--soulless` / `SOULLESS` / explicit system prompt > `modelSouls` (exact `provider/modelId`) > `defaultSoul` > Pi default.
 
-The session choice follows resume, fork, and tree navigation. `--system-prompt` and `SYSTEM.md` outrank a settings soul but not `/soul`. A bad entry only breaks the case that uses it. When another extension forces the whole prompt, souls warns but still replaces the latest preamble if its exact text remains in the forced prompt, preserving surrounding instructions. When a soul can't apply (a bad entry, a missing file, or no matching preamble), Pi's prompt is used and a warning shows once, not on every request.
+The session choice follows resume, fork, and tree navigation. `--system-prompt` and `SYSTEM.md` outrank a settings soul but not `/soul`. A bad entry only breaks the case that uses it. When another extension forces the whole prompt, souls warns but still replaces the latest preamble if its exact text remains in the forced prompt, preserving surrounding instructions. When a soul can't apply (a bad entry, a missing file, or no matching preamble), Pi's prompt is used and a warning shows once, not on every request. Time awareness is on by default (`timeaware: false` disables it). When a soul is active, user messages refresh a visible watch-style `<system-reminder>` on the first prompt and whenever at least 1 hour has passed since the previous time reminder. A gap of at least 1 hour since the previous user message adds the parenthetical; continuous conversation just refreshes the watch. This is checked when a user message arrives, not by a background timer.
 
 ## Transition reminders
 
@@ -85,7 +108,8 @@ Uses the same `~/.agents/souls/<name>.md` files and strips frontmatter. Configur
     "pi-souls@inline": {
       "options": {
         "defaultSoul": "faye",
-        "modelSouls": ["claude-opus-5-5=reviewer"]
+        "modelSouls": ["claude-opus-5-5=reviewer"],
+        "timeaware": true
       }
     }
   }
@@ -98,7 +122,7 @@ Precedence: `SOULLESS=1` / `true` > exact requested Claude model ID in `modelSou
 
 The mod sends the same hidden transition reminder through `prompt.submit` context, which the engine wraps, and keeps a transient per-session baseline. A soul line appears only after `prompt.compose` actually replaced the opening for that model; a frozen prompt, a skipped compose, or `--system-prompt` leaves the last evidenced soul in place. The brain line still reports. Command/meta prompts, dropped prompts, and downstream-stripped context do not consume it.
 
-Only the first `You are…` paragraph of the normal or lean opening is replaced. Leading whitespace, the remaining text, and all other sections stay unchanged. A missing or unexpected opening leaves the prompt intact and warns once per session; unreadable souls also fall back to Claude's prompt.
+Only the first `You are…` paragraph of the normal or lean opening is replaced. Leading whitespace, the remaining text, and all other sections stay unchanged. A missing or unexpected opening leaves the prompt intact and warns once per session; unreadable souls also fall back to Claude's prompt. Time awareness (`timeaware`) is on by default (`false` disables it). When a soul is active, `prompt.submit` attaches the same watch-style time reminder on the first user prompt and when at least 1 hour has passed since the previous reminder. The parenthetical appears only after a gap of at least 1 hour between user prompts.
 
 Limitations:
 - The separate official identity, `You are Claude Code, Anthropic's official CLI…`, cannot be removed by this hook; it coexists with the soul.
