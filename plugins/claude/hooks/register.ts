@@ -12,16 +12,16 @@ declare global {
 /** Executed by the host's `node`, never loaded here: this sandbox has no dynamic import and no Node. */
 function runnerPath(): string | undefined {
   try {
-    return new URL("./voice-runner.mjs", import.meta.url).pathname;
+    return new URL("./reaction-runner.mjs", import.meta.url).pathname;
   } catch {
-    return undefined; // An environment without module URLs simply has no voice.
+    return undefined; // An environment without module URLs simply has no reaction.
   }
 }
 
-/** How the host saw a tool call; a voice module reads this instead of parsing tool names. */
+/** How the host saw a tool call; a reaction module reads this instead of parsing tool names. */
 type ToolCategory = "reading" | "running" | "writing" | "other";
 
-/** One lifecycle beat a soul may answer. Kept in step with `src/voice.ts`. */
+/** One lifecycle beat a soul may answer. Kept in step with `src/reaction.ts`. */
 type Moment =
   | { kind: "wake"; source: "startup" | "resume" | "compact" | "clear" | "fork" }
   | { kind: "human"; text: string }
@@ -90,12 +90,12 @@ function isName(value: unknown): value is string {
 async function homeDir($: Engine): Promise<string | undefined> {
   return await $.env.get("HOME") ?? await $.env.get("USERPROFILE");
 }
-/** A directory soul is `<name>/soul.md`; a single-file soul stays `<name>.md`. */
+/** A directory soul is `<name>/SOUL.md`; a single-file soul stays `<name>.md`. */
 async function load($: Engine, name: string): Promise<string> {
   if (!isName(name)) throw new Error(`Invalid soul: ${name}`);
   const home = await homeDir($);
   if (!home) throw new Error("Home directory unavailable");
-  const nested = `${home}/.agents/souls/${name}/soul.md`;
+  const nested = `${home}/.agents/souls/${name}/SOUL.md`;
   const path = await $.fs.exists(nested) ? nested : `${home}/.agents/souls/${name}.md`;
   if (!await $.fs.exists(path)) throw new Error(`Soul "${name}" not found`);
   const text = await $.fs.read(path);
@@ -172,7 +172,7 @@ function toolText(value: unknown): string | undefined {
   return text.length > DETAIL_LIMIT ? `${text.slice(0, DETAIL_LIMIT)}…` : text;
 }
 
-/** Clock facts a voice module can branch on without re-reading the clock. */
+/** Clock facts a reaction module can branch on without re-reading the clock. */
 function facts(now: number): Record<string, unknown> {
   const date = new Date(now);
   const hour = date.getHours();
@@ -194,17 +194,17 @@ async function soulName($: Engine, options: PluginOptions, reported: Set<string>
   return select($, options, await $.session.model(), reported);
 }
 
-/** A tool name mapped to the category a voice module reads. */
+/** A tool name mapped to the category a reaction module reads. */
 function categoryOf(toolName: string): ToolCategory {
   return Object.hasOwn(CATEGORIES, toolName) ? CATEGORIES[toolName]! : "other";
 }
 
-/** A directory soul's executable voice, when it ships one. */
-async function voicePath($: Engine, name: string): Promise<string | undefined> {
+/** A directory soul's executable reaction, when it ships one. */
+async function reactionPath($: Engine, name: string): Promise<string | undefined> {
   const home = await homeDir($);
   if (!home) return undefined;
   for (const extension of [".ts", ".mjs", ".js"]) {
-    const path = `${home}/.agents/souls/${name}/voice${extension}`;
+    const path = `${home}/.agents/souls/${name}/reaction${extension}`;
     if (await $.fs.exists(path)) return path;
   }
   return undefined;
@@ -219,14 +219,14 @@ function utterance(value: unknown): Utterance | undefined {
 }
 
 /**
- * Run one soul's `voice(moment, world)` in a Node child process: the sandbox has
+ * Run one soul's `reaction(moment, world)` in a Node child process: the sandbox has
  * no dynamic import, and a broken module must never break the host's request.
  */
-async function speak($: Engine, name: string, moment: Moment, absenceMs?: number): Promise<Utterance | undefined> {
+async function react($: Engine, name: string, moment: Moment, absenceMs?: number): Promise<Utterance | undefined> {
   try {
     const runner = runnerPath();
     if (!runner) return undefined;
-    const path = await voicePath($, name);
+    const path = await reactionPath($, name);
     if (!path) return undefined;
     const home = await homeDir($) ?? "";
     const now = await $.clock.now();
@@ -243,7 +243,7 @@ async function speak($: Engine, name: string, moment: Moment, absenceMs?: number
       { timeoutMs: 10_000 },
     );
     if (exitCode !== 0) return undefined;
-    // The last line is the runner's answer; a voice module may print on its own.
+    // The last line is the runner's answer; a reaction module may print on its own.
     const line = stdout.trim().split("\n").pop();
     return line ? utterance(JSON.parse(line)) : undefined;
   } catch {
@@ -310,7 +310,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const name = await soulName($, options, reported);
       if (!name) return result;
       const absenceMs = typeof e.seconds_since_last_response === "number" ? e.seconds_since_last_response * 1000 : undefined;
-      return withContext($, result, await speak($, name, { kind: "wake", source: e.source }, absenceMs));
+      return withContext($, result, await react($, name, { kind: "wake", source: e.source }, absenceMs));
     } catch {
       return result;
     }
@@ -324,7 +324,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const args = toolArgs(e);
       const filePath = toolPath(args);
       const input = toolText(args);
-      return withContext($, result, await speak($, name, {
+      return withContext($, result, await react($, name, {
         kind: "tool", phase: "before", category: categoryOf(e.tool), toolName: e.tool,
         ...(filePath ? { filePath } : {}), ...(input ? { input } : {}),
       }, await absence($)));
@@ -341,7 +341,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const filePath = toolPath(input);
       const detail = toolText(input);
       const seen = toolText(output);
-      return await speak($, name, {
+      return await react($, name, {
         kind: "tool", phase: "after", category: categoryOf(toolName), toolName,
         ...(filePath ? { filePath } : {}), ...(detail ? { input: detail } : {}), ...(seen ? { output: seen } : {}), ok,
       }, await absence($));
@@ -448,7 +448,7 @@ export function register(on: On, options: PluginOptions = {}) {
     // The soul answers the human's words; a model-facing line rides the context like a note.
     try {
       const name = await soulName($, options, reported);
-      const said = name ? await speak($, name, { kind: "human", text: e.text }, await absence($)) : undefined;
+      const said = name ? await react($, name, { kind: "human", text: e.text }, await absence($)) : undefined;
       if (said) {
         if (shown(said)) $.ui.toast(said.text);
         const text = told(said);

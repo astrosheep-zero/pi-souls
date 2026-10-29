@@ -83,10 +83,10 @@ test("commands validate templates before persisting; requests and forced prompts
     const original = structuredClone(input);
     const request = () => handlers.get("context_with_system")![0]({ messages: input }, ctx) as { messages: AgentMessage[] } | undefined;
 
-    await command.handler("broken", ctx);
+    await command.handler("@broken", ctx);
     assert.equal(sessionSoul(session.getBranch()), undefined);
     assert.match(notices.at(-1)!, /template:.*undefined variable/);
-    await command.handler("faye", ctx);
+    await command.handler("@faye", ctx);
     assert.equal(sessionSoul(session.getBranch()), "faye");
     assert.ok(handlers.get("before_agent_start")![0]({ messageType: "user", systemPromptOptions: options }, ctx));
     const expected = `Faye gpt-test in ${variables.cwd}`;

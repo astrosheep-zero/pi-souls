@@ -1,13 +1,14 @@
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { applySoul, replaceForcedPreamble } from "./prompt.ts";
-import { footerText, resolvePresence, resolveVoice, selectionPresence, type Presence } from "./presence.ts";
-import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
+import { footerText, resolvePresence, resolveReaction, selectionPresence, type Presence } from "./presence.ts";
+import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
 import { formatTimeReminder } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, formatTransitionReminder, readTransition, sameTransition, transitionLines, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
-import { loadVoice, toolCategory, toolFilePath, toolText, VOICE_MESSAGE_TYPE, worldFor, type Moment, type Voice } from "./voice.ts";
+import { loadReaction, toolCategory, toolFilePath, toolText, REACTION_MESSAGE_TYPE, worldFor, type Moment, type Reaction } from "./reaction.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
@@ -48,15 +49,16 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // ExtensionContext has no system-prompt options before a run or command; track what the host told us.
   let promptKnown = false;
   let seenPrompt: string | undefined;
-  // One loaded voice module per soul directory; a changing `voice.ts` needs a restart, like any module.
-  const voices = new Map<string, Voice>();
-  const voiceFor = (path: string): Voice => {
-    let voice = voices.get(path);
-    if (!voice) {
-      voice = loadVoice(path);
-      voices.set(path, voice);
+  // Cache one reaction per soul directory, including which extension supplied it.
+  const reactions = new Map<string, { path: string; reaction: Reaction }>();
+  const reactionFor = (path: string): Reaction => {
+    const dir = dirname(path);
+    let cached = reactions.get(dir);
+    if (!cached || cached.path !== path) {
+      cached = { path, reaction: loadReaction(path) };
+      reactions.set(dir, cached);
     }
-    return voice;
+    return cached.reaction;
   };
   // Tool calls remember what the end event no longer carries, bounded so a long run cannot grow it.
   const toolCalls = new Map<string, { filePath?: string; input?: string }>();
@@ -64,24 +66,24 @@ export default function soulsExtension(pi: ExtensionAPI) {
     const last = lastUserMessageTimestamp(branch);
     return last === undefined ? undefined : Math.max(0, now - last);
   };
-  /** Only an effective soul that ships a voice module may speak; everything else, and every failure, stays quiet. */
-  const speak = async (moment: Moment, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
+  /** Only an effective soul that ships a reaction module may answer; everything else, and every failure, stays quiet. */
+  const react = async (moment: Moment, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
     try {
       const config = readConfig(pi.getSettings(), ctx.cwd);
       const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model, soulless()), customPrompt);
-      const target = resolveVoice(config, selection);
+      const target = resolveReaction(config, selection);
       if (!target) return;
       const now = Date.now();
       const world = worldFor({ now, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, soul: target.name, absenceMs: absence(ctx.sessionManager.getBranch(), now) });
-      const said = await voiceFor(target.path)(moment, world);
+      const said = await reactionFor(target.path)(moment, world);
       if (!said) return;
       if (said.audience === "human") {
         if (ctx.hasUI) ctx.ui.notify(said.text, "info");
         return;
       }
-      pi.sendMessage({ customType: VOICE_MESSAGE_TYPE, content: said.text, display: said.audience === "both", details: { moment: moment.kind } });
+      pi.sendMessage({ customType: REACTION_MESSAGE_TYPE, content: said.text, display: said.audience === "both", details: { moment: moment.kind } });
     } catch {
-      // Voice is decoration: a broken module or soul never breaks the host.
+      // A reaction is decoration: a broken module or soul never breaks the host.
     }
   };
   // Retain the original text so tool-loop requests and soul edits do not patch our own output.
@@ -123,9 +125,9 @@ export default function soulsExtension(pi: ExtensionAPI) {
     toolCalls.clear();
     refreshFooter(ctx, undefined, ctx.model, false);
     const source = wakeSource(event.reason);
-    if (source) return speak({ kind: "wake", source }, ctx, undefined);
+    if (source) return react({ kind: "wake", source }, ctx, undefined);
   });
-  pi.on("session_compact", (_event, ctx) => speak({ kind: "wake", source: "compact" }, ctx, options?.customPrompt));
+  pi.on("session_compact", (_event, ctx) => react({ kind: "wake", source: "compact" }, ctx, options?.customPrompt));
   pi.on("model_select", (event, ctx) => refreshFooter(ctx, promptValue(), event.model));
   pi.on("session_tree", (_event, ctx) => refreshFooter(ctx, promptValue()));
   pi.on("before_agent_start", (event, ctx) => {
@@ -135,8 +137,8 @@ export default function soulsExtension(pi: ExtensionAPI) {
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
     if (!userRun) return;
-    // The handler stays synchronous: a pending voice answer arrives when it arrives.
-    void speak({ kind: "human", text: event.prompt }, ctx, options.customPrompt);
+    // The handler stays synchronous: a pending reaction answer arrives when it arrives.
+    void react({ kind: "human", text: event.prompt }, ctx, options.customPrompt);
     try {
       const branch = ctx.sessionManager.getBranch();
       const config = readConfig(pi.getSettings(), ctx.cwd);
@@ -162,13 +164,13 @@ export default function soulsExtension(pi: ExtensionAPI) {
     toolCalls.delete(event.toolCallId);
     toolCalls.set(event.toolCallId, record);
     if (toolCalls.size > 64) toolCalls.delete(toolCalls.keys().next().value!);
-    return speak({ kind: "tool", phase: "before", category: toolCategory(event.toolName), toolName: event.toolName, ...record }, ctx, options?.customPrompt);
+    return react({ kind: "tool", phase: "before", category: toolCategory(event.toolName), toolName: event.toolName, ...record }, ctx, options?.customPrompt);
   });
   pi.on("tool_execution_end", (event, ctx) => {
     const record = toolCalls.get(event.toolCallId);
     toolCalls.delete(event.toolCallId);
     const output = toolText(event.result);
-    return speak({ kind: "tool", phase: "after", category: toolCategory(event.toolName), toolName: event.toolName, ...record, ...(output ? { output } : {}), ok: !event.isError }, ctx, options?.customPrompt);
+    return react({ kind: "tool", phase: "after", category: toolCategory(event.toolName), toolName: event.toolName, ...record, ...(output ? { output } : {}), ok: !event.isError }, ctx, options?.customPrompt);
   });
   // The host copies the run options before each tool-loop request, so re-render them here:
   // a broken soul falls back to the base prompt instead of stalling the previous body.
@@ -194,11 +196,15 @@ export default function soulsExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("soul", {
-    description: "Switch soul: /soul [name|clear]",
+    description: "Soul: /soul [@name|clear|reload]",
     getArgumentCompletions: (prefix) => {
       try {
-        const souls = listSouls(readConfig(pi.getSettings(), cwd).dir).map((name) => ({ value: name, label: name }));
-        const items = [...souls, { value: "clear", label: "clear", description: "Follow defaults" }];
+        const souls = listSouls(readConfig(pi.getSettings(), cwd).dir).map((name) => ({ value: `@${name}`, label: `@${name}` }));
+        const items = [
+          ...souls,
+          { value: "clear", label: "clear", description: "Follow defaults" },
+          { value: "reload", label: "reload", description: "Re-read the active soul and reaction" },
+        ];
         const matches = items.filter((item) => item.value.startsWith(prefix.trim()));
         return matches.length ? matches : null;
       } catch {
@@ -208,11 +214,11 @@ export default function soulsExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const notify = (text: string) => ctx.ui.notify(text, "info");
       if (!ctx.isIdle()) {
-        ctx.ui.notify("Busy. Switch souls after this run.", "warning");
+        ctx.ui.notify("Busy. Try again after this run.", "warning");
         return;
       }
       try {
-        const name = args.trim();
+        const input = args.trim();
         const config = readConfig(pi.getSettings(), ctx.cwd);
         const prompt = ctx.getSystemPromptOptions().customPrompt;
         seenPrompt = prompt; promptKnown = true;
@@ -242,7 +248,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
           return describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless());
         };
 
-        if (name === "clear") {
+        if (input === "clear") {
           let selected = true; // A corrupted selection counts as something to clear.
           try {
             selected = override() !== undefined;
@@ -261,34 +267,53 @@ export default function soulsExtension(pi: ExtensionAPI) {
           return notify(`Cleared. Soul: ${now()}`);
         }
 
-        const available = listSouls(config.dir);
-        if (name) {
-          if (override() === name) {
+        if (input === "reload") {
+          const selection = active();
+          if (!selection) {
             refresh();
-            return notify(`Already ${name}.`);
+            return notify("No soul to reload.");
           }
-          if (!available.includes(name)) {
-            throw new Error(`No soul "${name}". Souls: ${available.join(", ") || "none"}`);
-          }
-          readSoul(config.dir, name, soulVariables(ctx)); // Validate content before changing durable session state.
-          const before = loadedName(activeName());
-          pi.appendEntry(ENTRY_TYPE, { version: 1, name });
-          if (before !== name) appendDivider(pi, name);
+          readSoul(config.dir, selection.name, soulVariables(ctx)); // A broken SOUL or fragment never clears the old module.
+          reactions.delete(join(config.dir, selection.name));
           refresh();
-          return notify(`Soul: ${name}`);
+          return notify(`Reloaded ${selection.name}.`);
         }
 
+        if (!input) {
+          refresh();
+          const available = listSouls(config.dir);
+          const configured = resolved();
+          const selection = effectiveSoul(configured, prompt);
+          const missing = selection && !available.includes(selection.name) ? " (missing)" : "";
+          const ignored = unmatchableModelKeys(config);
+          return notify([
+            `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless())}${missing}`,
+            `Souls: ${available.map((name) => `@${name}`).join(", ") || "none"}`,
+            `Dir: ${tilde(config.dir)}`,
+            ...(ignored.length ? [`Ignored keys: ${ignored.join(", ")}`] : []),
+          ].join("\n"));
+        }
+
+        if (!input.startsWith("@") || !isSoulName(input.slice(1))) {
+          ctx.ui.notify("Usage: /soul [@<name>|clear|reload]", "warning");
+          return;
+        }
+
+        const name = input.slice(1);
+        if (override() === name) {
+          refresh();
+          return notify(`Already ${name}.`);
+        }
+        const available = listSouls(config.dir);
+        if (!available.includes(name)) {
+          throw new Error(`No soul "${name}". Souls: ${available.map((name) => `@${name}`).join(", ") || "none"}`);
+        }
+        readSoul(config.dir, name, soulVariables(ctx)); // Validate content before changing durable session state.
+        const before = loadedName(activeName());
+        pi.appendEntry(ENTRY_TYPE, { version: 1, name });
+        if (before !== name) appendDivider(pi, name);
         refresh();
-        const configured = resolved();
-        const selection = effectiveSoul(configured, prompt);
-        const missing = selection && !available.includes(selection.name) ? " (missing)" : "";
-        const ignored = unmatchableModelKeys(config);
-        notify([
-          `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless())}${missing}`,
-          `Souls: ${available.join(", ") || "none"}`,
-          `Dir: ${tilde(config.dir)}`,
-          ...(ignored.length ? [`Ignored keys: ${ignored.join(", ")}`] : []),
-        ].join("\n"));
+        return notify(`Soul: ${name}`);
       } catch (error) {
         refreshFooter(ctx, ctx.getSystemPromptOptions().customPrompt);
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");

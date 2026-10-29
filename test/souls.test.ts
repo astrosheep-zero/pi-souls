@@ -7,7 +7,7 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earen
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
 import { applySoul, replaceForcedPreamble } from "../src/prompt.ts";
-import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulVoicePath, unmatchableModelKeys } from "../src/souls.ts";
+import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulReactionPath, unmatchableModelKeys } from "../src/souls.ts";
 import { formatTimeReminder } from "../src/time.ts";
 
 const model = { provider: "provider", id: "model" };
@@ -66,7 +66,7 @@ test("soulless via CLI or env skips defaults; /soul wins and clear returns to so
     process.env.SOULLESS = "0";
     flag = true;
     assert.equal(request(), undefined); // CLI still wins over SOULLESS=0.
-    await command.handler("faye", ctx);
+    await command.handler("@faye", ctx);
     const applied = request()!;
     const head = applied.messages[0];
     assert.ok(head.role === "system");
@@ -115,16 +115,16 @@ test("directory souls are listed, render from their own folder, and win over a s
   try {
     writeFileSync(join(dir, "flat.md"), "Flat");
     mkdirSync(join(dir, "deep", "parts"), { recursive: true });
-    writeFileSync(join(dir, "deep", "soul.md"), "---\nicon: 🦈\n---\nDeep {{ cwd }}\n{% include 'parts/own' %}\n{% render 'parts/shared' %}");
+    writeFileSync(join(dir, "deep", "SOUL.md"), "---\nicon: 🦈\n---\nDeep {{ cwd }}\n{% include 'parts/own' %}\n{% render 'parts/shared' %}");
     writeFileSync(join(dir, "deep", "parts", "own.md"), "own-part");
     mkdirSync(join(dir, "parts"), { recursive: true });
     writeFileSync(join(dir, "parts", "shared.md"), "shared-part");
     mkdirSync(join(dir, "empty"));
     mkdirSync(join(dir, "both"));
-    writeFileSync(join(dir, "both", "soul.md"), "Nested wins");
+    writeFileSync(join(dir, "both", "SOUL.md"), "Nested wins");
     writeFileSync(join(dir, "both.md"), "Flat loses");
 
-    // A directory only counts with soul.md inside it; the nested form wins over the file.
+    // A directory only counts with SOUL.md inside it; the nested form wins over the file.
     assert.deepEqual(listSouls(dir), ["both", "deep", "flat"]);
     assert.equal(readSoul(dir, "both").body, "Nested wins");
     assert.deepEqual(readSoul(dir, "deep", { model: { provider: "p", id: "m" }, cwd: "/work" }), {
@@ -132,30 +132,30 @@ test("directory souls are listed, render from their own folder, and win over a s
       icon: "🦈",
     });
     assert.equal(loadSoul(dir, "deep", { model: { provider: "", id: "" }, cwd: "/here" }).includes("Deep /here"), true);
-    assert.equal(soulFile(dir, "deep").path, join(dir, "deep", "soul.md"));
+    assert.equal(soulFile(dir, "deep").path, join(dir, "deep", "SOUL.md"));
     assert.deepEqual(soulFile(dir, "deep").root, [join(dir, "deep"), dir]);
     assert.deepEqual(soulFile(dir, "flat").root, [dir]);
     assert.throws(() => loadSoul(dir, "empty"), /Soul "empty" not found/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("a directory soul's voice is found by extension precedence and unsafe names never resolve", () => {
-  const dir = mkdtempSync(join(tmpdir(), "souls-voice-"));
+test("a directory soul's reaction is found by extension precedence and unsafe names never resolve", () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-reaction-"));
   try {
     mkdirSync(join(dir, "faye"));
-    writeFileSync(join(dir, "faye", "soul.md"), "Faye");
-    assert.equal(soulVoicePath(dir, "faye"), undefined);
+    writeFileSync(join(dir, "faye", "SOUL.md"), "Faye");
+    assert.equal(soulReactionPath(dir, "faye"), undefined);
 
-    writeFileSync(join(dir, "faye", "voice.js"), "export const voice = () => undefined;");
-    assert.equal(soulVoicePath(dir, "faye"), join(dir, "faye", "voice.js"));
-    writeFileSync(join(dir, "faye", "voice.mjs"), "export const voice = () => undefined;");
-    assert.equal(soulVoicePath(dir, "faye"), join(dir, "faye", "voice.mjs"));
-    writeFileSync(join(dir, "faye", "voice.ts"), "export const voice = () => undefined;");
-    assert.equal(soulVoicePath(dir, "faye"), join(dir, "faye", "voice.ts"));
+    writeFileSync(join(dir, "faye", "reaction.js"), "export const reaction = () => undefined;");
+    assert.equal(soulReactionPath(dir, "faye"), join(dir, "faye", "reaction.js"));
+    writeFileSync(join(dir, "faye", "reaction.mjs"), "export const reaction = () => undefined;");
+    assert.equal(soulReactionPath(dir, "faye"), join(dir, "faye", "reaction.mjs"));
+    writeFileSync(join(dir, "faye", "reaction.ts"), "export const reaction = () => undefined;");
+    assert.equal(soulReactionPath(dir, "faye"), join(dir, "faye", "reaction.ts"));
 
     writeFileSync(join(dir, "flat.md"), "Flat");
-    assert.equal(soulVoicePath(dir, "flat"), undefined);
-    assert.equal(soulVoicePath(dir, "../escape"), undefined);
+    assert.equal(soulReactionPath(dir, "flat"), undefined);
+    assert.equal(soulReactionPath(dir, "../escape"), undefined);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -263,10 +263,12 @@ test("forced projection uses the latest preamble and preserves surrounding promp
   assert.throws(() => replaceForcedPreamble(messages, "Old identity", "Soul"), /no preamble/);
 });
 
-test("registered command persists selection, refuses missing files, skips no-ops, and completes names", async () => {
+test("registered command persists selection, refuses missing files, skips no-ops, and completes @names", async () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-command-"));
   try {
     writeFileSync(join(dir, "faye.md"), "Faye");
+    writeFileSync(join(dir, "clear.md"), "Literal clear");
+    writeFileSync(join(dir, "reload.md"), "Literal reload");
     const session = SessionManager.inMemory();
     const notices: string[] = [];
     const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
@@ -284,20 +286,29 @@ test("registered command persists selection, refuses missing files, skips no-ops
     const project = handlers.get("context_with_system")![0];
     const entries = () => session.getBranch().length;
 
-    assert.deepEqual(command.getArgumentCompletions("f")?.map((item) => item.value), ["faye"]);
-    assert.deepEqual(command.getArgumentCompletions("")?.map((item) => item.value), ["faye", "clear"]);
+    assert.deepEqual(command.getArgumentCompletions("f"), null); // Bare names cannot switch.
+    assert.deepEqual(command.getArgumentCompletions("@")?.map((item) => item.value), ["@clear", "@faye", "@reload"]);
+    assert.deepEqual(command.getArgumentCompletions("@c")?.map((item) => item.value), ["@clear"]);
+    assert.deepEqual(command.getArgumentCompletions("")?.map((item) => item.value), ["@clear", "@faye", "@reload", "clear", "reload"]);
+    assert.deepEqual(command.getArgumentCompletions("r")?.map((item) => item.value), ["reload"]);
     assert.equal(command.getArgumentCompletions("zzz"), null);
 
-    await command.handler("faye", ctx);
+    for (const input of ["faye", "@ faye"]) {
+      await command.handler(input, ctx);
+      assert.equal(sessionSoul(session.getBranch()), undefined);
+      assert.match(notices.at(-1)!, /Usage: \/soul \[@<name>\|clear\|reload\]/);
+    }
+    assert.equal(entries(), 0);
+    await command.handler("@faye", ctx);
     assert.equal(sessionSoul(session.getBranch()), "faye");
     const afterSelect = entries();
-    await command.handler("faye", ctx);
+    await command.handler("@faye", ctx);
     assert.equal(entries(), afterSelect);
     assert.match(notices.at(-1)!, /Already faye/);
 
-    await command.handler("missing", ctx);
+    await command.handler("@missing", ctx);
     assert.equal(sessionSoul(session.getBranch()), "faye");
-    assert.match(notices.at(-1)!, /No soul "missing". Souls: faye/);
+    assert.match(notices.at(-1)!, /No soul "missing". Souls: @clear, @faye, @reload/);
     assert.ok(project({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx));
 
     await command.handler("clear", ctx);
@@ -307,6 +318,18 @@ test("registered command persists selection, refuses missing files, skips no-ops
     assert.equal(entries(), afterClear);
     assert.match(notices.at(-1)!, /No session soul/);
     assert.equal(project({ messages: [] }, ctx), undefined);
+
+    await command.handler("@clear", ctx);
+    assert.equal(sessionSoul(session.getBranch()), "clear");
+    const literalClear = entries();
+    await command.handler("reload", ctx);
+    assert.equal(entries(), literalClear);
+    assert.equal(sessionSoul(session.getBranch()), "clear");
+    assert.match(notices.at(-1)!, /Reloaded clear/);
+    await command.handler("@reload", ctx);
+    assert.equal(sessionSoul(session.getBranch()), "reload");
+    await command.handler("clear", ctx);
+    assert.equal(sessionSoul(session.getBranch()), undefined);
 
     session.appendCustomEntry(ENTRY_TYPE, { version: 99 });
     await command.handler("", ctx);
@@ -352,9 +375,9 @@ test("customPrompt keeps settings souls off, leaves the session choice and statu
     assert.equal(project({ messages: system() }, ctx), undefined);
     await command.handler("", ctx);
     assert.match(notices.at(-1)!, /Soul: none \(custom prompt\)/);
-    assert.match(notices.at(-1)!, /Souls: faye, global/);
+    assert.match(notices.at(-1)!, /Souls: @faye, @global/);
 
-    await command.handler("faye", ctx);
+    await command.handler("@faye", ctx);
     const applied = project({ messages: system() }, ctx) as { messages: AgentMessage[] };
     assert.deepEqual(applied.messages[0], { ...system()[0], sections: { preamble: "Faye" } });
 

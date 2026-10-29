@@ -28,7 +28,7 @@ export interface SoulVariables {
 const EMPTY_VARIABLES: SoulVariables = { model: { provider: "", id: "" }, cwd: "" };
 
 export function isSoulName(value: unknown): value is string {
-  return typeof value === "string" && /^[\p{L}\p{N}_-][\p{L}\p{N}_.-]*$/u.test(value) && value !== "clear";
+  return typeof value === "string" && /^[\p{L}\p{N}_-][\p{L}\p{N}_.-]*$/u.test(value);
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -109,20 +109,20 @@ export function effectiveSoul(selection: Selection | undefined, customPrompt: st
   return selection?.source === "session" || !customPrompt ? selection : undefined;
 }
 
-/** A single file soul is `<name>.md`; a directory soul is `<name>/soul.md` plus whatever it keeps beside it. */
+/** A single file soul is `<name>.md`; a directory soul is `<name>/SOUL.md` plus whatever it keeps beside it. */
 export function soulFile(dir: string, name: string): { path: string; root: string[] } {
-  const nested = join(dir, name, "soul.md");
+  const nested = join(dir, name, "SOUL.md");
   if (existsSync(nested)) return { path: nested, root: [join(dir, name), dir] };
   return { path: join(dir, `${name}.md`), root: [dir] };
 }
 
-const VOICE_EXTENSIONS = [".ts", ".mjs", ".js"] as const;
+const REACTION_EXTENSIONS = [".ts", ".mjs", ".js"] as const;
 
-/** The executable voice of a directory soul, if it ships one. */
-export function soulVoicePath(dir: string, name: string): string | undefined {
+/** The executable reaction of a directory soul, if it ships one. */
+export function soulReactionPath(dir: string, name: string): string | undefined {
   if (!isSoulName(name)) return undefined;
-  for (const extension of VOICE_EXTENSIONS) {
-    const path = join(dir, name, `voice${extension}`);
+  for (const extension of REACTION_EXTENSIONS) {
+    const path = join(dir, name, `reaction${extension}`);
     if (existsSync(path)) return path;
   }
   return undefined;
@@ -141,7 +141,7 @@ export function listSouls(dir: string): string[] {
   for (const entry of entries) {
     const name = entry.isDirectory() ? entry.name : entry.name.endsWith(".md") ? entry.name.slice(0, -3) : undefined;
     if (name === undefined || !isSoulName(name)) continue;
-    if (entry.isDirectory() ? existsSync(join(dir, name, "soul.md")) : entry.isFile()) names.add(name);
+    if (entry.isDirectory() ? existsSync(join(dir, name, "SOUL.md")) : entry.isFile()) names.add(name);
   }
   return [...names].sort();
 }

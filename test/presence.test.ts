@@ -96,7 +96,7 @@ test("settings/model footer waits for host prompt options; a session choice does
 
     h.fire("session_start");
     assert.equal(h.status(), undefined);
-    await h.command.handler("faye", h.ctx);
+    await h.command.handler("@faye", h.ctx);
     assert.equal(h.status(), "🦈");
     h.fire("session_start");
     assert.equal(h.status(), "🦈");
@@ -146,7 +146,7 @@ test("footer follows model/default/session/customPrompt precedence and survives 
     h.fire("before_agent_start", { systemPromptOptions: { cwd: h.dir, customPrompt: "My prompt" } });
     assert.equal(h.status(), undefined);
 
-    await h.command.handler("faye", h.ctx);
+    await h.command.handler("@faye", h.ctx);
     assert.equal(h.status(), "🦈");
 
     h.setPrompt("");
@@ -220,7 +220,7 @@ test("divider lines fit the requested terminal width", () => {
 test("clear to a missing default reports soulless, not a false soul", async () => {
   const h = setup({ "faye.md": "Faye" }, { defaultSoul: "missing" });
   try {
-    await h.command.handler("faye", h.ctx);
+    await h.command.handler("@faye", h.ctx);
     await h.command.handler("clear", h.ctx);
     assert.deepEqual(h.dividers(), [{ version: 1, name: "faye" }, { version: 1, name: null }]);
     assert.equal(h.renderDivider(h.dividers().at(-1)), "── soulless ──");
@@ -232,16 +232,16 @@ test("clear to a missing default reports soulless, not a false soul", async () =
 test("dividers mark real identity changes only", async () => {
   const h = setup({ "faye.md": "---\nicon: 🦈\n---\nFaye", "reviewer.md": "Reviewer" }, { defaultSoul: "reviewer" });
   try {
-    await h.command.handler("faye", h.ctx);
+    await h.command.handler("@faye", h.ctx);
     assert.deepEqual(h.dividers(), [{ version: 1, name: "faye" }]);
     assert.equal(h.renderDivider(h.dividers()[0]), "── soul: faye ──");
 
     const afterSelect = h.session.getBranch().length;
-    await h.command.handler("faye", h.ctx);
+    await h.command.handler("@faye", h.ctx);
     assert.equal(h.session.getBranch().length, afterSelect);
     await h.command.handler("", h.ctx);
     assert.equal(h.session.getBranch().length, afterSelect);
-    await h.command.handler("missing", h.ctx);
+    await h.command.handler("@missing", h.ctx);
     assert.equal(h.session.getBranch().length, afterSelect);
     assert.equal(h.dividers().length, 1);
     assert.match(h.notices.at(-1)!, /^error: No soul "missing"/);
@@ -260,7 +260,7 @@ test("dividers mark real identity changes only", async () => {
 test("clear to no soul is soulless, while clear back to the same default adds no divider", async () => {
   const none = setup({ "faye.md": "Faye" });
   try {
-    await none.command.handler("faye", none.ctx);
+    await none.command.handler("@faye", none.ctx);
     await none.command.handler("clear", none.ctx);
     assert.deepEqual(none.dividers(), [{ version: 1, name: "faye" }, { version: 1, name: null }]);
     assert.equal(none.renderDivider(none.dividers().at(-1)), "── soulless ──");
@@ -269,7 +269,7 @@ test("clear to no soul is soulless, while clear back to the same default adds no
 
   const same = setup({ "faye.md": "Faye" }, { defaultSoul: "faye" });
   try {
-    await same.command.handler("faye", same.ctx);
+    await same.command.handler("@faye", same.ctx);
     await same.command.handler("clear", same.ctx);
     assert.deepEqual(same.dividers(), []);
   } finally { same.done(); }
@@ -279,7 +279,7 @@ test("clear under a custom prompt is soulless because settings souls stay off", 
   const h = setup({ "faye.md": "---\nicon: 🦈\n---\nFaye" }, { defaultSoul: "faye" });
   try {
     h.setPrompt("My prompt");
-    await h.command.handler("faye", h.ctx);
+    await h.command.handler("@faye", h.ctx);
     assert.equal(h.status(), "🦈");
     await h.command.handler("clear", h.ctx);
     assert.deepEqual(h.dividers().at(-1), { version: 1, name: null });
@@ -291,7 +291,7 @@ test("stored dividers replay their own facts and never enter model context", asy
   const h = setup({ "faye.md": "---\nicon: 🦈\n---\nFaye", "reviewer.md": "Reviewer" }, { defaultSoul: "reviewer" });
   try {
     h.fire("session_start");
-    await h.command.handler("faye", h.ctx);
+    await h.command.handler("@faye", h.ctx);
     const stored = h.dividers()[0];
     rmSync(join(h.dir, "faye.md"));
     h.fire("session_start");
