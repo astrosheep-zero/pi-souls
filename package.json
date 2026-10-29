@@ -1,6 +1,6 @@
 {
   "name": "@astrosheep/pi-souls",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Session souls with model-specific defaults for Pi",
   "type": "module",
   "keywords": [
