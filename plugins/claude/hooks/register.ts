@@ -262,6 +262,33 @@ interface PromptState {
   humanAt?: number;
 }
 
+/** How long the human has been away, when this session already heard from them. */
+async function absence($: Engine, promptStates: Map<string, PromptState>): Promise<number | undefined> {
+  try {
+    const state = promptStates.get(await $.session.id());
+    return state?.humanAt === undefined ? undefined : Math.max(0, (await $.clock.now()) - state.humanAt);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The tool moment the two result hooks share; `output` is the response or the failure. */
+async function toolNote($: Engine, options: PluginOptions, reported: Set<string>, promptStates: Map<string, PromptState>, toolName: string, input: unknown, ok: boolean, output?: unknown): Promise<Utterance | undefined> {
+  try {
+    const name = await soulName($, options, reported);
+    if (!name) return undefined;
+    const filePath = toolPath(input);
+    const detail = toolText(input);
+    const seen = toolText(output);
+    return await perceive($, name, {
+      kind: "tool", phase: "after", category: categoryOf(toolName), toolName,
+      ...(filePath ? { filePath } : {}), ...(detail ? { input: detail } : {}), ...(seen ? { output: seen } : {}), ok,
+    }, await absence($, promptStates));
+  } catch {
+    return undefined;
+  }
+}
+
 function transitionLines(previous: Identity, current: Identity): string[] {
   const lines: string[] = [];
   if (previous.model !== current.model) lines.push(`new brain: ${current.model}`);
@@ -276,15 +303,6 @@ export function register(on: On, options: PluginOptions = {}) {
   // Transient, like the rest of this host's session state; the engine's framing wraps context.
   const sessions = new Map<string, SessionState>();
   const promptStates = new Map<string, PromptState>();
-  /** How long the human has been away, when this session already heard from them. */
-  const absence = async ($: Engine): Promise<number | undefined> => {
-    try {
-      const state = promptStates.get(await $.session.id());
-      return state?.humanAt === undefined ? undefined : Math.max(0, (await $.clock.now()) - state.humanAt);
-    } catch {
-      return undefined;
-    }
-  };
 
   on("classic.SessionStart", async ($, e, next) => {
     const result = await next(e);
@@ -309,37 +327,20 @@ export function register(on: On, options: PluginOptions = {}) {
       return withContext(result, await perceive($, name, {
         kind: "tool", phase: "before", category: categoryOf(e.tool), toolName: e.tool,
         ...(filePath ? { filePath } : {}), ...(input ? { input } : {}),
-      }, await absence($)));
+      }, await absence($, promptStates)));
     } catch {
       return result;
     }
   });
 
-  /** The tool moment the two result hooks share; `output` is the response or the failure. */
-  const toolNote = async ($: Engine, toolName: string, input: unknown, ok: boolean, output?: unknown): Promise<Utterance | undefined> => {
-    try {
-      const name = await soulName($, options, reported);
-      if (!name) return undefined;
-      const filePath = toolPath(input);
-      const detail = toolText(input);
-      const seen = toolText(output);
-      return await perceive($, name, {
-        kind: "tool", phase: "after", category: categoryOf(toolName), toolName,
-        ...(filePath ? { filePath } : {}), ...(detail ? { input: detail } : {}), ...(seen ? { output: seen } : {}), ok,
-      }, await absence($));
-    } catch {
-      return undefined;
-    }
-  };
-
   on("classic.PostToolUse", async ($, e, next) => {
     const result = await next(e);
-    return withContext(result, await toolNote($, e.tool_name, e.tool_input, true, e.tool_response));
+    return withContext(result, await toolNote($, options, reported, promptStates, e.tool_name, e.tool_input, true, e.tool_response));
   });
 
   on("classic.PostToolUseFailure", async ($, e, next) => {
     const result = await next(e);
-    return withContext(result, await toolNote($, e.tool_name, e.tool_input, false, e.error));
+    return withContext(result, await toolNote($, options, reported, promptStates, e.tool_name, e.tool_input, false, e.error));
   });
 
   on("prompt.compose", async ($, e, next) => {
@@ -430,7 +431,7 @@ export function register(on: On, options: PluginOptions = {}) {
     // The soul answers the human's words; a model-facing line rides the context like a note.
     try {
       const name = await soulName($, options, reported);
-      const said = name ? await perceive($, name, { kind: "human", text: e.text }, await absence($)) : undefined;
+      const said = name ? await perceive($, name, { kind: "human", text: e.text }, await absence($, promptStates)) : undefined;
       if (said) notes.push(said.text);
     } catch {}
 
