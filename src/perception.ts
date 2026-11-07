@@ -28,9 +28,7 @@ export type Moment =
       input?: string;
       output?: string;
       ok?: boolean;
-    }
-  | { kind: "brain"; id: string; provider?: string }
-  | { kind: "soul"; name: string };
+    };
 
 export interface Utterance {
   text: string;

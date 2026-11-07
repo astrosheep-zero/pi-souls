@@ -25,9 +25,7 @@ type ToolCategory = "reading" | "running" | "writing" | "other";
 type Moment =
   | { kind: "wake"; source: "startup" | "resume" | "compact" | "clear" | "fork" }
   | { kind: "human"; text: string }
-  | { kind: "tool"; phase: "before" | "after"; category: ToolCategory; toolName: string; filePath?: string; input?: string; output?: string; ok?: boolean }
-  | { kind: "brain"; id: string; provider?: string }
-  | { kind: "soul"; name: string };
+  | { kind: "tool"; phase: "before" | "after"; category: ToolCategory; toolName: string; filePath?: string; input?: string; output?: string; ok?: boolean };
 
 interface Utterance {
   text: string;
