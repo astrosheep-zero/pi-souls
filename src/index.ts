@@ -3,12 +3,12 @@ import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { applySoul, replaceForcedPreamble } from "./prompt.ts";
-import { footerText, resolvePresence, resolveReaction, selectionPresence, type Presence } from "./presence.ts";
+import { footerText, resolvePresence, resolvePerception, selectionPresence, type Presence } from "./presence.ts";
 import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
 import { formatTimeReminder } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, formatTransitionReminder, readTransition, sameTransition, transitionLines, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
-import { loadReaction, toolCategory, toolFilePath, toolText, REACTION_MESSAGE_TYPE, worldFor, type Moment, type Reaction } from "./reaction.ts";
+import { loadPerception, toolCategory, toolFilePath, toolText, PERCEPTION_MESSAGE_TYPE, worldFor, type Moment, type Perception } from "./perception.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
@@ -49,16 +49,16 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // ExtensionContext has no system-prompt options before a run or command; track what the host told us.
   let promptKnown = false;
   let seenPrompt: string | undefined;
-  // Cache one reaction per soul directory, including which extension supplied it.
-  const reactions = new Map<string, { path: string; reaction: Reaction }>();
-  const reactionFor = (path: string): Reaction => {
+  // Cache one perception per soul directory, including which extension supplied it.
+  const perceptions = new Map<string, { path: string; perception: Perception }>();
+  const perceptionFor = (path: string): Perception => {
     const dir = dirname(path);
-    let cached = reactions.get(dir);
+    let cached = perceptions.get(dir);
     if (!cached || cached.path !== path) {
-      cached = { path, reaction: loadReaction(path) };
-      reactions.set(dir, cached);
+      cached = { path, perception: loadPerception(path) };
+      perceptions.set(dir, cached);
     }
-    return cached.reaction;
+    return cached.perception;
   };
   // Tool calls remember what the end event no longer carries, bounded so a long run cannot grow it.
   const toolCalls = new Map<string, { filePath?: string; input?: string }>();
@@ -66,24 +66,20 @@ export default function soulsExtension(pi: ExtensionAPI) {
     const last = lastUserMessageTimestamp(branch);
     return last === undefined ? undefined : Math.max(0, now - last);
   };
-  /** Only an effective soul that ships a reaction module may answer; everything else, and every failure, stays quiet. */
-  const react = async (moment: Moment, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
+  /** Only an effective soul that ships a perception module may answer; everything else, and every failure, stays quiet. */
+  const perceive = async (moment: Moment, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
     try {
       const config = readConfig(pi.getSettings(), ctx.cwd);
       const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model, soulless()), customPrompt);
-      const target = resolveReaction(config, selection);
+      const target = resolvePerception(config, selection);
       if (!target) return;
       const now = Date.now();
       const world = worldFor({ now, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, soul: target.name, absenceMs: absence(ctx.sessionManager.getBranch(), now) });
-      const said = await reactionFor(target.path)(moment, world);
+      const said = await perceptionFor(target.path)(moment, world);
       if (!said) return;
-      if (said.audience === "human") {
-        if (ctx.hasUI) ctx.ui.notify(said.text, "info");
-        return;
-      }
-      pi.sendMessage({ customType: REACTION_MESSAGE_TYPE, content: said.text, display: said.audience === "both", details: { moment: moment.kind } });
+      pi.sendMessage({ customType: PERCEPTION_MESSAGE_TYPE, content: said.text, display: false, details: { moment: moment.kind } });
     } catch {
-      // A reaction is decoration: a broken module or soul never breaks the host.
+      // A perception is decoration: a broken module or soul never breaks the host.
     }
   };
   // Retain the original text so tool-loop requests and soul edits do not patch our own output.
@@ -125,9 +121,9 @@ export default function soulsExtension(pi: ExtensionAPI) {
     toolCalls.clear();
     refreshFooter(ctx, undefined, ctx.model, false);
     const source = wakeSource(event.reason);
-    if (source) return react({ kind: "wake", source }, ctx, undefined);
+    if (source) return perceive({ kind: "wake", source }, ctx, undefined);
   });
-  pi.on("session_compact", (_event, ctx) => react({ kind: "wake", source: "compact" }, ctx, options?.customPrompt));
+  pi.on("session_compact", (_event, ctx) => perceive({ kind: "wake", source: "compact" }, ctx, options?.customPrompt));
   pi.on("model_select", (event, ctx) => refreshFooter(ctx, promptValue(), event.model));
   pi.on("session_tree", (_event, ctx) => refreshFooter(ctx, promptValue()));
   pi.on("before_agent_start", (event, ctx) => {
@@ -137,8 +133,8 @@ export default function soulsExtension(pi: ExtensionAPI) {
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
     if (!userRun) return;
-    // The handler stays synchronous: a pending reaction answer arrives when it arrives.
-    void react({ kind: "human", text: event.prompt }, ctx, options.customPrompt);
+    // The handler stays synchronous: a pending perception answer arrives when it arrives.
+    void perceive({ kind: "human", text: event.prompt }, ctx, options.customPrompt);
     try {
       const branch = ctx.sessionManager.getBranch();
       const config = readConfig(pi.getSettings(), ctx.cwd);
@@ -164,13 +160,13 @@ export default function soulsExtension(pi: ExtensionAPI) {
     toolCalls.delete(event.toolCallId);
     toolCalls.set(event.toolCallId, record);
     if (toolCalls.size > 64) toolCalls.delete(toolCalls.keys().next().value!);
-    return react({ kind: "tool", phase: "before", category: toolCategory(event.toolName), toolName: event.toolName, ...record }, ctx, options?.customPrompt);
+    return perceive({ kind: "tool", phase: "before", category: toolCategory(event.toolName), toolName: event.toolName, ...record }, ctx, options?.customPrompt);
   });
   pi.on("tool_execution_end", (event, ctx) => {
     const record = toolCalls.get(event.toolCallId);
     toolCalls.delete(event.toolCallId);
     const output = toolText(event.result);
-    return react({ kind: "tool", phase: "after", category: toolCategory(event.toolName), toolName: event.toolName, ...record, ...(output ? { output } : {}), ok: !event.isError }, ctx, options?.customPrompt);
+    return perceive({ kind: "tool", phase: "after", category: toolCategory(event.toolName), toolName: event.toolName, ...record, ...(output ? { output } : {}), ok: !event.isError }, ctx, options?.customPrompt);
   });
   // The host copies the run options before each tool-loop request, so re-render them here:
   // a broken soul falls back to the base prompt instead of stalling the previous body.
@@ -203,7 +199,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         const items = [
           ...souls,
           { value: "clear", label: "clear", description: "Follow defaults" },
-          { value: "reload", label: "reload", description: "Re-read the active soul and reaction" },
+          { value: "reload", label: "reload", description: "Re-read the active soul and perception" },
         ];
         const matches = items.filter((item) => item.value.startsWith(prefix.trim()));
         return matches.length ? matches : null;
@@ -274,7 +270,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
             return notify("No soul to reload.");
           }
           readSoul(config.dir, selection.name, soulVariables(ctx)); // A broken SOUL or fragment never clears the old module.
-          reactions.delete(join(config.dir, selection.name));
+          perceptions.delete(join(config.dir, selection.name));
           refresh();
           return notify(`Reloaded ${selection.name}.`);
         }

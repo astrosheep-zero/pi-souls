@@ -12,16 +12,16 @@ declare global {
 /** Executed by the host's `node`, never loaded here: this sandbox has no dynamic import and no Node. */
 function runnerPath(): string | undefined {
   try {
-    return new URL("./reaction-runner.mjs", import.meta.url).pathname;
+    return new URL("./perception-runner.mjs", import.meta.url).pathname;
   } catch {
-    return undefined; // An environment without module URLs simply has no reaction.
+    return undefined; // An environment without module URLs simply has no perception.
   }
 }
 
-/** How the host saw a tool call; a reaction module reads this instead of parsing tool names. */
+/** How the host saw a tool call; a perception module reads this instead of parsing tool names. */
 type ToolCategory = "reading" | "running" | "writing" | "other";
 
-/** One lifecycle beat a soul may answer. Kept in step with `src/reaction.ts`. */
+/** One lifecycle beat a soul may answer. Kept in step with `src/perception.ts`. */
 type Moment =
   | { kind: "wake"; source: "startup" | "resume" | "compact" | "clear" | "fork" }
   | { kind: "human"; text: string }
@@ -29,12 +29,8 @@ type Moment =
   | { kind: "brain"; id: string; provider?: string }
   | { kind: "soul"; name: string };
 
-/** Who reads an utterance; `model` is the default. */
-type Audience = "model" | "human" | "both";
-
 interface Utterance {
   text: string;
-  audience?: Audience;
 }
 
 const CATEGORIES: Readonly<Record<string, ToolCategory>> = {
@@ -172,7 +168,7 @@ function toolText(value: unknown): string | undefined {
   return text.length > DETAIL_LIMIT ? `${text.slice(0, DETAIL_LIMIT)}…` : text;
 }
 
-/** Clock facts a reaction module can branch on without re-reading the clock. */
+/** Clock facts a perception module can branch on without re-reading the clock. */
 function facts(now: number): Record<string, unknown> {
   const date = new Date(now);
   const hour = date.getHours();
@@ -194,17 +190,17 @@ async function soulName($: Engine, options: PluginOptions, reported: Set<string>
   return select($, options, await $.session.model(), reported);
 }
 
-/** A tool name mapped to the category a reaction module reads. */
+/** A tool name mapped to the category a perception module reads. */
 function categoryOf(toolName: string): ToolCategory {
   return Object.hasOwn(CATEGORIES, toolName) ? CATEGORIES[toolName]! : "other";
 }
 
-/** A directory soul's executable reaction, when it ships one. */
-async function reactionPath($: Engine, name: string): Promise<string | undefined> {
+/** A directory soul's executable perception, when it ships one. */
+async function perceptionPath($: Engine, name: string): Promise<string | undefined> {
   const home = await homeDir($);
   if (!home) return undefined;
   for (const extension of [".ts", ".mjs", ".js"]) {
-    const path = `${home}/.agents/souls/${name}/reaction${extension}`;
+    const path = `${home}/.agents/souls/${name}/perception${extension}`;
     if (await $.fs.exists(path)) return path;
   }
   return undefined;
@@ -212,21 +208,20 @@ async function reactionPath($: Engine, name: string): Promise<string | undefined
 
 function utterance(value: unknown): Utterance | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const { text, audience } = value as { text?: unknown; audience?: unknown };
+  const { text } = value as { text?: unknown };
   if (typeof text !== "string" || !text.trim()) return undefined;
-  const known = audience === "human" || audience === "both" || audience === "model" ? audience : undefined;
-  return { text, ...(known ? { audience: known } : {}) };
+  return { text };
 }
 
 /**
- * Run one soul's `reaction(moment, world)` in a Node child process: the sandbox has
+ * Run one soul's `perception(moment, world)` in a Node child process: the sandbox has
  * no dynamic import, and a broken module must never break the host's request.
  */
-async function react($: Engine, name: string, moment: Moment, absenceMs?: number): Promise<Utterance | undefined> {
+async function perceive($: Engine, name: string, moment: Moment, absenceMs?: number): Promise<Utterance | undefined> {
   try {
     const runner = runnerPath();
     if (!runner) return undefined;
-    const path = await reactionPath($, name);
+    const path = await perceptionPath($, name);
     if (!path) return undefined;
     const home = await homeDir($) ?? "";
     const now = await $.clock.now();
@@ -243,7 +238,7 @@ async function react($: Engine, name: string, moment: Moment, absenceMs?: number
       { timeoutMs: 10_000 },
     );
     if (exitCode !== 0) return undefined;
-    // The last line is the runner's answer; a reaction module may print on its own.
+    // The last line is the runner's answer; a perception module may print on its own.
     const line = stdout.trim().split("\n").pop();
     return line ? utterance(JSON.parse(line)) : undefined;
   } catch {
@@ -251,20 +246,9 @@ async function react($: Engine, name: string, moment: Moment, absenceMs?: number
   }
 }
 
-/** A human reads it in a toast; the model reads it as extra context. */
-function shown(said: Utterance): boolean {
-  return said.audience === "human" || said.audience === "both";
-}
-/** What the model reads: everything but a human-only utterance. */
-function told(said: Utterance): string | undefined {
-  return said.audience === "human" ? undefined : said.text;
-}
 /** A classic result with the utterance added: the host's own fields pass through untouched. */
-function withContext<T extends { additionalContext?: string[] }>($: Engine, result: T, said: Utterance | undefined): T {
-  if (!said) return result;
-  if (shown(said)) $.ui.toast(said.text);
-  const text = told(said);
-  return text ? { ...result, additionalContext: [...(result.additionalContext ?? []), text] } : result;
+function withContext<T extends { additionalContext?: string[] }>(result: T, said: Utterance | undefined): T {
+  return said ? { ...result, additionalContext: [...(result.additionalContext ?? []), said.text] } : result;
 }
 
 interface SessionState {
@@ -310,7 +294,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const name = await soulName($, options, reported);
       if (!name) return result;
       const absenceMs = typeof e.seconds_since_last_response === "number" ? e.seconds_since_last_response * 1000 : undefined;
-      return withContext($, result, await react($, name, { kind: "wake", source: e.source }, absenceMs));
+      return withContext(result, await perceive($, name, { kind: "wake", source: e.source }, absenceMs));
     } catch {
       return result;
     }
@@ -324,7 +308,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const args = toolArgs(e);
       const filePath = toolPath(args);
       const input = toolText(args);
-      return withContext($, result, await react($, name, {
+      return withContext(result, await perceive($, name, {
         kind: "tool", phase: "before", category: categoryOf(e.tool), toolName: e.tool,
         ...(filePath ? { filePath } : {}), ...(input ? { input } : {}),
       }, await absence($)));
@@ -341,7 +325,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const filePath = toolPath(input);
       const detail = toolText(input);
       const seen = toolText(output);
-      return await react($, name, {
+      return await perceive($, name, {
         kind: "tool", phase: "after", category: categoryOf(toolName), toolName,
         ...(filePath ? { filePath } : {}), ...(detail ? { input: detail } : {}), ...(seen ? { output: seen } : {}), ok,
       }, await absence($));
@@ -352,12 +336,12 @@ export function register(on: On, options: PluginOptions = {}) {
 
   on("classic.PostToolUse", async ($, e, next) => {
     const result = await next(e);
-    return withContext($, result, await toolNote($, e.tool_name, e.tool_input, true, e.tool_response));
+    return withContext(result, await toolNote($, e.tool_name, e.tool_input, true, e.tool_response));
   });
 
   on("classic.PostToolUseFailure", async ($, e, next) => {
     const result = await next(e);
-    return withContext($, result, await toolNote($, e.tool_name, e.tool_input, false, e.error));
+    return withContext(result, await toolNote($, e.tool_name, e.tool_input, false, e.error));
   });
 
   on("prompt.compose", async ($, e, next) => {
@@ -448,12 +432,8 @@ export function register(on: On, options: PluginOptions = {}) {
     // The soul answers the human's words; a model-facing line rides the context like a note.
     try {
       const name = await soulName($, options, reported);
-      const said = name ? await react($, name, { kind: "human", text: e.text }, await absence($)) : undefined;
-      if (said) {
-        if (shown(said)) $.ui.toast(said.text);
-        const text = told(said);
-        if (text) notes.push(text);
-      }
+      const said = name ? await perceive($, name, { kind: "human", text: e.text }, await absence($)) : undefined;
+      if (said) notes.push(said.text);
     } catch {}
 
     // Let a downstream rejection propagate; calling next twice would submit twice.

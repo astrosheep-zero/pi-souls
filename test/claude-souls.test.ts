@@ -292,18 +292,18 @@ test("Claude loads a directory soul and prefers its SOUL.md over a same-named fi
   assert.match((await h.compose(original)).sections[0].text, /You are Faye/);
 });
 
-const REACTION = `export function reaction(moment, world) {
-  return { text: JSON.stringify({ moment, world }), audience: moment.kind === "human" ? "both" : "model" };
+const PERCEPTION = `export function perception(moment, world) {
+  return { text: JSON.stringify({ moment, world }) };
 }
 `;
 
-// The reaction path is a real file and a real child process: only the engine's IO is stubbed.
-function diskHost(reaction: Record<string, string> | string, options: PluginOptions = { defaultSoul: "faye", timeaware: false }) {
-  const home = mkdtempSync(join(tmpdir(), "claude-reaction-"));
+// The perception path is a real file and a real child process: only the engine's IO is stubbed.
+function diskHost(perception: Record<string, string> | string, options: PluginOptions = { defaultSoul: "faye", timeaware: false }) {
+  const home = mkdtempSync(join(tmpdir(), "claude-perception-"));
   const souls = join(home, ".agents", "souls", "faye");
   mkdirSync(souls, { recursive: true });
   writeFileSync(join(souls, "SOUL.md"), "You are Faye.");
-  for (const [name, text] of Object.entries(typeof reaction === "string" ? { "reaction.ts": reaction } : reaction)) writeFileSync(join(souls, name), text);
+  for (const [name, text] of Object.entries(typeof perception === "string" ? { "perception.ts": perception } : perception)) writeFileSync(join(souls, name), text);
   const hooks = new Map<string, Hook>();
   const toasts: string[] = [];
   const env = new Map<string, string>([["HOME", home]]);
@@ -338,8 +338,8 @@ function diskHost(reaction: Record<string, string> | string, options: PluginOpti
 
 const momentOf = (entry: string | undefined) => JSON.parse(entry!).moment;
 
-test("Claude wakes a directory soul's reaction with the world it can see", async () => {
-  const h = diskHost(REACTION);
+test("Claude wakes a directory soul's perception with the world it can see", async () => {
+  const h = diskHost(PERCEPTION);
   try {
     const result = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "resume", seconds_since_last_response: 120 });
     assert.equal(result.additionalContext.length, 1);
@@ -359,24 +359,31 @@ test("Claude wakes a directory soul's reaction with the world it can see", async
     assert.deepEqual(momentOf(fresh.additionalContext[0]), { kind: "wake", source: "clear" });
   } finally { h.close(); }
 
-  // A plain ES module works the same way: the runner reads `reaction` or the default export.
-  const esm = diskHost({ "reaction.mjs": "export default (moment) => ({ text: `mjs:${moment.source}` });" });
+  // A plain ES module works the same way: the runner reads `perception` or the default export.
+  const esm = diskHost({ "perception.mjs": "export default (moment) => ({ text: `mjs:${moment.source}` });" });
   try {
     const result = await esm.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
     assert.deepEqual(result.additionalContext, ["mjs:startup"]);
   } finally { esm.close(); }
 });
 
-test("Claude hands the human's prompt to the reaction and appends what the model should read", async () => {
-  const h = diskHost(REACTION);
+test("Claude loads a top-level CommonJS function export", async () => {
+  const h = diskHost({ "perception.js": "module.exports = function perception() { return { text: 'callable' }; };" });
+  try {
+    const result = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
+    assert.deepEqual(result.additionalContext, ["callable"]);
+  } finally { h.close(); }
+});
+
+test("Claude hands the human's prompt to the perception and appends what the model should read", async () => {
+  const h = diskHost(PERCEPTION);
   try {
     const result = await h.submit({ text: "what now", context: ["earlier"] });
     assert.deepEqual(result.context?.slice(0, 1), ["earlier"]);
     const said = JSON.parse(result.context!.at(-1)!);
     assert.deepEqual(said.moment, { kind: "human", text: "what now" });
     assert.equal(said.world.sessionId, "session-a");
-    assert.equal(h.toasts.length, 1); // `both` reaches the human too
-    assert.equal(JSON.parse(h.toasts[0]!).moment.text, "what now");
+    assert.equal(h.toasts.length, 0);
 
     // The next prompt learns how long the human was away.
     h.at(new Date(2026, 9, 27, 2, 14, 0).getTime() + 90_000);
@@ -386,7 +393,7 @@ test("Claude hands the human's prompt to the reaction and appends what the model
 });
 
 test("Claude answers tool calls on both phases and keeps the host's own context", async () => {
-  const h = diskHost(REACTION);
+  const h = diskHost(PERCEPTION);
   try {
     const before = await h.classic("classic.PreToolUse", { tool: "Read", tool_use_id: "t1", file_path: "/work/a.md" }, { additionalContext: ["host"] });
     assert.deepEqual(before.additionalContext[0], "host");
@@ -414,8 +421,8 @@ test("Claude answers tool calls on both phases and keeps the host's own context"
   } finally { h.close(); }
 });
 
-test("Claude keeps silence when soulless, without a reaction, or the reaction module is broken", async () => {
-  const soulless = diskHost(REACTION);
+test("Claude keeps silence when soulless, without a perception, or the perception module is broken", async () => {
+  const soulless = diskHost(PERCEPTION);
   try {
     soulless.env.set("SOULLESS", "1");
     const result = await soulless.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
@@ -428,7 +435,7 @@ test("Claude keeps silence when soulless, without a reaction, or the reaction mo
     assert.equal((await plain.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" })).additionalContext, undefined);
   } finally { plain.close(); }
 
-  const broken = diskHost({ "reaction.ts": "export const reaction = () => { throw new Error('boom'); };" });
+  const broken = diskHost({ "perception.ts": "export const perception = () => { throw new Error('boom'); };" });
   try {
     assert.equal((await broken.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" })).additionalContext, undefined);
     assert.equal((await broken.submit()).context, undefined);

@@ -116,13 +116,13 @@ export function soulFile(dir: string, name: string): { path: string; root: strin
   return { path: join(dir, `${name}.md`), root: [dir] };
 }
 
-const REACTION_EXTENSIONS = [".ts", ".mjs", ".js"] as const;
+const PERCEPTION_EXTENSIONS = [".ts", ".mjs", ".js"] as const;
 
-/** The executable reaction of a directory soul, if it ships one. */
-export function soulReactionPath(dir: string, name: string): string | undefined {
+/** The executable perception of a directory soul, if it ships one. */
+export function soulPerceptionPath(dir: string, name: string): string | undefined {
   if (!isSoulName(name)) return undefined;
-  for (const extension of REACTION_EXTENSIONS) {
-    const path = join(dir, name, `reaction${extension}`);
+  for (const extension of PERCEPTION_EXTENSIONS) {
+    const path = join(dir, name, `perception${extension}`);
     if (existsSync(path)) return path;
   }
   return undefined;

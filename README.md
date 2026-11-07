@@ -12,12 +12,12 @@ pi install npm:@astrosheep/pi-souls
 /soul          # current soul and list
 /soul @faye    # use faye for this session
 /soul clear    # follow defaults again
-/soul reload   # re-read the active SOUL and its reaction
+/soul reload   # re-read the active SOUL and its perception
 ```
 
 Tab-complete offers `@name`, `clear`, and `reload`. Soul names `clear` and `reload` are selected as `@clear` and `@reload`.
 
-`/soul reload` validates the active body and Liquid fragments, refreshes the footer, and reloads its reaction on the next moment. It changes no selection and starts no model request; the next request uses the current soul body.
+`/soul reload` validates the active body and Liquid fragments, refreshes the footer, and reloads its perception on the next moment. It changes no selection and starts no model request; the next request uses the current soul body.
 
 ```bash
 pi --soulless
@@ -35,13 +35,13 @@ A soul is one Markdown file, or a directory holding `SOUL.md` beside whatever it
 ├── faye/
 │   ├── SOUL.md
 │   ├── parts/shared.md
-│   └── reaction.ts
+│   └── perception.ts
 ├── reviewer.md
 └── parts/
     └── shared.md
 ```
 
-`<dir>/<name>/SOUL.md` wins when both forms exist. A directory soul renders templates from its own folder first and `soulsDir` second, so `parts/` next to it beats the shared one. `<name>/reaction.ts` is optional; see [Reaction](#reaction).
+`<dir>/<name>/SOUL.md` wins when both forms exist. A directory soul renders templates from its own folder first and `soulsDir` second, so `parts/` next to it beats the shared one. `<name>/perception.ts` is optional; see [Perception](#perception).
 
 ```md
 ---
@@ -76,13 +76,13 @@ Put reusable Markdown fragments in `soulsDir/parts/`; both `{% include 'parts/sh
 
 Template syntax is processed even inside Markdown code fences. Wrap literal examples in `{% raw %}...{% endraw %}`. The Claude Code mod below still reads souls as literal Markdown; Liquid rendering is Pi-only.
 
-## Reaction
+## Perception
 
-A directory soul may answer lifecycle moments with code. `<soulsDir>/<name>/reaction.ts` (or `reaction.mjs`, `reaction.js`) exports `reaction(moment, world)`, by name or as the default:
+A directory soul may answer lifecycle moments with code. `<soulsDir>/<name>/perception.ts` (or `perception.mjs`, `perception.js`) exports `perception(moment, world)`, by name or as the default:
 
 ```ts
-export function reaction(moment, world) {
-  if (moment.kind === "human") return { text: "……", audience: "human" };
+export function perception(moment, world) {
+  if (moment.kind === "human") return { text: "……" };
   if (moment.kind === "tool" && moment.phase === "after") return { text: `${moment.toolName} ${moment.ok ? "ok" : "failed"}` };
   return undefined; // silence is always allowed
 }
@@ -92,9 +92,9 @@ Moments: `wake` (`source`: `startup`, `resume`, `fork`, `clear`, `compact`), `hu
 
 `world` is `{ now, sessionId, cwd, absenceMs?, storeDir, facts }`. `facts` carries `hour`, `morning`, `afternoon`, `evening`, `night`, `weekday` (0 is Sunday) and `weekend`. `absenceMs` is the time since the human's previous message when that is known; `storeDir` defaults to `~/.local/share/pi-souls/<name>`.
 
-`audience` decides delivery. `human` is a notification the model never reads, `both` is a visible transcript message, and `model` (the default) is a hidden one. A module that fails to import, throws, or returns no text is ignored: a reaction never interrupts the host. Pi loads it once; `/soul reload` drops the cached module so the next moment imports the file again.
+Utterances are delivered as hidden model context. A module that fails to import, throws, or returns no text is ignored: a perception never interrupts the host. Pi loads it once; `/soul reload` drops the cached module so the next moment imports the file again.
 
-Pi imports the entry module in-process; dependencies follow their loader's normal caching. The Claude Code mod runs it in a `node` child process (`--experimental-strip-types`), because its sandbox has no `import()` and no Node. `node` must be on the mod's `PATH`, and its TypeScript reactions must use syntax Node can erase.
+Pi imports the entry module in-process; dependencies follow their loader's normal caching. The Claude Code mod runs it in a `node` child process (`--experimental-strip-types`), because its sandbox has no `import()` and no Node. `node` must be on the mod's `PATH`, and its TypeScript perceptions must use syntax Node can erase.
 
 ## Settings
 
@@ -130,7 +130,7 @@ From a checkout, with Claude Code 2.1.299 or later:
 claude --plugin-dir /path/to/pi-souls/plugins/claude
 ```
 
-Uses the same `~/.agents/souls/` souls (`<name>.md`, or `<name>/SOUL.md` with an optional `reaction.ts`) and strips frontmatter. Configure the plugin's optional `userConfig` values in Claude's user `settings.json`:
+Uses the same `~/.agents/souls/` souls (`<name>.md`, or `<name>/SOUL.md` with an optional `perception.ts`) and strips frontmatter. Configure the plugin's optional `userConfig` values in Claude's user `settings.json`:
 
 ```json
 {
@@ -154,7 +154,7 @@ The mod sends the same hidden transition reminder through `prompt.submit` contex
 
 Only the first `You are…` paragraph of the normal or lean opening is replaced. Leading whitespace, the remaining text, and all other sections stay unchanged. A missing or unexpected opening leaves the prompt intact and warns once per session; unreadable souls also fall back to Claude's prompt. Time awareness (`timeaware`) is on by default (`false` disables it). When a soul is active, `prompt.submit` attaches the same watch-style time reminder on the first user prompt and when at least 1 hour has passed since the previous reminder. The parenthetical appears only after a gap of at least 1 hour between user prompts.
 
-A directory soul's `reaction.ts` answers `wake` on `SessionStart`, `human` on `prompt.submit`, and `tool` on `PreToolUse`/`PostToolUse`/`PostToolUseFailure`. Model-facing text joins the event's context; `human` (and `both`) also show a toast. `absenceMs` comes from `seconds_since_last_response` on resume/fork and from the session's previous prompt otherwise.
+A directory soul's `perception.ts` answers `wake` on `SessionStart`, `human` on `prompt.submit`, and `tool` on `PreToolUse`/`PostToolUse`/`PostToolUseFailure`. Utterance text joins the event's context. `absenceMs` comes from `seconds_since_last_response` on resume/fork and from the session's previous prompt otherwise.
 
 Limitations:
 - The separate official identity, `You are Claude Code, Anthropic's official CLI…`, cannot be removed by this hook; it coexists with the soul.

@@ -8,17 +8,17 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 // Load through Pi's extension loader, not only through a direct Node import.
-test("Pi loads a changed reaction after /soul reload without starting a model request", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "souls-reaction-sdk-"));
+test("Pi loads a changed perception after /soul reload without starting a model request", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-perception-sdk-"));
   let dispose: (() => void) | undefined;
   try {
     const soul = join(dir, "faye");
-    const marker = join(dir, "reaction-output");
-    const reaction = join(soul, "reaction.ts");
-    const code = (value: string) => `import { writeFileSync } from 'node:fs'; enum Marker { value = ${JSON.stringify(value)} } export function reaction() { writeFileSync(${JSON.stringify(marker)}, Marker.value); }`;
+    const marker = join(dir, "perception-output");
+    const perception = join(soul, "perception.ts");
+    const code = (value: string) => `import { writeFileSync } from 'node:fs'; enum Marker { value = ${JSON.stringify(value)} } export function perception() { writeFileSync(${JSON.stringify(marker)}, Marker.value); }`;
     mkdirSync(soul);
     writeFileSync(join(soul, "SOUL.md"), "Faye");
-    writeFileSync(reaction, code("old"));
+    writeFileSync(perception, code("old"));
     const settings = SettingsManager.inMemory({ soulsDir: dir, timeaware: false } as any);
     const loader = new DefaultResourceLoader({
       cwd: dir, agentDir: dir, settingsManager: settings,
@@ -53,7 +53,7 @@ test("Pi loads a changed reaction after /soul reload without starting a model re
     await session.extensionRunner.emit({ type: "session_start", reason: "resume" });
     assert.equal(readFileSync(marker, "utf8"), "old");
 
-    writeFileSync(reaction, code("new"));
+    writeFileSync(perception, code("new"));
     mkdirSync(join(soul, "parts"));
     writeFileSync(join(soul, "parts", "shared.md"), "fresh snippet");
     writeFileSync(join(soul, "SOUL.md"), "Faye {{ model.id }} {% render 'parts/shared' %}");
@@ -66,9 +66,9 @@ test("Pi loads a changed reaction after /soul reload without starting a model re
     assert.equal(readFileSync(marker, "utf8"), "new");
 
     // Native ESM needs a fresh URL even when Pi loaded this extension through Jiti.
-    const esm = join(soul, "reaction.mjs");
-    const esmCode = (value: string) => `import { writeFileSync } from 'node:fs'; export function reaction() { writeFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); }`;
-    rmSync(reaction);
+    const esm = join(soul, "perception.mjs");
+    const esmCode = (value: string) => `import { writeFileSync } from 'node:fs'; export function perception() { writeFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); }`;
+    rmSync(perception);
     writeFileSync(esm, esmCode("esm-old"));
     await session.prompt("/soul reload");
     await session.extensionRunner.emit({ type: "session_start", reason: "resume" });

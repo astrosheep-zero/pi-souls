@@ -5,14 +5,14 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createJiti } from "jiti";
 
-export const REACTION_MESSAGE_TYPE = "pi-souls:reaction";
+export const PERCEPTION_MESSAGE_TYPE = "pi-souls:perception";
 
-const reactionRequire = createRequire(import.meta.url);
-const { importModule } = reactionRequire("./reaction-import.mjs") as { importModule: (url: string) => Promise<unknown> };
+const perceptionRequire = createRequire(import.meta.url);
+const { importModule } = perceptionRequire("./perception-import.mjs") as { importModule: (url: string) => Promise<unknown> };
 // A fresh Jiti evaluation retains full TypeScript support without its parent-module cache.
 const importTypeScript = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
 
-/** How the host saw a tool call; a reaction module reads this instead of parsing tool names. */
+/** How the host saw a tool call; a perception module reads this instead of parsing tool names. */
 export type ToolCategory = "reading" | "running" | "writing" | "other";
 
 /** One lifecycle beat a soul may answer. */
@@ -32,12 +32,8 @@ export type Moment =
   | { kind: "brain"; id: string; provider?: string }
   | { kind: "soul"; name: string };
 
-/** Who reads an utterance; `model` is the default. */
-export type Audience = "model" | "human" | "both";
-
 export interface Utterance {
   text: string;
-  audience?: Audience;
 }
 
 export interface World {
@@ -58,8 +54,8 @@ export interface World {
   };
 }
 
-/** What a soul's `reaction.ts` exports, by name or as the default. */
-export type Reaction = (moment: Moment, world: World) => Utterance | undefined | Promise<Utterance | undefined>;
+/** What a soul's `perception.ts` exports, by name or as the default. */
+export type Perception = (moment: Moment, world: World) => Utterance | undefined | Promise<Utterance | undefined>;
 
 const CATEGORIES: Readonly<Record<string, ToolCategory>> = {
   read: "reading",
@@ -79,7 +75,7 @@ const CATEGORIES: Readonly<Record<string, ToolCategory>> = {
   Write: "writing",
 };
 
-/** Long tool details are cut here; a reaction module gets the shape, not the whole file. */
+/** Long tool details are cut here; a perception module gets the shape, not the whole file. */
 const DETAIL_LIMIT = 2000;
 
 const object = (value: unknown): value is Record<string, unknown> =>
@@ -114,7 +110,7 @@ export function toolText(value: unknown): string | undefined {
   return text.length > DETAIL_LIMIT ? `${text.slice(0, DETAIL_LIMIT)}…` : text;
 }
 
-/** Clock facts a reaction module can branch on without re-reading the clock. */
+/** Clock facts a perception module can branch on without re-reading the clock. */
 export function factsFor(now: number): World["facts"] {
   const at = Number.isFinite(now) ? now : Date.now();
   const date = new Date(at);
@@ -136,7 +132,7 @@ export function storeDirFor(soul: string): string {
   return join(homedir(), ".local", "share", "pi-souls", soul);
 }
 
-/** Everything a reaction module learns about the moment's surroundings. */
+/** Everything a perception module learns about the moment's surroundings. */
 export function worldFor(input: { now: number; sessionId: string; cwd: string; soul: string; absenceMs?: number }): World {
   const { now, sessionId, cwd, soul, absenceMs } = input;
   return {
@@ -149,39 +145,39 @@ export function worldFor(input: { now: number; sessionId: string; cwd: string; s
   };
 }
 
-function pick(value: unknown): Reaction | undefined {
-  if (!object(value)) return undefined;
-  if (typeof value.reaction === "function") return value.reaction as Reaction;
-  return typeof value.default === "function" ? (value.default as Reaction) : undefined;
+function pick(value: unknown): Perception | undefined {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.perception === "function") return record.perception as Perception;
+  if (typeof record.default === "function") return record.default as Perception;
+  return typeof value === "function" ? value as Perception : undefined;
 }
 
-/** Only a nonempty text with a known audience is an utterance; anything else is ignored. */
+/** Only nonempty text is an utterance. */
 export function utterance(value: unknown): Utterance | undefined {
   if (!object(value)) return undefined;
-  const { text, audience } = value;
-  if (typeof text !== "string" || !text.trim()) return undefined;
-  const known = audience === "model" || audience === "human" || audience === "both" ? audience : undefined;
-  return { text, ...(known ? { audience: known } : {}) };
+  const { text } = value;
+  return typeof text === "string" && text.trim() ? { text } : undefined;
 }
 
 /**
- * Load one soul's reaction module, once. A broken module, a throwing call, or a
- * malformed answer is swallowed: a reaction may never break the host's request.
+ * Load one soul's perception module, once. A broken module, a throwing call, or a
+ * malformed answer is swallowed: a perception may never break the host's request.
  */
-export function loadReaction(reactionPath: string): Reaction {
-  let loaded: Promise<Reaction | undefined> | undefined;
-  const load = (): Promise<Reaction | undefined> =>
+export function loadPerception(perceptionPath: string): Perception {
+  let loaded: Promise<Perception | undefined> | undefined;
+  const load = (): Promise<Perception | undefined> =>
     (loaded ??= (async () => {
-      if (reactionPath.endsWith(".ts")) return pick(await importTypeScript.import(reactionPath));
+      if (perceptionPath.endsWith(".ts")) return pick(await importTypeScript.import(perceptionPath));
       // CommonJS also caches by filename, independently of the fresh ESM URL.
-      delete reactionRequire.cache[reactionRequire.resolve(reactionPath)];
-      return pick(await importModule(`${pathToFileURL(reactionPath).href}?v=${randomUUID()}`));
+      delete perceptionRequire.cache[perceptionRequire.resolve(perceptionPath)];
+      return pick(await importModule(`${pathToFileURL(perceptionPath).href}?v=${randomUUID()}`));
     })().catch(() => undefined));
   return async (moment, world) => {
-    const reaction = await load();
-    if (!reaction) return undefined;
+    const perception = await load();
+    if (!perception) return undefined;
     try {
-      return utterance(await reaction(moment, world));
+      return utterance(await perception(moment, world));
     } catch {
       return undefined;
     }

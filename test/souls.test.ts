@@ -7,7 +7,7 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earen
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
 import { applySoul, replaceForcedPreamble } from "../src/prompt.ts";
-import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulReactionPath, unmatchableModelKeys } from "../src/souls.ts";
+import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulPerceptionPath, unmatchableModelKeys } from "../src/souls.ts";
 import { formatTimeReminder } from "../src/time.ts";
 
 const model = { provider: "provider", id: "model" };
@@ -139,23 +139,23 @@ test("directory souls are listed, render from their own folder, and win over a s
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("a directory soul's reaction is found by extension precedence and unsafe names never resolve", () => {
-  const dir = mkdtempSync(join(tmpdir(), "souls-reaction-"));
+test("a directory soul's perception is found by extension precedence and unsafe names never resolve", () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-perception-"));
   try {
     mkdirSync(join(dir, "faye"));
     writeFileSync(join(dir, "faye", "SOUL.md"), "Faye");
-    assert.equal(soulReactionPath(dir, "faye"), undefined);
+    assert.equal(soulPerceptionPath(dir, "faye"), undefined);
 
-    writeFileSync(join(dir, "faye", "reaction.js"), "export const reaction = () => undefined;");
-    assert.equal(soulReactionPath(dir, "faye"), join(dir, "faye", "reaction.js"));
-    writeFileSync(join(dir, "faye", "reaction.mjs"), "export const reaction = () => undefined;");
-    assert.equal(soulReactionPath(dir, "faye"), join(dir, "faye", "reaction.mjs"));
-    writeFileSync(join(dir, "faye", "reaction.ts"), "export const reaction = () => undefined;");
-    assert.equal(soulReactionPath(dir, "faye"), join(dir, "faye", "reaction.ts"));
+    writeFileSync(join(dir, "faye", "perception.js"), "export const perception = () => undefined;");
+    assert.equal(soulPerceptionPath(dir, "faye"), join(dir, "faye", "perception.js"));
+    writeFileSync(join(dir, "faye", "perception.mjs"), "export const perception = () => undefined;");
+    assert.equal(soulPerceptionPath(dir, "faye"), join(dir, "faye", "perception.mjs"));
+    writeFileSync(join(dir, "faye", "perception.ts"), "export const perception = () => undefined;");
+    assert.equal(soulPerceptionPath(dir, "faye"), join(dir, "faye", "perception.ts"));
 
     writeFileSync(join(dir, "flat.md"), "Flat");
-    assert.equal(soulReactionPath(dir, "flat"), undefined);
-    assert.equal(soulReactionPath(dir, "../escape"), undefined);
+    assert.equal(soulPerceptionPath(dir, "flat"), undefined);
+    assert.equal(soulPerceptionPath(dir, "../escape"), undefined);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
