@@ -31,6 +31,7 @@ function host(options: PluginOptions = { defaultSoul: "faye", modelSouls: ["clau
     session: {
       id: async () => sessionId,
       model: async () => currentModel,
+      cwd: async () => "/work",
     },
     ui: { log: (text: string) => { warnings.push(text); } },
   } as unknown as EngineInterface;
@@ -284,6 +285,34 @@ test("Claude prompt.submit refreshes the watch hourly by default and notes the h
   assert.match(accepted.context![0]!, /since \*human\* was last present\)$/);
 });
 
+test("Claude rejected, dropped, command and meta prompts preserve the clock and human absence", async () => {
+  for (const skipped of [{ reject: true }, { drop: true }, { command: { name: "help", args: "" } }, { isMeta: true }] as const) {
+    const h = host({ defaultSoul: "faye" });
+    const t0 = h.getNow();
+    await h.submit();
+    h.setNow(t0 + 2 * 3_600_000);
+    if ("reject" in skipped) await assert.rejects(h.submit(skipped), /blocked/);
+    else await h.submit(skipped);
+    h.setNow(t0 + 3 * 3_600_000);
+    assert.deepEqual((await h.submit()).context, ["⌚ 05:14 · Tue, Oct 27\n(3h since *human* was last present)"]);
+  }
+  const stripped = host({ defaultSoul: "faye" });
+  await stripped.submit({ strip: true });
+  assert.deepEqual((await stripped.submit()).context, ["⌚ 02:14 · Tue, Oct 27"]);
+});
+
+test("Claude unreadable souls do not emit a time note or consume human presence", async () => {
+  const h = host({ defaultSoul: "faye" });
+  const t0 = h.getNow();
+  await h.submit();
+  h.files.delete("/home/.agents/souls/faye.md");
+  h.setNow(t0 + 2 * 3_600_000);
+  assert.equal((await h.submit()).context, undefined);
+  h.files.set("/home/.agents/souls/faye.md", "You are repaired.");
+  h.setNow(t0 + 3 * 3_600_000);
+  assert.deepEqual((await h.submit()).context, ["⌚ 05:14 · Tue, Oct 27\n(3h since *human* was last present)"]);
+});
+
 test("Claude loads a directory soul and prefers its SOUL.md over a same-named file", async () => {
   const h = host();
   h.files.set("/home/.agents/souls/faye/SOUL.md", "---\nicon: \u{1F988}\n---\nYou are Directory Faye.");
@@ -309,8 +338,9 @@ function diskHost(perception: Record<string, string> | string, options: PluginOp
   const env = new Map<string, string>([["HOME", home]]);
   let now = new Date(2026, 9, 27, 2, 14, 0).getTime();
   const session = { id: "session-a", model: "claude-test", cwd: "/work" };
+  let clockReads = 0;
   const $ = {
-    clock: { now: async () => now },
+    clock: { now: async () => { clockReads++; return now; } },
     env: { get: async (key: string) => env.get(key) },
     fs: { exists: async (path: string) => existsSync(path), read: async (path: string) => readFileSync(path, "utf8") },
     session: { id: async () => session.id, model: async () => session.model, cwd: async () => session.cwd },
@@ -327,6 +357,7 @@ function diskHost(perception: Record<string, string> | string, options: PluginOp
     hooks.get(name)!($, event, async (_e: unknown) => ({ ...answer }));
   return {
     home, souls, toasts, env, session,
+    clockReads: () => clockReads,
     fire: (name: string, event: Record<string, unknown>) => hooks.get(name)!($, { session_id: session.id, transcript_path: "", cwd: session.cwd, ...event }, async (x: any) => x),
     classic,
     submit: (event: Partial<PromptSubmitInput> = {}) =>
@@ -389,6 +420,30 @@ test("Claude hands the human's prompt to the perception and appends what the mod
     h.at(new Date(2026, 9, 27, 2, 14, 0).getTime() + 90_000);
     const next = await h.submit({ text: "again" });
     assert.equal(JSON.parse(next.context!.at(-1)!).world.absenceMs, 90_000);
+  } finally { h.close(); }
+});
+
+test("Claude builtin and directory perceptions share the prompt's clock and absence", async () => {
+  const h = diskHost(PERCEPTION, { defaultSoul: "faye" });
+  try {
+    const t0 = new Date(2026, 9, 27, 2, 14, 0).getTime();
+    const first = await h.submit({ text: "first", context: ["host"] });
+    assert.deepEqual(first.context?.slice(0, 2), ["host", "⌚ 02:14 · Tue, Oct 27"]);
+    assert.deepEqual(JSON.parse(first.context![2]!).moment, { kind: "human", text: "first" });
+    assert.equal(JSON.parse(first.context![2]!).world.now, t0);
+    assert.equal(h.clockReads(), 1);
+    h.at(t0 + 2 * 3_600_000);
+    const later = await h.submit({ text: "back" });
+    assert.equal(later.context![0], "⌚ 04:14 · Tue, Oct 27\n(2h since *human* was last present)");
+    const { moment, world } = JSON.parse(later.context![1]!);
+    assert.deepEqual(moment, { kind: "human", text: "back" });
+    assert.equal(world.now, t0 + 2 * 3_600_000);
+    assert.equal(world.absenceMs, 2 * 3_600_000);
+    assert.equal(h.clockReads(), 2);
+    assert.ok(later.context!.every((text: string) => !text.includes("<system-reminder>")));
+    const withinHour = await h.submit();
+    assert.equal(withinHour.context!.length, 1); // The directory perception still speaks while time is throttled.
+    assert.equal(JSON.parse(withinHour.context![0]!).world.absenceMs, 0);
   } finally { h.close(); }
 });
 

@@ -31,6 +31,17 @@ interface Utterance {
   text: string;
 }
 
+interface World {
+  now: number;
+  sessionId: string;
+  cwd: string;
+  storeDir: string;
+  facts: Record<string, unknown>;
+  absenceMs?: number;
+}
+
+type Perception = (moment: Moment, world: World) => Utterance | undefined;
+
 const CATEGORIES: Readonly<Record<string, ToolCategory>> = {
   read: "reading", Read: "reading", grep: "reading", Grep: "reading",
   glob: "reading", Glob: "reading", find: "reading",
@@ -62,20 +73,17 @@ function formatElapsed(ms: number): string {
   if (minutes === 60) return `${hours + 1}h`;
   return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
 }
-/**
- * Refresh the watch at most once an hour; the parenthetical appears only when the
- * human has actually been away for an hour or more. Undefined when neither is due.
- */
-export function formatTimeContext(now: number, lastNoteAt?: number, lastHumanAt?: number): string | undefined {
-  if (!Number.isFinite(now)) return undefined;
-  const noteDue = lastNoteAt === undefined || !Number.isFinite(lastNoteAt) || now - lastNoteAt >= HOUR_MS;
-  if (!noteDue) return undefined;
-  const away = lastHumanAt !== undefined && Number.isFinite(lastHumanAt) && now - lastHumanAt >= HOUR_MS
-    ? formatElapsed(now - lastHumanAt)
-    : undefined;
-  return away === undefined
-    ? `⌚ ${formatClock(now)}`
-    : `⌚ ${formatClock(now)}\n(${away} since *human* was last present)`;
+/** Refresh the watch on human moments, at most once an hour. */
+function timePerception(lastNoteAt?: number): Perception {
+  return (moment, world) => {
+    if (moment.kind !== "human" || !Number.isFinite(world.now)) return undefined;
+    if (lastNoteAt !== undefined && Number.isFinite(lastNoteAt) && world.now - lastNoteAt < HOUR_MS) return undefined;
+    const clock = `⌚ ${formatClock(world.now)}`;
+    const away = world.absenceMs !== undefined && Number.isFinite(world.absenceMs) && world.absenceMs >= HOUR_MS
+      ? formatElapsed(world.absenceMs)
+      : undefined;
+    return { text: away ? `${clock}\n(${away} since *human* was last present)` : clock };
+  };
 }
 
 function isName(value: unknown): value is string {
@@ -211,26 +219,30 @@ function utterance(value: unknown): Utterance | undefined {
   return { text };
 }
 
+/** Build one world shared by every perception answering a moment. */
+async function worldFor($: Engine, name: string, absenceMs?: number): Promise<World> {
+  const home = await homeDir($) ?? "";
+  const now = await $.clock.now();
+  return {
+    now,
+    sessionId: await $.session.id(),
+    cwd: await $.session.cwd(),
+    storeDir: `${home}/.local/share/pi-souls/${name}`,
+    facts: facts(now),
+    ...(absenceMs !== undefined && Number.isFinite(absenceMs) && absenceMs >= 0 ? { absenceMs } : {}),
+  };
+}
+
 /**
  * Run one soul's `perception(moment, world)` in a Node child process: the sandbox has
  * no dynamic import, and a broken module must never break the host's request.
  */
-async function perceive($: Engine, name: string, moment: Moment, absenceMs?: number): Promise<Utterance | undefined> {
+async function perceive($: Engine, name: string, moment: Moment, world: World): Promise<Utterance | undefined> {
   try {
     const runner = runnerPath();
     if (!runner) return undefined;
     const path = await perceptionPath($, name);
     if (!path) return undefined;
-    const home = await homeDir($) ?? "";
-    const now = await $.clock.now();
-    const world = {
-      now,
-      sessionId: await $.session.id(),
-      cwd: await $.session.cwd(),
-      storeDir: `${home}/.local/share/pi-souls/${name}`,
-      facts: facts(now),
-      ...(absenceMs !== undefined && Number.isFinite(absenceMs) && absenceMs >= 0 ? { absenceMs } : {}),
-    };
     const { exitCode, stdout } = await $.process.run(
       ["node", "--experimental-strip-types", runner, path, JSON.stringify({ moment, world })],
       { timeoutMs: 10_000 },
@@ -283,7 +295,7 @@ async function toolNote($: Engine, options: PluginOptions, reported: Set<string>
     return await perceive($, name, {
       kind: "tool", phase: "after", category: categoryOf(toolName), toolName,
       ...(filePath ? { filePath } : {}), ...(detail ? { input: detail } : {}), ...(seen ? { output: seen } : {}), ok,
-    }, await absence($, promptStates));
+    }, await worldFor($, name, await absence($, promptStates)));
   } catch {
     return undefined;
   }
@@ -310,7 +322,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const name = await soulName($, options, reported);
       if (!name) return result;
       const absenceMs = typeof e.seconds_since_last_response === "number" ? e.seconds_since_last_response * 1000 : undefined;
-      return withContext(result, await perceive($, name, { kind: "wake", source: e.source }, absenceMs));
+      return withContext(result, await perceive($, name, { kind: "wake", source: e.source }, await worldFor($, name, absenceMs)));
     } catch {
       return result;
     }
@@ -327,7 +339,7 @@ export function register(on: On, options: PluginOptions = {}) {
       return withContext(result, await perceive($, name, {
         kind: "tool", phase: "before", category: categoryOf(e.tool), toolName: e.tool,
         ...(filePath ? { filePath } : {}), ...(input ? { input } : {}),
-      }, await absence($, promptStates)));
+      }, await worldFor($, name, await absence($, promptStates))));
     } catch {
       return result;
     }
@@ -377,28 +389,26 @@ export function register(on: On, options: PluginOptions = {}) {
   on("prompt.submit", async ($, e, next) => {
     if (e.command || e.isMeta) return next(e);
     const notes: string[] = [];
-    let timeNote: string | undefined;
-
-    // A soul's presence is recorded whenever a soul applies, whether or not time notes are on.
-    let presence: { id: string; now: number } | undefined;
+    let timeSaid: Utterance | undefined;
+    let presence: World | undefined;
     try {
-      if (!/^(1|true)$/i.test(await $.env.get("SOULLESS") ?? "")) {
-        const name = await select($, options, await $.session.model(), reported);
-        if (name) {
-          if (options.timeaware !== false) await load($, name);
-          presence = { id: await $.session.id(), now: await $.clock.now() };
+      const name = await soulName($, options, reported);
+      if (name) {
+        await load($, name);
+        const world = await worldFor($, name);
+        const state = promptStates.get(world.sessionId);
+        if (state?.humanAt !== undefined) world.absenceMs = Math.max(0, world.now - state.humanAt);
+        presence = world;
+        const moment: Moment = { kind: "human", text: e.text };
+        if (options.timeaware !== false) {
+          timeSaid = timePerception(state?.noteAt)(moment, world);
+          if (timeSaid) notes.push(timeSaid.text);
         }
+        const said = await perceive($, name, moment, world);
+        if (said) notes.push(said.text);
       }
     } catch {
-      presence = undefined;
-    }
-    const sessionId = presence?.id;
-    const now = presence?.now;
-    // Watch-style time awareness: only when a soul would actually be applied.
-    if (presence && options.timeaware !== false) {
-      const state = promptStates.get(presence.id);
-      timeNote = formatTimeContext(presence.now, state?.noteAt, state?.humanAt);
-      if (timeNote !== undefined) notes.push(timeNote);
+      // A missing or unreadable soul neither speaks nor consumes human presence.
     }
 
     let id: string | undefined;
@@ -428,22 +438,16 @@ export function register(on: On, options: PluginOptions = {}) {
       }
     }
 
-    // The soul answers the human's words; a model-facing line rides the context like a note.
-    try {
-      const name = await soulName($, options, reported);
-      const said = name ? await perceive($, name, { kind: "human", text: e.text }, await absence($, promptStates)) : undefined;
-      if (said) notes.push(said.text);
-    } catch {}
-
     // Let a downstream rejection propagate; calling next twice would submit twice.
     const result = await next(notes.length ? { ...e, context: [...(e.context ?? []), ...notes] } : e);
 
     if (!("drop" in result)) {
-      if (sessionId !== undefined && now !== undefined) {
-        const promptState = promptStates.get(sessionId) ?? {};
-        promptState.humanAt = now;
-        if (timeNote !== undefined && result.context?.includes(timeNote)) promptState.noteAt = now;
-        promptStates.set(sessionId, promptState);
+      if (presence) {
+        const promptState = promptStates.get(presence.sessionId);
+        promptStates.set(presence.sessionId, {
+          humanAt: presence.now,
+          noteAt: timeSaid && result.context?.includes(timeSaid.text) ? presence.now : promptState?.noteAt,
+        });
       }
       // A dropped prompt or a downstream hook that strips the block did not deliver it.
       if (state !== undefined && current !== undefined && (!previous || transitionNote === undefined || result.context?.includes(transitionNote))) {

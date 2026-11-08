@@ -3,9 +3,11 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseFrontmatter, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Liquid } from "liquidjs";
+import { PERCEPTION_MESSAGE_TYPE } from "./perception.ts";
+import { TIME_ENTRY_TYPE } from "./time.ts";
 
+export { TIME_ENTRY_TYPE } from "./time.ts";
 export const ENTRY_TYPE = "pi-souls:selection";
-export const TIME_ENTRY_TYPE = "pi-souls:time";
 export interface SoulFile {
   body: string;
   icon?: string;
@@ -67,13 +69,13 @@ export function sessionSoul(branch: readonly SessionEntry[]): string | undefined
 export function lastTimeNoteTimestamp(branch: readonly SessionEntry[]): number | undefined {
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
-    if (entry.type !== "custom_message" || entry.customType !== TIME_ENTRY_TYPE) continue;
-    const details = entry.details;
-    if (typeof details === "object" && details !== null && typeof (details as { timestamp?: unknown }).timestamp === "number") {
-      return (details as { timestamp: number }).timestamp;
+    if (entry.type !== "custom_message" || (entry.customType !== PERCEPTION_MESSAGE_TYPE && entry.customType !== TIME_ENTRY_TYPE)) continue;
+    const timestamp = object(entry.details) ? entry.details.timestamp : undefined;
+    if (typeof timestamp === "number" && Number.isFinite(timestamp)) return timestamp;
+    if (entry.customType === TIME_ENTRY_TYPE) {
+      const parsed = Date.parse(entry.timestamp);
+      if (Number.isFinite(parsed)) return parsed;
     }
-    const parsed = Date.parse(entry.timestamp);
-    if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
 }

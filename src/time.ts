@@ -1,17 +1,19 @@
+import type { Perception } from "./perception.ts";
+
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
-const HOUR_MS = 3_600_000;
+export const HOUR_MS = 3_600_000;
+export const TIME_ENTRY_TYPE = "pi-souls:time";
 const DAY_MS = 24 * HOUR_MS;
 
 /** Watch-face style: big time first, then the small date window. No year, like a real watch. */
-function formatClock(now: number): string {
-  const date = new Date(now);
+export function formatClock(date: Date): string {
   const hours = String(date.getHours()).padStart(2, "0");
   const minutes = String(date.getMinutes()).padStart(2, "0");
   return `${hours}:${minutes} · ${DAYS[date.getDay()]}, ${MONTHS[date.getMonth()]} ${date.getDate()}`;
 }
 
-function formatElapsed(ms: number): string {
+export function formatElapsed(ms: number): string {
   if (ms >= DAY_MS) {
     const days = Math.floor(ms / DAY_MS);
     const hours = Math.floor((ms % DAY_MS) / HOUR_MS);
@@ -23,19 +25,15 @@ function formatElapsed(ms: number): string {
   return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
 }
 
-/**
- * Refresh the watch at most once an hour; the parenthetical appears only when the
- * human has actually been away for an hour or more. Undefined when neither is due.
- */
-export function formatTimeReminder(now: number, lastNoteAt?: number, lastHumanAt?: number, wrap = true): string | undefined {
-  if (!Number.isFinite(now)) return undefined;
-  const noteDue = lastNoteAt === undefined || !Number.isFinite(lastNoteAt) || now - lastNoteAt >= HOUR_MS;
-  if (!noteDue) return undefined;
-  const away = lastHumanAt !== undefined && Number.isFinite(lastHumanAt) && now - lastHumanAt >= HOUR_MS
-    ? formatElapsed(now - lastHumanAt)
-    : undefined;
-  const text = away === undefined
-    ? `⌚ ${formatClock(now)}`
-    : `⌚ ${formatClock(now)}\n(${away} since *human* was last present)`;
-  return wrap ? `<system-reminder>\n${text}\n</system-reminder>` : text;
+/** Refresh the watch on human moments, at most once an hour. */
+export function timePerception(lastNoteAt?: number): Perception {
+  return (moment, world) => {
+    if (moment.kind !== "human" || !Number.isFinite(world.now)) return undefined;
+    if (lastNoteAt !== undefined && Number.isFinite(lastNoteAt) && world.now - lastNoteAt < HOUR_MS) return undefined;
+    const clock = `⌚ ${formatClock(new Date(world.now))}`;
+    const away = world.absenceMs !== undefined && Number.isFinite(world.absenceMs) && world.absenceMs >= HOUR_MS
+      ? formatElapsed(world.absenceMs)
+      : undefined;
+    return { text: away ? `${clock}\n(${away} since *human* was last present)` : clock };
+  };
 }

@@ -7,6 +7,10 @@ import { createJiti } from "jiti";
 
 export const PERCEPTION_MESSAGE_TYPE = "pi-souls:perception";
 
+export function wrapReminder(text: string): string {
+  return `<system-reminder>\n${text}\n</system-reminder>`;
+}
+
 const perceptionRequire = createRequire(import.meta.url);
 const { importModule } = perceptionRequire("./perception-import.mjs") as { importModule: (url: string) => Promise<unknown> };
 // A fresh Jiti evaluation retains full TypeScript support without its parent-module cache.

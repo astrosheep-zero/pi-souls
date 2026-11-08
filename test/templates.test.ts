@@ -67,7 +67,7 @@ test("commands validate templates before persisting; requests and forced prompts
     let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
     extension({
       registerFlag: () => {}, getFlag: () => false,
-      getSettings: () => ({ soulsDir: dir }),
+      getSettings: () => ({ soulsDir: dir, timeaware: false }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerEntryRenderer: () => {},
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
@@ -88,7 +88,7 @@ test("commands validate templates before persisting; requests and forced prompts
     assert.match(notices.at(-1)!, /template:.*undefined variable/);
     await command.handler("@faye", ctx);
     assert.equal(sessionSoul(session.getBranch()), "faye");
-    assert.ok(handlers.get("before_agent_start")![0]({ messageType: "user", systemPromptOptions: options }, ctx));
+    assert.equal(handlers.get("before_agent_start")![0]({ messageType: "user", systemPromptOptions: options }, ctx), undefined);
     const expected = `Faye gpt-test in ${variables.cwd}`;
     assert.deepEqual(request()!.messages[0], { ...input[0], sections: { preamble: expected, rules: "Keep" } });
     assert.equal(options.forceSystemPrompt, `${expected}\nKeep these rules`);

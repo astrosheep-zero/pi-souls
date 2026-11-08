@@ -3,9 +3,72 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, createAgentSession, DefaultResourceLoader, ModelRuntime, SettingsManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createAssistantMessageEventStream, type AssistantMessage, type TranscriptContext } from "@earendil-works/pi-ai";
 import extension from "../src/index.ts";
-import { factsFor, loadPerception, storeDirFor, toolCategory, toolFilePath, toolText, worldFor } from "../src/perception.ts";
+import { factsFor, loadPerception, PERCEPTION_MESSAGE_TYPE, storeDirFor, toolCategory, toolFilePath, toolText, worldFor, wrapReminder } from "../src/perception.ts";
+
+function perceptionText(content: string): string {
+  assert.match(content, /^<system-reminder>\n[\s\S]*\n<\/system-reminder>$/);
+  return content.slice("<system-reminder>\n".length, -"\n</system-reminder>".length);
+}
+
+test("Pi SDK persists wrapped builtin and directory utterances and sends them as model context", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-perception-context-"));
+  let dispose: (() => void) | undefined;
+  try {
+    mkdirSync(join(dir, "faye"));
+    writeFileSync(join(dir, "faye/SOUL.md"), "Faye");
+    writeFileSync(join(dir, "faye/perception.ts"), "export const perception = (moment) => moment.kind === 'human' ? { text: 'directory note' } : undefined;");
+    const settings = SettingsManager.inMemory({ soulsDir: dir, defaultSoul: "faye" } as any);
+    const loader = new DefaultResourceLoader({
+      cwd: dir, agentDir: dir, settingsManager: settings,
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [extension],
+    });
+    await loader.reload();
+    const modelRuntime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
+    const model = modelRuntime.getModels("openai")[0]!;
+    await modelRuntime.setRuntimeApiKey(model.provider, "test-key-never-sent");
+    const sessionManager = SessionManager.inMemory(dir);
+    const { session } = await createAgentSession({ cwd: dir, agentDir: dir, settingsManager: settings, sessionManager, modelRuntime, model, resourceLoader: loader, noTools: "all" });
+    dispose = () => session.dispose();
+    const requests: TranscriptContext["messages"][] = [];
+    session.agent.streamFunction = (requestModel, context) => {
+      requests.push(structuredClone(context.messages));
+      const message: AssistantMessage = {
+        role: "assistant", content: [{ type: "text", text: "Done" }],
+        api: requestModel.api, provider: requestModel.provider, model: requestModel.id,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "stop", timestamp: Date.now(),
+      };
+      const stream = createAssistantMessageEventStream();
+      stream.push({ type: "done", reason: "stop", message });
+      stream.end();
+      return stream;
+    };
+    const errors: string[] = [];
+    await session.bindExtensions({ onError: (event) => errors.push(event.error) });
+    await session.extensionRunner.emit({ type: "session_start", reason: "startup" });
+    await session.prompt("hello");
+    const notes = sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === PERCEPTION_MESSAGE_TYPE);
+    assert.equal(notes.length, 2);
+    assert.ok(notes.every((entry) => entry.type === "custom_message" && entry.display === false));
+    const contents = notes.map((entry) => {
+      assert.equal(entry.type, "custom_message");
+      assert.equal(typeof entry.content, "string");
+      return entry.content as string;
+    });
+    assert.match(perceptionText(contents[0]!), /^⌚ /);
+    assert.equal(contents[1], wrapReminder("directory note"));
+    const sent = requests[0]!.map((message) => typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join(""));
+    for (const content of contents) assert.ok(sent.includes(content));
+    assert.deepEqual(errors, []);
+  } finally {
+    dispose?.();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 const model = { provider: "provider", id: "model" };
 
@@ -191,7 +254,7 @@ test("Pi wakes the soul through its perception and hands it accurate world facts
     assert.equal(h.sent[0]!.customType, "pi-souls:perception");
     assert.equal(h.sent[0]!.display, false);
     assert.deepEqual(h.sent[0]!.details, { moment: "wake" });
-    const said = JSON.parse(h.sent[0]!.content);
+    const said = JSON.parse(perceptionText(h.sent[0]!.content));
     assert.deepEqual(said.moment, { kind: "wake", source: "resume" });
     assert.equal(said.base.sessionId, h.session.getSessionId());
     assert.equal(said.base.cwd, h.dir);
@@ -210,10 +273,10 @@ test("Pi maps wake reasons: new is clear, reload is silent, compaction wakes", a
     assert.equal(h.sent.length, 0);
     for (const [reason, source] of [["startup", "startup"], ["new", "clear"], ["fork", "fork"]] as const) {
       await h.fire("session_start", { type: "session_start", reason });
-      assert.deepEqual(JSON.parse(h.sent.at(-1)!.content).moment, { kind: "wake", source });
+      assert.deepEqual(JSON.parse(perceptionText(h.sent.at(-1)!.content)).moment, { kind: "wake", source });
     }
     await h.fire("session_compact", { type: "session_compact" });
-    assert.deepEqual(JSON.parse(h.sent.at(-1)!.content).moment, { kind: "wake", source: "compact" });
+    assert.deepEqual(JSON.parse(perceptionText(h.sent.at(-1)!.content)).moment, { kind: "wake", source: "compact" });
   }, files);
 });
 
@@ -232,7 +295,7 @@ test("/soul reload revalidates the SOUL and its fragments, then reimports the pe
     await h.command.handler("@faye", h.ctx);
     const selected = h.session.getBranch().length;
     await h.fire("session_start", { type: "session_start", reason: "startup" });
-    assert.equal(h.sent.at(-1)!.content, "r1:startup");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("r1:startup"));
     assert.equal(h.footer(), "🦈");
 
     // Neither a broken SOUL nor a broken fragment may evict the working module.
@@ -241,13 +304,13 @@ test("/soul reload revalidates the SOUL and its fragments, then reimports the pe
     await h.command.handler("reload", h.ctx);
     assert.match(h.notices.at(-1)!, /Soul "faye" is empty/);
     await h.fire("session_compact", { type: "session_compact" });
-    assert.equal(h.sent.at(-1)!.content, "r1:compact");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("r1:compact"));
     h.write("faye/SOUL.md", "Soul {% render 'parts/shared' %}");
     h.write("parts/shared.md", "{{ missing }}");
     await h.command.handler("reload", h.ctx);
     assert.match(h.notices.at(-1)!, /Soul "faye" template/);
     await h.fire("session_compact", { type: "session_compact" });
-    assert.equal(h.sent.at(-1)!.content, "r1:compact");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("r1:compact"));
 
     h.write("parts/shared.md", "SHARED {{ model.id }}");
     h.write("faye/SOUL.md", "---\nicon: 🦊\n---\nSoul v2 {% render 'parts/shared' %}");
@@ -258,7 +321,7 @@ test("/soul reload revalidates the SOUL and its fragments, then reimports the pe
     assert.equal(h.sent.length, sentBeforeReload); // No perception or model turn from the command.
     assert.equal(h.session.getBranch().length, selected); // No divider or new selection.
     await h.fire("session_compact", { type: "session_compact" });
-    assert.equal(h.sent.at(-1)!.content, "r2:compact");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("r2:compact"));
   }, files, { defaultSoul: undefined });
 });
 
@@ -272,30 +335,30 @@ test("/soul reload refreshes CommonJS perceptions without evicting other souls",
   await withTime(1_700_000_000_000, async (h) => {
     await h.command.handler("@other", h.ctx);
     await h.fire("session_start", { type: "session_start", reason: "startup" });
-    assert.equal(h.sent.at(-1)!.content, "o1");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("o1"));
     await h.command.handler("@faye", h.ctx);
     await h.fire("session_compact", { type: "session_compact" });
-    assert.equal(h.sent.at(-1)!.content, "f1");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("f1"));
 
     h.write("faye/perception.js", code("f2"));
     h.write("other/perception.js", code("o2"));
     await h.command.handler("reload", h.ctx);
     await h.fire("session_compact", { type: "session_compact" });
-    assert.equal(h.sent.at(-1)!.content, "f2");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("f2"));
 
     // A missing entry still invalidates the soul's old cached perception.
     rmSync(join(h.dir, "faye/perception.js"));
     await h.command.handler("reload", h.ctx);
     h.write("faye/perception.js", code("f3"));
     await h.fire("session_compact", { type: "session_compact" });
-    assert.equal(h.sent.at(-1)!.content, "f3");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("f3"));
 
     await h.command.handler("@other", h.ctx);
     await h.fire("session_compact", { type: "session_compact" });
-    assert.equal(h.sent.at(-1)!.content, "o1");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("o1"));
     await h.command.handler("reload", h.ctx);
     await h.fire("session_compact", { type: "session_compact" });
-    assert.equal(h.sent.at(-1)!.content, "o2");
+    assert.equal(h.sent.at(-1)!.content, wrapReminder("o2"));
   }, files);
 });
 
@@ -307,7 +370,7 @@ test("Pi speaks on the human's prompt without blocking the request", async () =>
     await h.settle(() => h.sent.length > 0);
     assert.equal(h.notices.length, 0);
     assert.equal(h.sent[0]!.display, false);
-    const said = JSON.parse(h.sent[0]!.content);
+    const said = JSON.parse(perceptionText(h.sent[0]!.content));
     assert.deepEqual(said.moment, { kind: "human", text: "hello there" });
   }, { "faye/SOUL.md": "Directory faye", "faye/perception.ts": wakePerception });
 });
@@ -317,13 +380,13 @@ test("Pi answers tool calls before and after, carrying category, path and result
     await h.fire("tool_call", { type: "tool_call", toolCallId: "c1", toolName: "read", input: { path: "/work/a.md" } });
     assert.equal(h.sent.at(-1)!.display, false);
     assert.equal(h.notices.length, 0);
-    const before = JSON.parse(h.sent.at(-1)!.content).moment;
+    const before = JSON.parse(perceptionText(h.sent.at(-1)!.content)).moment;
     assert.deepEqual(before, {
       kind: "tool", phase: "before", category: "reading", toolName: "read",
       filePath: "/work/a.md", input: '{"path":"/work/a.md"}',
     });
     await h.fire("tool_execution_end", { type: "tool_execution_end", toolCallId: "c1", toolName: "read", result: "contents", isError: false });
-    const after = JSON.parse(h.sent.at(-1)!.content).moment;
+    const after = JSON.parse(perceptionText(h.sent.at(-1)!.content)).moment;
     assert.deepEqual(after, {
       kind: "tool", phase: "after", category: "reading", toolName: "read",
       filePath: "/work/a.md", input: '{"path":"/work/a.md"}', output: "contents", ok: true,
@@ -331,12 +394,43 @@ test("Pi answers tool calls before and after, carrying category, path and result
 
     await h.fire("tool_call", { type: "tool_call", toolCallId: "c2", toolName: "bash", input: { command: "false" } });
     await h.fire("tool_execution_end", { type: "tool_execution_end", toolCallId: "c2", toolName: "bash", result: "exit 1", isError: true });
-    const failed = JSON.parse(h.sent.at(-1)!.content).moment;
+    const failed = JSON.parse(perceptionText(h.sent.at(-1)!.content)).moment;
     assert.equal(failed.category, "running");
     assert.equal(failed.ok, false);
     assert.equal(failed.filePath, undefined);
     assert.equal(failed.output, "exit 1");
   }, { "faye/SOUL.md": "Directory faye", "faye/perception.ts": wakePerception });
+});
+
+test("Pi builtin and directory perceptions share a human moment and fail independently", async () => {
+  const now = new Date(2026, 9, 27, 2, 14, 0).getTime();
+  await withTime(now, async (h) => {
+    await h.fire("before_agent_start", { prompt: "hi", systemPromptOptions: { cwd: h.dir } });
+    await h.settle(() => h.sent.length === 2);
+    assert.equal(h.sent[0]!.content, wrapReminder("⌚ 02:14 · Tue, Oct 27"));
+    assert.deepEqual(h.sent[0]!.details, { moment: "human", timestamp: now });
+    assert.deepEqual(h.sent[1]!.details, { moment: "human" });
+    const said = JSON.parse(perceptionText(h.sent[1]!.content));
+    assert.deepEqual(said.moment, { kind: "human", text: "hi" });
+    assert.equal(said.base.now, now);
+    assert.ok(h.sent.every((message) => message.display === false));
+
+    // A failed soul render suppresses the clock, while its independent module can still answer.
+    h.write("faye/SOUL.md", "{{ missing }}");
+    h.sent.length = 0;
+    await h.fire("before_agent_start", { prompt: "again", systemPromptOptions: { cwd: h.dir } });
+    await h.settle(() => h.sent.length === 1);
+    assert.deepEqual(h.sent[0]!.details, { moment: "human" });
+  }, { "faye/SOUL.md": "Faye", "faye/perception.ts": wakePerception }, { timeaware: true });
+
+  await withTime(now, async (h) => {
+    await h.fire("before_agent_start", { prompt: "hi", systemPromptOptions: { cwd: h.dir } });
+    await h.settle(() => h.sent.length > 0);
+    assert.equal(h.sent[0]!.content, wrapReminder("⌚ 02:14 · Tue, Oct 27"));
+    // Await the same broken module through an event handler to finish the pending human perception.
+    await h.fire("session_compact");
+    assert.equal(h.sent.length, 1);
+  }, { "faye/SOUL.md": "Faye", "faye/perception.ts": "export const perception = () => { throw new Error('boom'); };" }, { timeaware: true });
 });
 
 test("Pi stays quiet with no perception, soulless, a suppressed soul, or a broken module", async () => {
