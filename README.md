@@ -11,11 +11,14 @@ pi install npm:@astrosheep/pi-souls
 ```text
 /soul          # current soul and list
 /soul @faye    # use faye for this session
-/soul clear    # follow defaults again
+/soul clear    # disable souls for this session
+/soul reset    # follow defaults again
 /soul reload   # re-read the active SOUL and its perception
 ```
 
-Tab-complete offers `@name`, `clear`, and `reload`. Soul names `clear` and `reload` are selected as `@clear` and `@reload`.
+Tab-complete offers `@name`, `clear`, `reset`, and `reload`. Soul names matching commands are selected with `@`, such as `@clear` or `@reset`.
+
+`/soul clear` keeps souls off for this session, including model changes, resume, and fork. `/soul reset` removes that override and any manual soul selection, restoring model and global defaults. `/soul @<name>` selects a soul again after clearing.
 
 `/soul reload` validates the active body and Liquid fragments, refreshes the footer, and reloads its perception on the next moment. It changes no selection and starts no model request; the next request uses the current soul body.
 
@@ -24,7 +27,7 @@ pi --soulless
 SOULLESS=1 pi
 ```
 
-Skip settings souls for this process. `SOULLESS=1` or `true` enables it; `0`, `false`, or unset does not. A session `/soul @<name>` still wins, including resumed selections; `/soul clear` returns to soulless.
+Skip settings souls for this process. `SOULLESS=1` or `true` enables it; `0`, `false`, or unset does not. A session `/soul @<name>` still wins, including resumed selections. `/soul clear` disables souls for the session; `/soul reset` follows defaults, which remain off while this flag is set.
 
 ## Souls
 
@@ -52,7 +55,7 @@ Faye's identity body
 
 ## Presence
 
-The footer shows the effective soul, and is removed when no soul applies. Before the first request after startup, Pi does not expose the explicit system prompt to extensions, so a session `/soul` choice is shown but a settings or model soul waits until the first request confirms it applies. `/soul @<name>` and `/soul clear` leave a compact durable divider in the transcript only when the effective identity actually changes: `── soul: faye ──`, or `── soulless ──` when nothing applies. `/soul clear` follows defaults, so it may land on another soul rather than soulless. Dividers keep the identity they recorded when replayed, and never enter model context. No divider appears for no-ops, failures, `/soul reload`, or a bare `/soul` status check.
+The footer shows the effective soul, and is removed when no soul applies. Before the first request after startup, Pi does not expose the explicit system prompt to extensions, so a session `/soul` choice is shown but a settings or model soul waits until the first request confirms it applies. `/soul @<name>`, `/soul clear`, and `/soul reset` leave a compact durable divider in the transcript only when the effective identity actually changes: `── soul: faye ──`, or `── soulless ──` when nothing applies. Dividers keep the identity they recorded when replayed, and never enter model context. No divider appears for no-ops, failures, `/soul reload`, or a bare `/soul` status check.
 
 ### Templates (Pi)
 
@@ -92,7 +95,7 @@ Moments: `wake` (`source`: `startup`, `resume`, `fork`, `clear`, `compact`), `hu
 
 `world` is `{ now, sessionId, cwd, absenceMs?, storeDir, facts }`. `facts` carries `hour`, `morning`, `afternoon`, `evening`, `night`, `weekday` (0 is Sunday) and `weekend`. `absenceMs` is the time since the human's previous message when that is known; `storeDir` defaults to `~/.local/share/pi-souls/<name>`.
 
-`timeaware` (⌚️) is a builtin perception on `"human"` moments, for file and directory souls alike. Utterances are delivered as hidden model context; Pi wraps each one in `<system-reminder>...</system-reminder>`. A module that fails to import, throws, or returns no text is ignored: a perception never interrupts the host. Pi loads it once; `/soul reload` drops the cached module so the next moment imports the file again.
+`timeaware` (⌚️) is a builtin perception on `"human"` moments, for file and directory souls alike. Pi wraps each utterance in `<system-reminder>...</system-reminder>` and displays it in the transcript; Claude delivers it as model context. A module that fails to import, throws, or returns no text is ignored: a perception never interrupts the host. Pi loads it once; `/soul reload` drops the cached module so the next moment imports the file again.
 
 Pi imports the entry module in-process; dependencies follow their loader's normal caching. The Claude Code mod runs it in a `node` child process (`--experimental-strip-types`), because its sandbox has no `import()` and no Node. `node` must be on the mod's `PATH`, and its TypeScript perceptions must use syntax Node can erase.
 
@@ -101,26 +104,28 @@ Pi imports the entry module in-process; dependencies follow their loader's norma
 ```json
 {
   "defaultSoul": "faye",
-  "modelSouls": { "anthropic/claude-sonnet-5": "reviewer" },
+  "modelSouls": { "*/claude-*": "reviewer" },
   "soulsDir": "~/.agents/souls",
   "timeaware": true
 }
 ```
 
-Precedence: `/soul @<name>` > `--soulless` / `SOULLESS` / explicit system prompt > `modelSouls` (exact `provider/modelId`) > `defaultSoul` > Pi default.
+Precedence: session choice (`/soul @<name>` or `/soul clear`) > `--soulless` / `SOULLESS` / explicit system prompt > exact `modelSouls` entry > first matching `modelSouls` wildcard > `defaultSoul` > Pi default. `/soul reset` removes the session choice. Keys are `provider/modelId` patterns: `*` matches any text, including `/`; all other characters are literal. For example, `*/gemini-*` applies across providers, and `kimi-coding/*` applies to that provider. Exact entries always win; overlapping wildcard entries use JSON order.
 
-The session choice follows resume, fork, and tree navigation. `--system-prompt` and `SYSTEM.md` outrank a settings soul but not `/soul`. A bad entry only breaks the case that uses it. When another extension forces the whole prompt, souls warns but still replaces the latest preamble if its exact text remains in the forced prompt, preserving surrounding instructions. When a soul can't apply (a bad entry, a missing file, or no matching preamble), Pi's prompt is used and a warning shows once, not on every request. Time awareness is on by default (`timeaware: false` disables it). When a soul is active, user messages refresh a hidden watch-style `<system-reminder>` on the first prompt and whenever at least 1 hour has passed since the previous time reminder. A gap of at least 1 hour since the previous user message adds the parenthetical; continuous conversation just refreshes the watch. This is checked when a user message arrives, not by a background timer.
+The session choice follows resume, fork, and tree navigation. `--system-prompt` and `SYSTEM.md` outrank a settings soul but not `/soul`. A bad entry only breaks the case that uses it. When another extension forces the whole prompt, souls warns but still replaces the latest preamble if its exact text remains in the forced prompt, preserving surrounding instructions. When a soul can't apply (a bad entry, a missing file, or no matching preamble), Pi's prompt is used and a warning shows once, not on every request. Time awareness is on by default (`timeaware: false` disables it). When a soul is active, user messages refresh a visible watch-style `<system-reminder>` on the first prompt and whenever at least 1 hour has passed since the previous time reminder. A gap of at least 1 hour since the previous user message adds the parenthetical; continuous conversation just refreshes the watch. This is checked when a user message arrives, not by a background timer.
 
 ## Transition reminders
 
-When the model or effective soul changes between prompts, the next user prompt carries one hidden system reminder:
+Native model changes and successfully applied soul changes append hidden system reminders to the transcript:
 
 ```text
 new brain: gpt-5.4
 new soul: faye
 ```
 
-Only changed lines appear, brain first. The reminder is separate from clock/time messages and never written to the transcript, and the first prompt only records a baseline. With Pi the baseline lives on the active session branch; the reminder follows the final live prompt options, so resume, fork, tree navigation, and reload do not repeat it, and extension-triggered turns and commands do not consume it.
+Only changed lines appear, brain first, each as its own persisted message. Reminders are separate from clock/time messages. A notice is written once, when it is observed: one that arrives during a run settles after that run's tool results, so later requests carry it unchanged in the same place. Earlier messages are never edited, reordered, or retroactively given a line they did not have; the initial model selection establishes a silent baseline.
+
+Soul changes require evidence from a successful projection using the final live prompt options of a user run. A missing or failed soul is never announced, and a later success is announced at that later point rather than backdated to the earlier attempt. Switching souls still replaces the system preamble for the next request, so that switch remains a cache miss on its own; the notices around it are not.
 
 ## Claude Code mod
 

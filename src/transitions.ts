@@ -49,15 +49,3 @@ export function sameTransition(left: Transition, right: Transition): boolean {
   return left.soul === right.soul && sameModel(left.model, right.model);
 }
 
-/** Brain first, soul second; a change to none is a silent baseline update, not prose. */
-export function transitionLines(previous: Transition, current: Transition): string[] {
-  const lines: string[] = [];
-  if (!sameModel(previous.model, current.model) && current.model) lines.push(`new brain: ${current.model.id}`);
-  if (previous.soul !== current.soul && current.soul !== null) lines.push(`new soul: ${current.soul}`);
-  return lines;
-}
-
-export function formatTransitionReminder(lines: readonly string[], wrap = true): string {
-  const text = lines.join("\n");
-  return wrap ? `<system-reminder>\n${text}\n</system-reminder>` : text;
-}

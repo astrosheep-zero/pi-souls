@@ -4,9 +4,7 @@ import { join, resolve } from "node:path";
 import { parseFrontmatter, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Liquid } from "liquidjs";
 import { PERCEPTION_MESSAGE_TYPE } from "./perception.ts";
-import { TIME_ENTRY_TYPE } from "./time.ts";
 
-export { TIME_ENTRY_TYPE } from "./time.ts";
 export const ENTRY_TYPE = "pi-souls:selection";
 export interface SoulFile {
   body: string;
@@ -52,15 +50,21 @@ export function unmatchableModelKeys(config: SoulConfig): string[] {
   return Object.keys(config.modelSouls).filter((key) => !/^[^/]+\/.+$/.test(key));
 }
 
+/** A name selects a soul, null explicitly disables souls, undefined follows defaults. */
+export type SoulOverride = string | null | undefined;
+
 /** Read the active branch, never the whole session file or a second in-memory authority. */
-export function sessionSoul(branch: readonly SessionEntry[]): string | undefined {
+export function sessionSoul(branch: readonly SessionEntry[]): SoulOverride {
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
     if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
-    if (!object(entry.data) || entry.data.version !== 1 || !(entry.data.name === null || isSoulName(entry.data.name))) {
+    if (!object(entry.data) || entry.data.version !== 1 || !(entry.data.name === null || isSoulName(entry.data.name))
+      || (entry.data.disabled !== undefined && typeof entry.data.disabled !== "boolean")
+      || (entry.data.disabled === true && entry.data.name !== null)) {
       throw new Error("Corrupted soul entry. Run /soul clear");
     }
-    return entry.data.name ?? undefined;
+    // Existing name:null entries mean defaults; an explicit flag records session opt-out.
+    return entry.data.disabled === true ? null : entry.data.name ?? undefined;
   }
   return undefined;
 }
@@ -69,13 +73,9 @@ export function sessionSoul(branch: readonly SessionEntry[]): string | undefined
 export function lastTimeNoteTimestamp(branch: readonly SessionEntry[]): number | undefined {
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
-    if (entry.type !== "custom_message" || (entry.customType !== PERCEPTION_MESSAGE_TYPE && entry.customType !== TIME_ENTRY_TYPE)) continue;
+    if (entry.type !== "custom_message" || entry.customType !== PERCEPTION_MESSAGE_TYPE) continue;
     const timestamp = object(entry.details) ? entry.details.timestamp : undefined;
     if (typeof timestamp === "number" && Number.isFinite(timestamp)) return timestamp;
-    if (entry.customType === TIME_ENTRY_TYPE) {
-      const parsed = Date.parse(entry.timestamp);
-      if (Number.isFinite(parsed)) return parsed;
-    }
   }
   return undefined;
 }
@@ -97,11 +97,19 @@ function named(name: unknown, source: Selection["source"], setting: string): Sel
   return { name, source };
 }
 
-export function resolveSoul(config: SoulConfig, override: string | undefined, model?: { provider: string; id: string }, soulless = false): Selection | undefined {
+export function resolveSoul(config: SoulConfig, override: SoulOverride, model?: { provider: string; id: string }, soulless = false): Selection | undefined {
+  if (override === null) return undefined;
   if (override) return { name: override, source: "session" };
   if (soulless) return undefined;
   const key = model && `${model.provider}/${model.id}`;
   if (key && Object.hasOwn(config.modelSouls, key)) return named(config.modelSouls[key], "model", `modelSouls["${key}"]`);
+  if (key) {
+    for (const [pattern, name] of Object.entries(config.modelSouls)) {
+      if (!pattern.includes("*") || !/^[^/]+\/.+$/.test(pattern)) continue;
+      const escaped = pattern.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+      if (new RegExp(`^${escaped}$`).test(key)) return named(name, "model", `modelSouls["${pattern}"]`);
+    }
+  }
   if (config.defaultSoul !== undefined) return named(config.defaultSoul, "default", "defaultSoul");
   return undefined;
 }

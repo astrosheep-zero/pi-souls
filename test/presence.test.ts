@@ -35,6 +35,9 @@ function setup(files: Record<string, string>, settings: Record<string, unknown> 
     getFlag: () => flag,
     getSettings: () => config,
     appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
+    sendMessage: (message: { customType: string; content: string; display: boolean; details?: unknown }) => {
+      session.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+    },
     registerCommand: (_name: string, registered: typeof command) => { command = registered; },
     registerEntryRenderer: (type: string, renderer: unknown) => { renderers.set(type, renderer as Renderer); },
     on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
@@ -123,12 +126,12 @@ test("footer shows a nonempty icon alone and falls back to the soul name", () =>
   } finally { h.done(); }
 });
 
-test("footer follows model/default/session/customPrompt precedence and survives branch navigation", async () => {
+test("footer follows wildcard model/default/session/customPrompt precedence and survives branch navigation", async () => {
   const h = setup({
     "global.md": "---\nicon: 🌍\n---\nGlobal",
     "specific.md": "Specific",
     "faye.md": "---\nicon: 🦈\n---\nFaye",
-  }, { defaultSoul: "global", modelSouls: { "provider/first": "specific" } });
+  }, { defaultSoul: "global", modelSouls: { "*/first": "specific" } });
   const root = h.session.appendCustomEntry("unrelated", {});
   try {
     h.useModel(second);
@@ -217,15 +220,15 @@ test("divider lines fit the requested terminal width", () => {
   } finally { h.done(); }
 });
 
-test("clear to a missing default reports soulless, not a false soul", async () => {
+test("reset to a missing default reports soulless, not a false soul", async () => {
   const h = setup({ "faye.md": "Faye" }, { defaultSoul: "missing" });
   try {
     await h.command.handler("@faye", h.ctx);
-    await h.command.handler("clear", h.ctx);
+    await h.command.handler("reset", h.ctx);
     assert.deepEqual(h.dividers(), [{ version: 1, name: "faye" }, { version: 1, name: null }]);
     assert.equal(h.renderDivider(h.dividers().at(-1)), "── soulless ──");
     assert.equal(h.status(), undefined);
-    assert.match(h.notices.at(-1)!, /^info: Cleared\. Soul: missing \(default\)/);
+    assert.match(h.notices.at(-1)!, /^info: Reset\. Soul: missing \(default\)/);
   } finally { h.done(); }
 });
 
@@ -246,18 +249,18 @@ test("dividers mark real identity changes only", async () => {
     assert.equal(h.dividers().length, 1);
     assert.match(h.notices.at(-1)!, /^error: No soul "missing"/);
 
-    await h.command.handler("clear", h.ctx);
+    await h.command.handler("reset", h.ctx);
     assert.deepEqual(h.dividers().at(-1), { version: 1, name: "reviewer" });
     assert.equal(h.renderDivider(h.dividers().at(-1)), "── soul: reviewer ──");
     assert.equal(h.status(), "reviewer");
 
     const afterClear = h.session.getBranch().length;
-    await h.command.handler("clear", h.ctx);
+    await h.command.handler("reset", h.ctx);
     assert.equal(h.session.getBranch().length, afterClear);
   } finally { h.done(); }
 });
 
-test("clear to no soul is soulless, while clear back to the same default adds no divider", async () => {
+test("clear to no soul is soulless, while reset back to the same default adds no divider", async () => {
   const none = setup({ "faye.md": "Faye" });
   try {
     await none.command.handler("@faye", none.ctx);
@@ -270,9 +273,60 @@ test("clear to no soul is soulless, while clear back to the same default adds no
   const same = setup({ "faye.md": "Faye" }, { defaultSoul: "faye" });
   try {
     await same.command.handler("@faye", same.ctx);
-    await same.command.handler("clear", same.ctx);
+    await same.command.handler("reset", same.ctx);
     assert.deepEqual(same.dividers(), []);
   } finally { same.done(); }
+});
+
+test("clear disables model/global defaults through lifecycle and model changes until reset or selection", async () => {
+  const h = setup({ "faye.md": "Faye", "reviewer.md": "Reviewer" }, {
+    defaultSoul: "reviewer", modelSouls: { "*/first": "faye" },
+  });
+  try {
+    const requestUnchanged = () => {
+      const messages = [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }];
+      assert.deepEqual(h.request(messages), { messages });
+    };
+    h.beforeAgent();
+    assert.equal(h.status(), "faye");
+    await h.command.handler("clear", h.ctx); // No manual selection is required.
+    assert.equal(h.status(), undefined);
+    assert.equal(h.renderDivider(h.dividers().at(-1)), "── soulless ──");
+    assert.match(h.notices.at(-1)!, /^info: Cleared\. Soul: none \(soulless\)/);
+    const afterClear = h.session.getBranch().length;
+    await h.command.handler("clear", h.ctx);
+    assert.equal(h.session.getBranch().length, afterClear);
+    await h.command.handler("", h.ctx);
+    assert.match(h.notices.at(-1)!, /^info: Soul: none \(soulless\)/);
+    await h.command.handler("reload", h.ctx);
+    assert.match(h.notices.at(-1)!, /^info: No soul to reload/);
+
+    for (const reason of ["resume", "fork", "reload"]) {
+      h.fire("session_start", { reason });
+      h.beforeAgent();
+      requestUnchanged();
+      assert.equal(h.status(), undefined);
+    }
+    h.useModel(second);
+    h.fire("model_select", { model: second });
+    h.beforeAgent();
+    requestUnchanged();
+    assert.equal(h.status(), undefined);
+
+    await h.command.handler("reset", h.ctx);
+    assert.equal(h.status(), "reviewer");
+    assert.equal(h.renderDivider(h.dividers().at(-1)), "── soul: reviewer ──");
+    const afterReset = h.session.getBranch().length;
+    await h.command.handler("reset", h.ctx);
+    assert.equal(h.session.getBranch().length, afterReset);
+
+    await h.command.handler("clear", h.ctx);
+    await h.command.handler("@faye", h.ctx);
+    assert.equal(h.status(), "faye");
+    assert.ok(h.request());
+    await h.command.handler("reset", h.ctx);
+    assert.equal(h.status(), "reviewer");
+  } finally { h.done(); }
 });
 
 test("clear under a custom prompt is soulless because settings souls stay off", async () => {

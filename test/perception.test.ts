@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { SessionManager, createAgentSession, DefaultResourceLoader, ModelRuntime, SettingsManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage, type TranscriptContext } from "@earendil-works/pi-ai";
 import extension from "../src/index.ts";
-import { factsFor, loadPerception, PERCEPTION_MESSAGE_TYPE, storeDirFor, toolCategory, toolFilePath, toolText, worldFor, wrapReminder } from "../src/perception.ts";
+import { factsFor, loadPerception, PERCEPTION_MESSAGE_TYPE, storeDirFor, toolCategory, toolFilePath, toolText, unwrapReminder, worldFor, wrapReminder } from "../src/perception.ts";
 
 function perceptionText(content: string): string {
   assert.match(content, /^<system-reminder>\n[\s\S]*\n<\/system-reminder>$/);
@@ -53,7 +53,7 @@ test("Pi SDK persists wrapped builtin and directory utterances and sends them as
     await session.prompt("hello");
     const notes = sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === PERCEPTION_MESSAGE_TYPE);
     assert.equal(notes.length, 2);
-    assert.ok(notes.every((entry) => entry.type === "custom_message" && entry.display === false));
+    assert.ok(notes.every((entry) => entry.type === "custom_message" && entry.display === true));
     const contents = notes.map((entry) => {
       assert.equal(entry.type, "custom_message");
       assert.equal(typeof entry.content, "string");
@@ -82,6 +82,7 @@ function setup(files: Record<string, string> = {}, settings: Record<string, unkn
   }
   const session = SessionManager.inMemory();
   const sent: { customType: string; content: string; display: boolean; details: unknown }[] = [];
+  const messageRenderers = new Map<string, any>();
   const notices: string[] = [];
   const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
   const previous = process.env.SOULLESS;
@@ -96,6 +97,7 @@ function setup(files: Record<string, string> = {}, settings: Record<string, unkn
     appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
     registerCommand: (_name: string, registered: typeof command) => { command = registered; },
     registerEntryRenderer: () => {},
+    registerMessageRenderer: (type: string, renderer: unknown) => { messageRenderers.set(type, renderer); },
     sendMessage: (message: { customType: string; content: string; display: boolean; details: unknown }) => { sent.push(message); },
     on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
   } as unknown as ExtensionAPI;
@@ -115,7 +117,7 @@ function setup(files: Record<string, string> = {}, settings: Record<string, unkn
     for (let i = 0; i < 400 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
   };
   return {
-    dir, dirs: dir, session, sent, notices, ctx, fire, settle, command,
+    dir, dirs: dir, session, sent, messageRenderers, notices, ctx, fire, settle, command,
     footer: () => footer,
     write: (path: string, text: string) => {
       const target = join(dir, path);
@@ -252,7 +254,7 @@ test("Pi wakes the soul through its perception and hands it accurate world facts
     await h.fire("session_start", { type: "session_start", reason: "resume" });
     assert.equal(h.sent.length, 1);
     assert.equal(h.sent[0]!.customType, "pi-souls:perception");
-    assert.equal(h.sent[0]!.display, false);
+    assert.equal(h.sent[0]!.display, true);
     assert.deepEqual(h.sent[0]!.details, { moment: "wake" });
     const said = JSON.parse(perceptionText(h.sent[0]!.content));
     assert.deepEqual(said.moment, { kind: "wake", source: "resume" });
@@ -369,7 +371,7 @@ test("Pi speaks on the human's prompt without blocking the request", async () =>
     assert.equal(result, undefined); // the handler never waits on a perception module
     await h.settle(() => h.sent.length > 0);
     assert.equal(h.notices.length, 0);
-    assert.equal(h.sent[0]!.display, false);
+    assert.equal(h.sent[0]!.display, true);
     const said = JSON.parse(perceptionText(h.sent[0]!.content));
     assert.deepEqual(said.moment, { kind: "human", text: "hello there" });
   }, { "faye/SOUL.md": "Directory faye", "faye/perception.ts": wakePerception });
@@ -378,7 +380,7 @@ test("Pi speaks on the human's prompt without blocking the request", async () =>
 test("Pi answers tool calls before and after, carrying category, path and result", async () => {
   await withTime(1_700_000_000_000, async (h) => {
     await h.fire("tool_call", { type: "tool_call", toolCallId: "c1", toolName: "read", input: { path: "/work/a.md" } });
-    assert.equal(h.sent.at(-1)!.display, false);
+    assert.equal(h.sent.at(-1)!.display, true);
     assert.equal(h.notices.length, 0);
     const before = JSON.parse(perceptionText(h.sent.at(-1)!.content)).moment;
     assert.deepEqual(before, {
@@ -413,7 +415,38 @@ test("Pi builtin and directory perceptions share a human moment and fail indepen
     const said = JSON.parse(perceptionText(h.sent[1]!.content));
     assert.deepEqual(said.moment, { kind: "human", text: "hi" });
     assert.equal(said.base.now, now);
-    assert.ok(h.sent.every((message) => message.display === false));
+    assert.ok(h.sent.every((message) => message.display === true));
+    const renderer = h.messageRenderers.get(PERCEPTION_MESSAGE_TYPE)!;
+    const rendered = renderer(
+      { customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder("⌚ 02:14 · Tue, Oct 27\n(1h since *human* was last present)") },
+      { expanded: false, outputPad: 1 },
+      { fg: (tone: string, text: string) => `[${tone}:${text}]` },
+    );
+    assert.deepEqual(rendered.render(80).map((line: string) => line.trimEnd()), [
+      " [borderMuted:│ ][dim:⌚ 02:14 · Tue, Oct 27]",
+      " [borderMuted:│ ][dim:(1h since ][dim:human][dim: was last present)]",
+    ]);
+    const multiLine = wrapReminder("[some other faye]\n\n*pokes screen* `` [too slow] ``\n\"hey copy\"\nline 4");
+    const folded = renderer(
+      { customType: PERCEPTION_MESSAGE_TYPE, content: multiLine },
+      { expanded: false, outputPad: 1 },
+      { fg: (tone: string, text: string) => `[${tone}:${text}]` },
+    );
+    assert.deepEqual(folded.render(120).map((line: string) => line.trimEnd()), [
+      " [borderMuted:│ ][muted:[some other faye]][dim: ][dim:pokes screen][dim: ][muted:[too slow]]",
+      " [borderMuted:│ ][dim:\"hey copy\"][muted:…]",
+    ]);
+    const unfolded = renderer(
+      { customType: PERCEPTION_MESSAGE_TYPE, content: multiLine },
+      { expanded: true, outputPad: 1 },
+      { fg: (tone: string, text: string) => `[${tone}:${text}]` },
+    );
+    assert.deepEqual(unfolded.render(120).map((line: string) => line.trimEnd()), [
+      " [borderMuted:│ ][muted:[some other faye]][dim: ][dim:pokes screen][dim: ][muted:[too slow]]",
+      " [borderMuted:│ ][dim:\"hey copy\"]",
+      " [borderMuted:│ ][dim:line 4]",
+    ]);
+    assert.equal(unwrapReminder(wrapReminder("hello")), "hello");
 
     // A failed soul render suppresses the clock, while its independent module can still answer.
     h.write("faye/SOUL.md", "{{ missing }}");

@@ -6,9 +6,9 @@ import { applySoul, replaceForcedPreamble } from "./prompt.ts";
 import { footerText, resolvePresence, resolvePerception, selectionPresence, type Presence } from "./presence.ts";
 import { ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
 import { timePerception } from "./time.ts";
-import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, formatTransitionReminder, readTransition, sameTransition, transitionLines, type Transition } from "./transitions.ts";
+import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, readTransition, sameTransition, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
-import { loadPerception, toolCategory, toolFilePath, toolText, PERCEPTION_MESSAGE_TYPE, worldFor, wrapReminder, type Moment, type Perception } from "./perception.ts";
+import { loadPerception, sendReminder, toolCategory, toolFilePath, toolText, worldFor, type Moment, type Perception } from "./perception.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
@@ -40,9 +40,6 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // Hold live options: handlers after ours can still set customPrompt or forceSystemPrompt.
   let options: BuildSystemPromptOptions | undefined;
   let running = false;
-  let userRun = false;
-  let transitionComputed = false;
-  let pendingReminder: string | undefined;
   // What the projection handler learned for this request, read by the transition handler.
   let projection: { known: boolean; soul: string | null } | undefined;
   let forceReported = false;
@@ -80,7 +77,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
           readSoul(config.dir, selection.name, soulVariables(ctx));
           const said = await timePerception(lastTimeNoteTimestamp(branch))(moment, world);
           if (said && typeof said.text === "string" && said.text.trim()) {
-            pi.sendMessage({ customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(said.text), display: false, details: { moment: moment.kind, timestamp: now } });
+            sendReminder(pi, { text: said.text, details: { moment: moment.kind, timestamp: now } });
           }
         } catch {
           // A missing or unreadable soul has no builtin time perception.
@@ -91,7 +88,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         try {
           const said = await perceptionFor(target.path)(moment, world);
           if (said && typeof said.text === "string" && said.text.trim()) {
-            pi.sendMessage({ customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(said.text), display: false, details: { moment: moment.kind } });
+            sendReminder(pi, { text: said.text, details: { moment: moment.kind } });
           }
         } catch {
           // A directory perception is independent of the builtin time perception.
@@ -134,7 +131,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   };
   pi.on("session_start", (event, ctx) => {
     cwd = ctx.cwd; reported = undefined; forceReported = false;
-    options = undefined; running = false; userRun = false; transitionComputed = false; pendingReminder = undefined;
+    options = undefined; running = false;
     projection = undefined; forcedProjection = undefined;
     promptKnown = false; seenPrompt = undefined;
     toolCalls.clear();
@@ -143,20 +140,26 @@ export default function soulsExtension(pi: ExtensionAPI) {
     if (source) return perceive({ kind: "wake", source }, ctx, undefined);
   });
   pi.on("session_compact", (_event, ctx) => perceive({ kind: "wake", source: "compact" }, ctx, options?.customPrompt));
-  pi.on("model_select", (event, ctx) => refreshFooter(ctx, promptValue(), event.model));
+  pi.on("model_select", (event, ctx) => {
+    refreshFooter(ctx, promptValue(), event.model);
+    if (!event.previousModel || (event.previousModel.provider === event.model.provider && event.previousModel.id === event.model.id)) return;
+    sendReminder(pi, {
+      customType: TRANSITION_MESSAGE_TYPE, display: false, defer: true,
+      text: `new brain: ${event.model.id}`,
+      details: { version: 1, model: { provider: event.model.provider, id: event.model.id } },
+    });
+  });
   pi.on("session_tree", (_event, ctx) => refreshFooter(ctx, promptValue()));
   pi.on("before_agent_start", (event, ctx) => {
     options = event.systemPromptOptions; running = true; forcedProjection = undefined;
-    userRun = !("messageType" in event) || event.messageType === "user";
-    transitionComputed = false; pendingReminder = undefined;
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
-    if (!userRun) return;
+    if ("messageType" in event && event.messageType !== "user") return;
     // The handler stays synchronous: a pending perception answer arrives when it arrives.
     void perceive({ kind: "human", text: event.prompt }, ctx, options.customPrompt);
   });
   pi.on("agent_settled", () => {
-    running = false; userRun = false; transitionComputed = false; pendingReminder = undefined; projection = undefined;
+    running = false; projection = undefined;
   });
   pi.on("tool_call", (event, ctx) => {
     const filePath = toolFilePath(event.input);
@@ -197,13 +200,14 @@ export default function soulsExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("soul", {
-    description: "Soul: /soul [@name|clear|reload]",
+    description: "Soul: /soul [@name|clear|reset|reload]",
     getArgumentCompletions: (prefix) => {
       try {
         const souls = listSouls(readConfig(pi.getSettings(), cwd).dir).map((name) => ({ value: `@${name}`, label: `@${name}` }));
         const items = [
           ...souls,
-          { value: "clear", label: "clear", description: "Follow defaults" },
+          { value: "clear", label: "clear", description: "Disable souls for this session" },
+          { value: "reset", label: "reset", description: "Follow defaults again" },
           { value: "reload", label: "reload", description: "Re-read the active soul and perception" },
         ];
         const matches = items.filter((item) => item.value.startsWith(prefix.trim()));
@@ -246,26 +250,27 @@ export default function soulsExtension(pi: ExtensionAPI) {
         const now = () => {
           const configured = resolved();
           const selection = effectiveSoul(configured, prompt);
-          return describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless());
+          return describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null);
         };
 
-        if (input === "clear") {
-          let selected = true; // A corrupted selection counts as something to clear.
+        if (input === "clear" || input === "reset") {
+          const target = input === "clear" ? null : undefined;
+          let unchanged = false;
           try {
-            selected = override() !== undefined;
+            unchanged = override() === target;
           } catch {
-            // Keep clearing the damaged choice.
+            // Either command can repair a damaged choice.
           }
-          if (!selected) {
+          if (unchanged) {
             refresh();
-            return notify(`No session soul. Soul: ${now()}`);
+            return notify(`${input === "clear" ? "Already soulless" : "Already following defaults"}. Soul: ${now()}`);
           }
           const before = loadedName(activeName());
-          pi.appendEntry(ENTRY_TYPE, { version: 1, name: null });
+          pi.appendEntry(ENTRY_TYPE, { version: 1, name: null, ...(input === "clear" ? { disabled: true } : {}) });
           const after = loadedName(active()?.name);
           if (before !== after) appendDivider(pi, after ?? null);
           refresh();
-          return notify(`Cleared. Soul: ${now()}`);
+          return notify(`${input === "clear" ? "Cleared" : "Reset"}. Soul: ${now()}`);
         }
 
         if (input === "reload") {
@@ -288,7 +293,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
           const missing = selection && !available.includes(selection.name) ? " (missing)" : "";
           const ignored = unmatchableModelKeys(config);
           return notify([
-            `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless())}${missing}`,
+            `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null)}${missing}`,
             `Souls: ${available.map((name) => `@${name}`).join(", ") || "none"}`,
             `Dir: ${tilde(config.dir)}`,
             ...(ignored.length ? [`Ignored keys: ${ignored.join(", ")}`] : []),
@@ -296,7 +301,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         }
 
         if (!input.startsWith("@") || !isSoulName(input.slice(1))) {
-          ctx.ui.notify("Usage: /soul [@<name>|clear|reload]", "warning");
+          ctx.ui.notify("Usage: /soul [@<name>|clear|reset|reload]", "warning");
           return;
         }
 
@@ -356,29 +361,20 @@ export default function soulsExtension(pi: ExtensionAPI) {
   };
 
   // The request boundary sees the final live options, after every before_agent_start handler.
-  const transition = (ctx: ExtensionContext, soul: string | null | undefined): string | undefined => {
+  const recordTransition = (ctx: ExtensionContext, soul: string | null | undefined): void => {
     const branch = ctx.sessionManager.getBranch();
     const previous = readTransition(branch);
     const model = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null;
     const current: Transition = { model, soul: soul === undefined ? previous?.soul ?? null : soul };
-    if (!previous) {
-      pi.appendEntry(TRANSITION_ENTRY_TYPE, { version: 1, ...current });
-      return;
-    }
-    if (sameTransition(previous, current)) return;
+    if (previous && sameTransition(previous, current)) return;
     pi.appendEntry(TRANSITION_ENTRY_TYPE, { version: 1, ...current });
-    const lines = transitionLines(previous, current);
-    return lines.length ? formatTransitionReminder(lines) : undefined;
+    if (previous && previous.soul !== current.soul && current.soul) {
+      sendReminder(pi, {
+        customType: TRANSITION_MESSAGE_TYPE, display: false, defer: true,
+        text: `new soul: ${current.soul}`, details: { version: 1, soul: current.soul },
+      });
+    }
   };
-
-  const reminder = (content: string): AgentMessage => ({
-    role: "custom",
-    customType: TRANSITION_MESSAGE_TYPE,
-    content,
-    display: false,
-    details: { version: 1 },
-    timestamp: Date.now(),
-  });
 
   // First handler owns presence/projection and its existing error path, including the no-UI throw.
   pi.on("context_with_system", (event, ctx) => {
@@ -418,13 +414,9 @@ export default function soulsExtension(pi: ExtensionAPI) {
 
   // A separate handler still runs after the runner catches a projection throw.
   pi.on("context_with_system", (event, ctx) => {
-    if (!running || !userRun) return;
-    if (!transitionComputed) {
-      // A failed soul load or projection never becomes the new soul; the brain still reports.
-      pendingReminder = transition(ctx, projection?.known ? projection.soul : undefined);
-      transitionComputed = true;
-    }
-    if (!pendingReminder) return;
-    return { messages: [...event.messages, reminder(pendingReminder)] };
+    // Only successful projection confirms a soul. Delivery is persisted by Pi at
+    // the next safe boundary, never retroactively inserted into a sent request.
+    if (running) recordTransition(ctx, projection?.known ? projection.soul : undefined);
+    return { messages: event.messages };
   });
 }

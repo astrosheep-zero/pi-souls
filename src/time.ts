@@ -3,7 +3,6 @@ import type { Perception } from "./perception.ts";
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
 export const HOUR_MS = 3_600_000;
-export const TIME_ENTRY_TYPE = "pi-souls:time";
 const DAY_MS = 24 * HOUR_MS;
 
 /** Watch-face style: big time first, then the small date window. No year, like a real watch. */

@@ -4,11 +4,35 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createJiti } from "jiti";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const PERCEPTION_MESSAGE_TYPE = "pi-souls:perception";
 
+const REMINDER_OPEN = "<system-reminder>\n";
+const REMINDER_CLOSE = "\n</system-reminder>";
+
 export function wrapReminder(text: string): string {
-  return `<system-reminder>\n${text}\n</system-reminder>`;
+  return `${REMINDER_OPEN}${text}${REMINDER_CLOSE}`;
+}
+
+export function unwrapReminder(text: string): string {
+  return text.startsWith(REMINDER_OPEN) && text.endsWith(REMINDER_CLOSE)
+    ? text.slice(REMINDER_OPEN.length, -REMINDER_CLOSE.length)
+    : text;
+}
+
+/** Persist once and let Pi deliver it at the next safe boundary; never rebuild old reminders. */
+export function sendReminder(pi: Pick<ExtensionAPI, "sendMessage">, message: {
+  text: string; details?: unknown; customType?: string; display?: boolean;
+  /** State notices describe the next request: settle with this run instead of steering it. */
+  defer?: boolean;
+}): void {
+  pi.sendMessage({
+    customType: message.customType ?? PERCEPTION_MESSAGE_TYPE,
+    content: wrapReminder(message.text),
+    display: message.display ?? true,
+    details: message.details,
+  }, message.defer ? { triggerTurn: false } : undefined);
 }
 
 const perceptionRequire = createRequire(import.meta.url);

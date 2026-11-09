@@ -7,28 +7,77 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earen
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
 import { applySoul, replaceForcedPreamble } from "../src/prompt.ts";
-import { ENTRY_TYPE, TIME_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulPerceptionPath, unmatchableModelKeys } from "../src/souls.ts";
+import { ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulPerceptionPath, unmatchableModelKeys } from "../src/souls.ts";
 import { HOUR_MS, timePerception } from "../src/time.ts";
 import { PERCEPTION_MESSAGE_TYPE, worldFor, wrapReminder, type Moment } from "../src/perception.ts";
 
 const model = { provider: "provider", id: "model" };
 const config = readConfig({ defaultSoul: "global", modelSouls: { "provider/model": "specific" } }, "/tmp");
 
-test("session > exact model > default; clear and branch navigation replay from the session", () => {
+test("session selection, opt-out and defaults replay from the active branch", () => {
   const session = SessionManager.inMemory();
   const root = session.appendCustomEntry("unrelated", {});
   assert.equal(resolveSoul(config, sessionSoul(session.getBranch()), model)?.name, "specific");
   session.appendCustomEntry(ENTRY_TYPE, { version: 1, name: "manual" });
   assert.equal(resolveSoul(config, sessionSoul(session.getBranch()), model)?.name, "manual");
+  const selected = session.getLeafId();
+  session.appendCustomEntry(ENTRY_TYPE, { version: 1, name: null, disabled: true });
+  assert.equal(sessionSoul(session.getBranch()), null);
+  assert.equal(resolveSoul(config, sessionSoul(session.getBranch()), model), undefined);
+  assert.equal(resolveSoul(config, sessionSoul(session.getBranch()), { ...model, id: "other" }), undefined);
+  const cleared = session.getLeafId();
   session.appendCustomEntry(ENTRY_TYPE, { version: 1, name: null });
   assert.equal(resolveSoul(config, sessionSoul(session.getBranch()), model)?.name, "specific");
+  session.branch(cleared!);
+  assert.equal(sessionSoul(session.getBranch()), null);
+  session.branch(selected!);
+  assert.equal(sessionSoul(session.getBranch()), "manual");
   session.branch(root);
   assert.equal(sessionSoul(session.getBranch()), undefined);
   assert.equal(resolveSoul(config, undefined, { ...model, id: "other" })?.name, "global");
   assert.equal(resolveSoul(readConfig({}, "/tmp"), undefined, model), undefined);
 });
 
-test("soulless via CLI or env skips defaults; /soul wins and clear returns to soulless", async () => {
+test("exact models beat wildcard patterns; otherwise the first matching pattern wins", () => {
+  const patterns = readConfig({ defaultSoul: "global", modelSouls: {
+    "*/claude-*": "claude",
+    "provider/*": "provider",
+    "provider/claude-special": "exact",
+    "*/gemini-*": "gemini",
+    "*/k3*": "kimi",
+    "*/kimi-k3*": "kimi",
+  } }, "/tmp");
+  const select = (provider: string, id: string) => resolveSoul(patterns, undefined, { provider, id })?.name;
+  assert.equal(select("provider", "claude-special"), "exact");
+  assert.equal(select("provider", "claude-new"), "claude");
+  assert.equal(select("provider", "other"), "provider");
+  assert.equal(select("new-provider", "gemini-new"), "gemini");
+  assert.equal(select("kimi-coding", "k3.1-pro"), "kimi");
+  assert.equal(select("opencode-go", "kimi-k3"), "kimi");
+  assert.equal(select("openrouter", "anthropic/claude-new"), "claude");
+  assert.equal(select("other", "unmatched"), "global");
+  assert.equal(resolveSoul(patterns, undefined)?.name, "global");
+  assert.equal(resolveSoul(patterns, "manual", model)?.name, "manual");
+  assert.equal(resolveSoul(patterns, undefined, model, true), undefined);
+});
+
+test("wildcards keep other characters literal and validate only the selected soul", () => {
+  const patterns = readConfig({ modelSouls: {
+    "*/k3.1-*": "kimi",
+    "*/broken-*": "../unsafe",
+    "provider/broken-exact": "exact",
+    "*": "not-a-provider-model-key",
+  } }, "/tmp");
+  assert.equal(resolveSoul(patterns, undefined, { ...model, id: "k3.1-pro" })?.name, "kimi");
+  for (const id of ["k3x1-pro", "prefix-k3.1-pro", "other"]) {
+    assert.equal(resolveSoul(patterns, undefined, { ...model, id }), undefined);
+  }
+  assert.equal(resolveSoul(patterns, undefined, { ...model, id: "broken-exact" })?.name, "exact");
+  assert.throws(() => resolveSoul(patterns, undefined, { ...model, id: "broken-new" }), /modelSouls\["\*\/broken-\*"\]/);
+  assert.deepEqual(unmatchableModelKeys(patterns), ["*"]);
+});
+
+test("soulless via CLI or env skips defaults; selection wins and clear/reset remain soulless", async () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-less-"));
   const previous = process.env.SOULLESS;
   try {
@@ -77,8 +126,14 @@ test("soulless via CLI or env skips defaults; /soul wins and clear returns to so
     await command.handler("clear", ctx);
     assert.match(notices.at(-1)!, /Soul: none \(soulless\)/);
     assert.equal(request(), undefined);
+    assert.equal(sessionSoul(session.getBranch()), null);
+    await command.handler("reset", ctx);
+    assert.match(notices.at(-1)!, /Soul: none \(soulless\)/);
+    assert.equal(sessionSoul(session.getBranch()), undefined);
+    assert.equal(request(), undefined);
     // Suppressed defaults need not even contain a valid name.
     assert.equal(resolveSoul(readConfig({ defaultSoul: 42 }, dir), undefined, model, true), undefined);
+    assert.equal(resolveSoul(readConfig({ defaultSoul: 42 }, dir), null, model), undefined);
   } finally {
     if (previous === undefined) delete process.env.SOULLESS; else process.env.SOULLESS = previous;
     rmSync(dir, { recursive: true, force: true });
@@ -290,14 +345,14 @@ test("registered command persists selection, refuses missing files, skips no-ops
     assert.deepEqual(command.getArgumentCompletions("f"), null); // Bare names cannot switch.
     assert.deepEqual(command.getArgumentCompletions("@")?.map((item) => item.value), ["@clear", "@faye", "@reload"]);
     assert.deepEqual(command.getArgumentCompletions("@c")?.map((item) => item.value), ["@clear"]);
-    assert.deepEqual(command.getArgumentCompletions("")?.map((item) => item.value), ["@clear", "@faye", "@reload", "clear", "reload"]);
-    assert.deepEqual(command.getArgumentCompletions("r")?.map((item) => item.value), ["reload"]);
+    assert.deepEqual(command.getArgumentCompletions("")?.map((item) => item.value), ["@clear", "@faye", "@reload", "clear", "reset", "reload"]);
+    assert.deepEqual(command.getArgumentCompletions("r")?.map((item) => item.value), ["reset", "reload"]);
     assert.equal(command.getArgumentCompletions("zzz"), null);
 
     for (const input of ["faye", "@ faye"]) {
       await command.handler(input, ctx);
       assert.equal(sessionSoul(session.getBranch()), undefined);
-      assert.match(notices.at(-1)!, /Usage: \/soul \[@<name>\|clear\|reload\]/);
+      assert.match(notices.at(-1)!, /Usage: \/soul \[@<name>\|clear\|reset\|reload\]/);
     }
     assert.equal(entries(), 0);
     await command.handler("@faye", ctx);
@@ -313,12 +368,18 @@ test("registered command persists selection, refuses missing files, skips no-ops
     assert.ok(project({ messages: [{ role: "system", content: "", sections: { preamble: "Pi" }, timestamp: 0 }] }, ctx));
 
     await command.handler("clear", ctx);
-    assert.equal(sessionSoul(session.getBranch()), undefined);
+    assert.equal(sessionSoul(session.getBranch()), null);
     const afterClear = entries();
     await command.handler("clear", ctx);
     assert.equal(entries(), afterClear);
-    assert.match(notices.at(-1)!, /No session soul/);
+    assert.match(notices.at(-1)!, /Already soulless/);
     assert.equal(project({ messages: [] }, ctx), undefined);
+    await command.handler("reset", ctx);
+    assert.equal(sessionSoul(session.getBranch()), undefined);
+    const afterReset = entries();
+    await command.handler("reset", ctx);
+    assert.equal(entries(), afterReset);
+    assert.match(notices.at(-1)!, /Already following defaults/);
 
     await command.handler("@clear", ctx);
     assert.equal(sessionSoul(session.getBranch()), "clear");
@@ -330,12 +391,15 @@ test("registered command persists selection, refuses missing files, skips no-ops
     await command.handler("@reload", ctx);
     assert.equal(sessionSoul(session.getBranch()), "reload");
     await command.handler("clear", ctx);
-    assert.equal(sessionSoul(session.getBranch()), undefined);
+    assert.equal(sessionSoul(session.getBranch()), null);
 
     session.appendCustomEntry(ENTRY_TYPE, { version: 99 });
     await command.handler("", ctx);
     assert.match(notices.at(-1)!, /Corrupted.*\/soul clear/);
     await command.handler("clear", ctx);
+    assert.equal(sessionSoul(session.getBranch()), null);
+    session.appendCustomEntry(ENTRY_TYPE, { version: 99 });
+    await command.handler("reset", ctx);
     assert.equal(sessionSoul(session.getBranch()), undefined);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -385,6 +449,9 @@ test("customPrompt keeps settings souls off, leaves the session choice and statu
     options.customPrompt = "";
     start({ systemPromptOptions: { cwd: dir, customPrompt: options.customPrompt } }, ctx);
     await command.handler("clear", ctx);
+    assert.match(notices.at(-1)!, /Soul: none \(soulless\)/);
+    assert.equal(project({ messages: system() }, ctx), undefined);
+    await command.handler("reset", ctx);
     assert.match(notices.at(-1)!, /Soul: global \(default\)/);
     const fallback = project({ messages: system() }, ctx) as { messages: AgentMessage[] };
     assert.equal((fallback.messages[0] as { sections: Record<string, string> }).sections.preamble, "Global");
@@ -411,24 +478,20 @@ test("builtin time perception returns bare text only for due human moments", asy
   assert.equal(await say(t0, t0 + HOUR_MS), undefined);
 });
 
-test("time note replay ignores directory perceptions and honors new and legacy branch entries", () => {
+test("time note replay ignores directory perceptions and follows branch entries", () => {
   const session = SessionManager.inMemory();
   const root = session.appendCustomEntry("root", {});
-  session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "directory", false, { moment: "human" });
+  session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "directory", true, { moment: "human" });
   assert.equal(lastTimeNoteTimestamp(session.getBranch()), undefined);
-  session.appendCustomMessageEntry(TIME_ENTRY_TYPE, "legacy", true, { timestamp: 100 });
-  assert.equal(lastTimeNoteTimestamp(session.getBranch()), 100);
-  session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "clock", false, { moment: "human", timestamp: 200 });
-  session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "directory", false, { moment: "tool" });
-  session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "bad timestamp", false, { timestamp: Infinity });
+  session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "clock", true, { moment: "human", timestamp: 200 });
+  session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "directory", true, { moment: "tool" });
+  session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "bad timestamp", true, { timestamp: Infinity });
   assert.equal(lastTimeNoteTimestamp(session.getBranch()), 200);
   session.branch(root);
   assert.equal(lastTimeNoteTimestamp(session.getBranch()), undefined);
-  session.appendCustomMessageEntry(TIME_ENTRY_TYPE, "legacy without details", true, { timestamp: NaN });
-  assert.equal(lastTimeNoteTimestamp(session.getBranch()), Date.parse(session.getBranch().at(-1)!.timestamp));
 });
 
-test("Pi time awareness sends hidden perceptions, throttles hourly and follows branch rewinds", async () => {
+test("Pi time awareness sends visible perceptions, throttles hourly and follows branch rewinds", async () => {
   const t0 = new Date(2026, 9, 27, 2, 14, 0).getTime();
   const dir = mkdtempSync(join(tmpdir(), "souls-time-"));
   const realNow = Date.now;
@@ -464,7 +527,7 @@ test("Pi time awareness sends hidden perceptions, throttles hourly and follows b
     assert.equal(await start(), undefined);
     timeaware = undefined;
     const first = await start();
-    assert.deepEqual(first, { customType: PERCEPTION_MESSAGE_TYPE, display: false, details: { moment: "human", timestamp: t0 }, content: wrapReminder("⌚ 02:14 · Tue, Oct 27") });
+    assert.deepEqual(first, { customType: PERCEPTION_MESSAGE_TYPE, display: true, details: { moment: "human", timestamp: t0 }, content: wrapReminder("⌚ 02:14 · Tue, Oct 27") });
     const firstNoteId = session.getLeafId()!;
     assert.equal(await start({ messageType: "custom" }), undefined);
     session.appendMessage({ role: "user", content: "hi", timestamp: t0 });

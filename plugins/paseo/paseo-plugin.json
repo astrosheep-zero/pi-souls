@@ -1,0 +1,6 @@
+{
+  "id": "pi-souls",
+  "requirements": {
+    "paseo": ">=0.11.2"
+  }
+}
