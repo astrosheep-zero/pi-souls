@@ -1,12 +1,30 @@
 /// <reference path="../plugins/claude/types/claude-code.d.ts" />
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
+import { pathToFileURL } from "node:url";
 import type { EngineInterface, On, PluginOptions, PromptComposeResult, PromptSubmitInput, PromptSubmitResult } from "claude-code";
-import { register, replaceIdentity } from "../plugins/claude/hooks/register.ts";
+
+const HOOKS = join(import.meta.dirname, "..", "plugins", "claude", "hooks");
+
+/** Load the real hooks module as Claude does: a `.mjs` fixture with the loader's `import.meta.dir`. */
+async function loadHooks(prefix = "pi-souls hooks ") {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const hooks = join(root, "hooks");
+  mkdirSync(hooks, { recursive: true });
+  const source = stripTypeScriptTypes(readFileSync(join(HOOKS, "register.ts"), "utf8"), { mode: "strip" });
+  writeFileSync(join(hooks, "register.mjs"), `import.meta.dir = ${JSON.stringify(hooks)};\n${source}`);
+  copyFileSync(join(HOOKS, "perception-runner.mjs"), join(hooks, "perception-runner.mjs"));
+  return { root, hooks, ...(await import(pathToFileURL(join(hooks, "register.mjs")).href)) };
+}
+
+const plugin = await loadHooks();
+const { register, replaceIdentity } = plugin;
+after(() => rmSync(plugin.root, { recursive: true, force: true }));
 
 // Exercise the actual compose and submit hooks with only host IO stubbed.
 type Hook = ($: EngineInterface, event: any, next: any) => Promise<any>;
@@ -327,7 +345,7 @@ const PERCEPTION = `export function perception(moment, world) {
 `;
 
 // The perception path is a real file and a real child process: only the engine's IO is stubbed.
-function diskHost(perception: Record<string, string> | string, options: PluginOptions = { defaultSoul: "faye", timeaware: false }) {
+function diskHost(perception: Record<string, string> | string, options: PluginOptions = { defaultSoul: "faye", timeaware: false }, pluginModule = plugin) {
   const home = mkdtempSync(join(tmpdir(), "claude-perception-"));
   const souls = join(home, ".agents", "souls", "faye");
   mkdirSync(souls, { recursive: true });
@@ -352,7 +370,7 @@ function diskHost(perception: Record<string, string> | string, options: PluginOp
       },
     },
   } as unknown as EngineInterface;
-  register(((event: string, hook: Hook) => { hooks.set(event, hook); }) as unknown as On, options);
+  pluginModule.register(((event: string, hook: Hook) => { hooks.set(event, hook); }) as unknown as On, options);
   const classic = (name: string, event: Record<string, unknown>, answer: Record<string, unknown> = {}) =>
     hooks.get(name)!($, event, async (_e: unknown) => ({ ...answer }));
   return {
@@ -368,6 +386,20 @@ function diskHost(perception: Record<string, string> | string, options: PluginOp
 }
 
 const momentOf = (entry: string | undefined) => JSON.parse(entry!).moment;
+
+test("Claude runs the real perception runner from a plugin path with spaces, # and %", async () => {
+  const spaced = await loadHooks("pi-souls plugin #% ");
+  const h = diskHost(PERCEPTION, { defaultSoul: "faye", timeaware: false }, spaced);
+  try {
+    assert.ok(spaced.hooks.includes(" ") && spaced.hooks.includes("#") && spaced.hooks.includes("%"));
+    const result = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
+    assert.equal(result.additionalContext.length, 1);
+    assert.deepEqual(momentOf(result.additionalContext[0]), { kind: "wake", source: "startup" });
+  } finally {
+    h.close();
+    rmSync(spaced.root, { recursive: true, force: true });
+  }
+});
 
 test("Claude wakes a directory soul's perception with the world it can see", async () => {
   const h = diskHost(PERCEPTION);

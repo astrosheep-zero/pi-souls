@@ -2,21 +2,8 @@ import type { EngineInterface, On, PluginOptions } from "claude-code";
 
 type Engine = Pick<EngineInterface, "fs" | "env" | "session" | "ui" | "clock" | "process">;
 
-declare global {
-  /** The hooks module runs as a file of the plugin; its own URL locates the sibling runner. */
-  interface ImportMeta {
-    url: string;
-  }
-}
-
 /** Executed by the host's `node`, never loaded here: this sandbox has no dynamic import and no Node. */
-function runnerPath(): string | undefined {
-  try {
-    return new URL("./perception-runner.mjs", import.meta.url).pathname;
-  } catch {
-    return undefined; // An environment without module URLs simply has no perception.
-  }
-}
+const RUNNER = `${import.meta.dir}/perception-runner.mjs`;
 
 /** How the host saw a tool call; a perception module reads this instead of parsing tool names. */
 type ToolCategory = "reading" | "running" | "writing" | "other";
@@ -239,12 +226,10 @@ async function worldFor($: Engine, name: string, absenceMs?: number): Promise<Wo
  */
 async function perceive($: Engine, name: string, moment: Moment, world: World): Promise<Utterance | undefined> {
   try {
-    const runner = runnerPath();
-    if (!runner) return undefined;
     const path = await perceptionPath($, name);
     if (!path) return undefined;
     const { exitCode, stdout } = await $.process.run(
-      ["node", "--experimental-strip-types", runner, path, JSON.stringify({ moment, world })],
+      ["node", "--experimental-strip-types", RUNNER, path, JSON.stringify({ moment, world })],
       { timeoutMs: 10_000 },
     );
     if (exitCode !== 0) return undefined;
