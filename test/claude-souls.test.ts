@@ -1,24 +1,24 @@
 /// <reference path="../plugins/claude/types/claude-code.d.ts" />
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { stripTypeScriptTypes } from "node:module";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { pathToFileURL } from "node:url";
+import { readSoul } from "../src/soul-content.ts";
+import type { SoulTask } from "../src/claude-souls-runner.ts";
 import type { EngineInterface, On, PluginOptions, PromptComposeResult, PromptSubmitInput, PromptSubmitResult } from "claude-code";
 
 const HOOKS = join(import.meta.dirname, "..", "plugins", "claude", "hooks");
 
-/** Load the real hooks module as Claude does: a `.mjs` fixture with the loader's `import.meta.dir`. */
+/** Load the shipped entry with the loader's `import.meta.dir`, outside the checkout. */
 async function loadHooks(prefix = "pi-souls hooks ") {
   const root = mkdtempSync(join(tmpdir(), prefix));
-  const hooks = join(root, "hooks");
-  mkdirSync(hooks, { recursive: true });
-  const source = stripTypeScriptTypes(readFileSync(join(HOOKS, "register.ts"), "utf8"), { mode: "strip" });
+  const hooks = join(root, "plugin", "hooks");
+  cpSync(join(HOOKS, ".."), join(root, "plugin"), { recursive: true });
+  const source = readFileSync(join(hooks, "register.js"), "utf8");
   writeFileSync(join(hooks, "register.mjs"), `import.meta.dir = ${JSON.stringify(hooks)};\n${source}`);
-  copyFileSync(join(HOOKS, "perception-runner.mjs"), join(hooks, "perception-runner.mjs"));
   return { root, hooks, ...(await import(pathToFileURL(join(hooks, "register.mjs")).href)) };
 }
 
@@ -26,15 +26,30 @@ const plugin = await loadHooks();
 const { register, replaceIdentity } = plugin;
 after(() => rmSync(plugin.root, { recursive: true, force: true }));
 
-// Exercise the actual compose and submit hooks with only host IO stubbed.
+// Exercise the shipped hooks and real helper processes; only the host API is stubbed.
 type Hook = ($: EngineInterface, event: any, next: any) => Promise<any>;
+function processRunner(env: Map<string, string>) {
+  return async (argv: readonly string[], init?: { cwd?: string; timeoutMs?: number }) => {
+    const child = spawnSync(argv[0]!, argv.slice(1), {
+      encoding: "utf8", cwd: init?.cwd, timeout: init?.timeoutMs ?? 20_000,
+      env: { ...process.env, ...Object.fromEntries(env), NODE_PATH: "" },
+    });
+    return { exitCode: child.status ?? 1, stdout: child.stdout ?? "", stderr: child.stderr ?? "", isStdoutTruncated: false, isStderrTruncated: false };
+  };
+}
 function host(options: PluginOptions = { defaultSoul: "faye", modelSouls: ["claude-test=reviewer"], timeaware: false }) {
+  const home = mkdtempSync(join(tmpdir(), "claude-souls-"));
+  after(() => rmSync(home, { recursive: true, force: true }));
+  const dir = join(home, ".agents", "souls");
+  const write = (name: string, text: string) => {
+    const path = join(dir, name);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+  };
+  write("faye.md", "---\nname: Faye\n---\nYou are Faye. $&\n\nKeep your own voice.\n");
+  write("reviewer.md", "You are a reviewer.");
   const hooks = new Map<string, Hook>();
-  const files = new Map<string, string>([
-    ["/home/.agents/souls/faye.md", "---\nname: Faye\n---\nYou are Faye. $&\n\nKeep your own voice.\n"],
-    ["/home/.agents/souls/reviewer.md", "You are a reviewer."],
-  ]);
-  const env = new Map<string, string>([["HOME", "/home"]]);
+  const env = new Map<string, string>([["HOME", home]]);
   const warnings: string[] = [];
   let now = new Date(2026, 9, 27, 2, 14, 0).getTime();
   let sessionId = "session-a";
@@ -42,10 +57,7 @@ function host(options: PluginOptions = { defaultSoul: "faye", modelSouls: ["clau
   const $ = {
     clock: { now: async () => now },
     env: { get: async (key: string) => env.get(key) },
-    fs: {
-      exists: async (path: string) => files.has(path),
-      read: async (path: string) => { if (!files.has(path)) throw new Error("unreadable"); return files.get(path)!; },
-    },
+    process: { run: processRunner(env) },
     session: {
       id: async () => sessionId,
       model: async () => currentModel,
@@ -72,7 +84,7 @@ function host(options: PluginOptions = { defaultSoul: "faye", modelSouls: ["clau
     });
   const end = () => hooks.get("session.end")!($, {}, async (e: any) => e);
   return {
-    files, env, warnings, compose, submit, end, options,
+    home, dir, write, remove: (name: string) => rmSync(join(dir, name)), env, warnings, compose, submit, end, options,
     setNow: (value: number) => { now = value; },
     getNow: () => now,
     setSession: (id: string) => { sessionId = id; },
@@ -141,12 +153,12 @@ test("Claude malformed model entries warn once and are ignored individually", as
 
 test("Claude unreadable/empty soul leaves core prompt intact and deduplicates the error", async () => {
   const h = host();
-  h.files.set("/home/.agents/souls/faye.md", "---\nname: Faye\n---\n");
+  h.write("faye.md", "---\nname: Faye\n---\n");
   assert.equal(await h.compose(original), original);
   assert.equal(await h.compose(original), original);
   assert.equal(h.warnings.length, 1);
   assert.match(h.warnings[0], /empty/);
-  h.files.set("/home/.agents/souls/faye.md", "You are repaired.");
+  h.write("faye.md", "You are repaired.");
   assert.match((await h.compose(original)).sections[0].text, /repaired/);
 });
 
@@ -184,7 +196,7 @@ test("Claude does not trust a compose that skipped the opening or failed to load
   assert.equal(await h.compose(changed, false, "claude-test"), changed);
   assert.deepEqual((await h.submit()).context, ["new brain: claude-test"]);
 
-  h.files.set("/home/.agents/souls/reviewer.md", "You are repaired.");
+  h.write("reviewer.md", "You are repaired.");
   assert.match((await h.compose(original, false, "claude-test")).sections[0].text, /repaired/);
   assert.deepEqual((await h.submit()).context, ["new soul: reviewer"]);
 });
@@ -250,7 +262,7 @@ test("Claude never announces a soul that failed to compose", async () => {
   h.setModel("claude-broken");
   assert.equal(await h.compose(original, false, "claude-broken"), original);
   assert.deepEqual((await h.submit()).context, ["new brain: claude-broken"]);
-  h.files.set("/home/.agents/souls/missing.md", "You are missing.");
+  h.write("missing.md", "You are missing.");
   assert.match((await h.compose(original, false, "claude-broken")).sections[0].text, /missing/);
   assert.deepEqual((await h.submit()).context, ["new soul: missing"]);
 });
@@ -323,19 +335,19 @@ test("Claude unreadable souls do not emit a time note or consume human presence"
   const h = host({ defaultSoul: "faye" });
   const t0 = h.getNow();
   await h.submit();
-  h.files.delete("/home/.agents/souls/faye.md");
+  h.remove("faye.md");
   h.setNow(t0 + 2 * 3_600_000);
   assert.equal((await h.submit()).context, undefined);
-  h.files.set("/home/.agents/souls/faye.md", "You are repaired.");
+  h.write("faye.md", "You are repaired.");
   h.setNow(t0 + 3 * 3_600_000);
   assert.deepEqual((await h.submit()).context, ["⌚ 05:14 · Tue, Oct 27\n(3h since *human* was last present)"]);
 });
 
 test("Claude loads a directory soul and prefers its SOUL.md over a same-named file", async () => {
   const h = host();
-  h.files.set("/home/.agents/souls/faye/SOUL.md", "---\nicon: \u{1F988}\n---\nYou are Directory Faye.");
+  h.write("faye/SOUL.md", "---\nicon: \u{1F988}\n---\nYou are Directory Faye.");
   assert.match((await h.compose(original)).sections[0].text, /Directory Faye/);
-  h.files.delete("/home/.agents/souls/faye/SOUL.md");
+  h.remove("faye/SOUL.md");
   assert.match((await h.compose(original)).sections[0].text, /You are Faye/);
 });
 
@@ -360,15 +372,9 @@ function diskHost(perception: Record<string, string> | string, options: PluginOp
   const $ = {
     clock: { now: async () => { clockReads++; return now; } },
     env: { get: async (key: string) => env.get(key) },
-    fs: { exists: async (path: string) => existsSync(path), read: async (path: string) => readFileSync(path, "utf8") },
     session: { id: async () => session.id, model: async () => session.model, cwd: async () => session.cwd },
     ui: { log: () => {}, toast: (text: string) => { toasts.push(text); } },
-    process: {
-      run: async (argv: readonly string[], init?: { cwd?: string; timeoutMs?: number }) => {
-        const child = spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8", cwd: init?.cwd, timeout: init?.timeoutMs ?? 20_000 });
-        return { exitCode: child.status ?? 1, stdout: child.stdout ?? "", stderr: child.stderr ?? "", isStdoutTruncated: false, isStderrTruncated: false };
-      },
-    },
+    process: { run: processRunner(env) },
   } as unknown as EngineInterface;
   pluginModule.register(((event: string, hook: Hook) => { hooks.set(event, hook); }) as unknown as On, options);
   const classic = (name: string, event: Record<string, unknown>, answer: Record<string, unknown> = {}) =>
@@ -378,6 +384,7 @@ function diskHost(perception: Record<string, string> | string, options: PluginOp
     clockReads: () => clockReads,
     fire: (name: string, event: Record<string, unknown>) => hooks.get(name)!($, { session_id: session.id, transcript_path: "", cwd: session.cwd, ...event }, async (x: any) => x),
     classic,
+    compose: (model = session.model) => hooks.get("prompt.compose")!($, { model, traits: [] }, async () => original),
     submit: (event: Partial<PromptSubmitInput> = {}) =>
       hooks.get("prompt.submit")!($, { text: "hello", wait: false, origin: { kind: "composer" }, ...event }, async (x: any) => ({ text: x.text, context: x.context, origin: x.origin })),
     at: (value: number) => { now = value; },
@@ -533,4 +540,92 @@ test("Claude hooks typecheck without Node globals", () => {
   const result = spawnSync(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "plugins/claude/tsconfig.json"], { encoding: "utf8" });
   assert.ifError(result.error);
   assert.equal(result.status, 0, result.stdout + result.stderr);
+});
+
+function runSoulTask(task: SoulTask, home = plugin.root) {
+  const child = spawnSync(process.execPath, [join(plugin.hooks, "souls-runner.cjs"), JSON.stringify(task)], {
+    encoding: "utf8", cwd: plugin.root, env: { ...process.env, HOME: home, NODE_PATH: "" }, timeout: 10_000,
+  });
+  assert.ifError(child.error);
+  return { status: child.status, value: JSON.parse(child.stdout) };
+}
+
+test("standalone helper matches Pi content, roots, icons and listing without checkout dependencies", () => {
+  for (let parent = plugin.root; ; parent = dirname(parent)) {
+    assert.equal(existsSync(join(parent, "node_modules")), false);
+    if (dirname(parent) === parent) break;
+  }
+  const cwd = join(plugin.root, "work #%");
+  const dir = join(cwd, "souls");
+  const write = (name: string, text: string) => {
+    const path = join(dir, name);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+  };
+  write("alpha.md", "Flat {{ model.id }} @ {{ cwd }}");
+  write("faye.md", "Flat loses");
+  write("faye/SOUL.md", "\uFEFF---\r\nicon: ' 🦈 '\r\n---\r\n{% if model.provider == '' %}Unknown provider{% endif %}\r\n{% include 'parts/local' %}\r\n{% render 'parts/shared' %}");
+  write("faye/parts/local.md", "Local {{ model.id }} @ {{ cwd }}");
+  write("parts/local.md", "Shared loses");
+  write("parts/shared.md", "Shared {{ model.id }} @ {{ cwd }}");
+  mkdirSync(join(dir, "incomplete"));
+  const variables = { model: { provider: "", id: "claude-requested" }, cwd };
+  for (const name of ["alpha", "faye"]) {
+    const result = runSoulTask({ op: "read", soulsDir: "souls", name, ...variables });
+    assert.equal(result.status, 0);
+    assert.deepEqual(result.value, { dir, ...readSoul(dir, name, variables) });
+  }
+  const task: SoulTask = { op: "read", soulsDir: "souls", name: "faye", ...variables };
+  assert.deepEqual(runSoulTask(task).value, {
+    dir, icon: "🦈", body: `Unknown provider\nLocal claude-requested @ ${cwd}\nShared claude-requested @ ${cwd}`,
+  });
+  assert.deepEqual(runSoulTask({ op: "list", soulsDir: "souls", cwd }).value, { dir, names: ["alpha", "faye"] });
+  assert.deepEqual(runSoulTask({ op: "list", soulsDir: "~/work #%/souls", cwd: "/unrelated" }).value, { dir, names: ["alpha", "faye"] });
+  write("faye/parts/local.md", "Edited {{ model.id }}");
+  assert.match(runSoulTask(task).value.body, /Edited claude-requested/);
+  write("alpha.md", "---\nicon: 42\n---\nFlat");
+  assert.deepEqual(runSoulTask({ ...task, name: "alpha" }).value, { dir, body: "Flat" });
+});
+
+test("helper failures are JSON errors, and malformed content falls back and recovers in compose", async () => {
+  const h = host();
+  for (const text of ["{{ model.typo }}", "{% render 'missing' %}", "---\nicon: [unclosed\n---\nSoul"]) {
+    h.write("faye.md", text);
+    const result = runSoulTask({ op: "read", soulsDir: h.dir, name: "faye", cwd: "/work", model: { provider: "", id: "claude-other" } });
+    assert.equal(result.status, 1);
+    assert.equal(typeof result.value.error, "string");
+    assert.equal(result.value.body, undefined);
+    const before = h.warnings.length;
+    assert.equal(await h.compose(original), original);
+    assert.equal(await h.compose(original), original);
+    assert.equal(h.warnings.length, before + 1);
+  }
+  h.write("faye.md", "---\nicon: 🦈\n---\n{{ model.id }} @ {{ cwd }} provider='{{ model.provider }}'");
+  assert.equal((await h.compose(original, false, "claude-requested")).sections[0].text,
+    "\nclaude-requested @ /work provider=''\n\nIMPORTANT: Keep this.\n");
+});
+
+test("Claude exact beats wildcards, first wildcard wins, and duplicate exact keeps its last valid value", async () => {
+  const h = host({ defaultSoul: "missing", modelSouls: [
+    "claude.1-*=faye", "claude*=reviewer", "*=fallback", "claude.1-exact=faye",
+    "claude.1-exact=reviewer", "claude.1-exact=../invalid",
+  ], timeaware: false });
+  h.write("fallback.md", "Fallback");
+  assert.match((await h.compose(original, false, "claude.1-exact")).sections[0].text, /reviewer/);
+  assert.match((await h.compose(original, false, "claude.1-new")).sections[0].text, /Faye/);
+  assert.match((await h.compose(original, false, "claudex1-new")).sections[0].text, /reviewer/);
+  assert.match((await h.compose(original, false, "other")).sections[0].text, /Fallback/);
+  assert.equal(h.warnings.length, 1);
+});
+
+test("Claude uses the configured relative directory for both content and perception discovery", async () => {
+  const h = diskHost(PERCEPTION, { defaultSoul: "faye", soulsDir: "custom", timeaware: false });
+  try {
+    cpSync(join(h.home, ".agents", "souls"), join(h.home, "custom"), { recursive: true });
+    rmSync(join(h.home, ".agents"), { recursive: true });
+    h.session.cwd = h.home;
+    assert.match((await h.compose()).sections[0].text, /Faye/);
+    const result = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
+    assert.deepEqual(momentOf(result.additionalContext[0]), { kind: "wake", source: "startup" });
+  } finally { h.close(); }
 });

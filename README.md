@@ -31,7 +31,7 @@ Skip settings souls for this process. `SOULLESS=1` or `true` enables it; `0`, `f
 
 ## Souls
 
-A soul is one Markdown file, or a directory holding `SOUL.md` beside whatever it keeps with it. The body becomes the identity; frontmatter is stripped, and edits apply on the next request. An optional nonempty `icon` string is shown alone in the footer; without one, the footer shows the soul's name.
+A soul is one Markdown file, or a directory holding `SOUL.md` beside whatever it keeps with it. The body becomes the identity; frontmatter is stripped, and files are read fresh when composing a prompt. Pi observes edits on the next request; Claude's frozen prompt snapshot is described below. An optional nonempty `icon` string is shown alone in Pi's footer; without one, the footer shows the soul's name. Claude's content helper returns the same normalized icon metadata for host integration.
 
 ```text
 ~/.agents/souls/
@@ -57,7 +57,7 @@ Faye's identity body
 
 The footer shows the effective soul, and is removed when no soul applies. Before the first request after startup, Pi does not expose the explicit system prompt to extensions, so a session `/soul` choice is shown but a settings or model soul waits until the first request confirms it applies. `/soul @<name>`, `/soul clear`, and `/soul reset` leave a compact durable divider in the transcript only when the effective identity actually changes: `── soul: faye ──`, or `── soulless ──` when nothing applies. Dividers keep the identity they recorded when replayed, and never enter model context. No divider appears for no-ops, failures, `/soul reload`, or a bare `/soul` status check.
 
-### Templates (Pi)
+### Templates
 
 Soul bodies support [Liquid](https://liquidjs.com/) without extra configuration:
 
@@ -73,11 +73,11 @@ Working in {{ cwd }} with {{ model.id }}.
 {% render 'parts/shared' %}
 ```
 
-Available variables: `model.provider`, `model.id`, and `cwd` (the session working directory). Model fields are empty strings when no model is selected. Output is plain text, without HTML escaping. Undefined variables, unknown filters, invalid templates, and empty output use the normal warning/fallback behavior. `/soul @<name>` validates the rendered result before saving the choice.
+Available variables: `model.provider`, `model.id`, and `cwd` (the session working directory). Pi model fields are empty strings when no model is selected. Claude uses the requested model ID, but `model.provider` is always an empty string because its host API exposes no provider identity; it is not inferred from the model's name. Output is plain text, without HTML escaping. Undefined variables, unknown filters, invalid templates, and empty output use the normal warning/fallback behavior. Pi's `/soul @<name>` validates the rendered result before saving the choice.
 
-Put reusable Markdown fragments in `soulsDir/parts/`; both `{% include 'parts/shared' %}` and `{% render 'parts/shared' %}` load `parts/shared.md` and can access the host variables above. Fragments should have no frontmatter. Subdirectories don't appear in `/soul` completion. Soul files and fragments are read fresh on each request.
+Put reusable Markdown fragments in `soulsDir/parts/`; both `{% include 'parts/shared' %}` and `{% render 'parts/shared' %}` load `parts/shared.md` and can access the host variables above. Fragments should have no frontmatter. Subdirectories don't appear in Pi's `/soul` completion. Soul files and fragments are read fresh on each Pi request and each Claude prompt composition.
 
-Template syntax is processed even inside Markdown code fences. Wrap literal examples in `{% raw %}...{% endraw %}`. The Claude Code mod below still reads souls as literal Markdown; Liquid rendering is Pi-only.
+Template syntax is processed even inside Markdown code fences. Wrap literal examples in `{% raw %}...{% endraw %}`. Both hosts use the same content loader, Liquid engine, and frontmatter parser.
 
 ## Perception
 
@@ -97,7 +97,7 @@ Moments: `wake` (`source`: `startup`, `resume`, `fork`, `clear`, `compact`), `hu
 
 `timeaware` (⌚️) is a builtin perception on `"human"` moments, for file and directory souls alike. Pi wraps each utterance in `<system-reminder>...</system-reminder>` and displays it in the transcript; Claude delivers it as model context. A module that fails to import, throws, or returns no text is ignored: a perception never interrupts the host. Pi loads it once; `/soul reload` drops the cached module so the next moment imports the file again.
 
-Pi imports the entry module in-process; dependencies follow their loader's normal caching. The Claude Code mod runs it in a `node` child process (`--experimental-strip-types`), because its sandbox has no `import()` and no Node. `node` must be on the mod's `PATH`, and its TypeScript perceptions must use syntax Node can erase.
+Pi imports the entry module in-process; dependencies follow their loader's normal caching. The Claude Code mod uses a bundled `node` helper for content and a separate child process (`--experimental-strip-types`) for perceptions, because its sandbox has no `import()` and no Node. Node 22.18 or later must be on the mod's `PATH`, and TypeScript perceptions must use syntax Node can erase.
 
 ## Settings
 
@@ -135,7 +135,7 @@ From a checkout, with Claude Code 2.1.299 or later:
 claude --plugin-dir /path/to/pi-souls/plugins/claude
 ```
 
-Uses the same `~/.agents/souls/` souls (`<name>.md`, or `<name>/SOUL.md` with an optional `perception.ts`) and strips frontmatter. Configure the plugin's optional `userConfig` values in Claude's user `settings.json`:
+Uses the same souls and templates as Pi (`<name>.md`, or `<name>/SOUL.md` with an optional `perception.ts`). The default directory is `~/.agents/souls`; `soulsDir` also accepts absolute paths, `~`, and paths relative to the session working directory, for both content and perceptions. Configure the plugin's optional `userConfig` values in Claude's user `settings.json`:
 
 ```json
 {
@@ -143,7 +143,8 @@ Uses the same `~/.agents/souls/` souls (`<name>.md`, or `<name>/SOUL.md` with an
     "pi-souls@inline": {
       "options": {
         "defaultSoul": "faye",
-        "modelSouls": ["claude-opus-5-5=reviewer"],
+        "soulsDir": "~/.agents/souls",
+        "modelSouls": ["claude-opus-5-5=reviewer", "claude-*=faye"],
         "timeaware": true
       }
     }
@@ -151,9 +152,11 @@ Uses the same `~/.agents/souls/` souls (`<name>.md`, or `<name>/SOUL.md` with an
 }
 ```
 
-`pi-souls@inline` is the key for `--plugin-dir`; a marketplace installation uses `pi-souls@<marketplace>` instead. Values come directly from Claude's official plugin configuration, with no separate souls settings file. `modelSouls` is a string list of exact `model=soul` entries; malformed entries warn once per session and are ignored individually. If a model appears more than once, the last valid entry wins.
+`pi-souls@inline` is the key for `--plugin-dir`; a marketplace installation uses `pi-souls@<marketplace>` instead. Values come directly from Claude's official plugin configuration, with no separate souls settings file. `modelSouls` is a string list of `model=soul` entries; malformed entries warn once per session and are ignored individually. Exact matches win over wildcards; otherwise the first matching wildcard in configuration order wins. Only `*` is special, as in Pi. A repeated key keeps its original position and its last valid soul value, preserving last-valid-wins behavior for duplicate exact entries.
 
-Precedence: `SOULLESS=1` / `true` > exact requested Claude model ID in `modelSouls` > `defaultSoul` > Claude default. Model IDs have no Pi provider prefix. Pi's own settings remain unchanged. File reads use the mods API, without a helper process or build step.
+Precedence: `SOULLESS=1` / `true` > exact requested Claude model ID in `modelSouls` > first matching wildcard > `defaultSoul` > Claude default. Claude keys are model IDs without Pi's provider prefix. Pi's own settings remain unchanged.
+
+The installed plugin is self-contained: it does not need the root checkout, `node_modules`, or an installation-time build. Its checked-in content helper bundles Liquid and the actual upstream frontmatter parser, not the Pi SDK barrel. Maintainers run `npm ci --ignore-scripts && npm run build:claude` after changing shared content or matching code; this also generates the sandbox entry from the shared matcher. Generated files must be committed, not edited by hand. Content loading and perception execution remain separate processes.
 
 The mod sends the same hidden transition reminder through `prompt.submit` context, which the engine wraps, and keeps a transient per-session baseline. A soul line appears only after `prompt.compose` actually replaced the opening for that model; a frozen prompt, a skipped compose, or `--system-prompt` leaves the last evidenced soul in place. The brain line still reports. Command/meta prompts, dropped prompts, and downstream-stripped context do not consume it.
 
@@ -167,4 +170,4 @@ Limitations:
 - `--system-prompt` overrides the soul. `--append-system-prompt` still appends normally.
 - An organization's managed settings can prevent installed mods from handling prompt events. `--bare` doesn't load this mod.
 
-Checks: `npm test`, `npm run typecheck`, and `claude plugin validate plugins/claude --strict --json`. The vendored `types/claude-code.d.ts` is the declaration generated by Claude Code 2.1.299.
+Checks: `npm run build:claude`, `npm test`, `npm run typecheck`, and `claude plugin validate plugins/claude --strict --json`. Tests execute the generated helper and hooks from a standalone plugin copy outside the checkout. The build resolves the installed Pi SDK entry to its adjacent frontmatter utility; a moved utility fails the build instead of falling back to a copied parser. The vendored `types/claude-code.d.ts` is the declaration generated by Claude Code 2.1.299.

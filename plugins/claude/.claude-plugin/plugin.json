@@ -4,6 +4,12 @@
   "description": "Souls with model-specific defaults for Claude Code.",
   "author": { "name": "AstroSheep" },
   "userConfig": {
+    "soulsDir": {
+      "type": "string",
+      "default": "~/.agents/souls",
+      "title": "Souls directory",
+      "description": "Soul files and directories; relative paths resolve from the session working directory."
+    },
     "timeaware": {
       "type": "boolean",
       "default": true,
@@ -20,7 +26,7 @@
       "multiple": true,
       "default": [],
       "title": "Model souls",
-      "description": "Exact model=soul entries, such as claude-opus-5-5=faye."
+      "description": "Model=soul entries, such as claude-opus-5-5=faye or claude-*=reviewer. Exact matches win, then the first matching wildcard."
     }
   }
 }

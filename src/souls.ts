@@ -1,48 +1,19 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import { parseFrontmatter, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { Liquid } from "liquidjs";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { PERCEPTION_MESSAGE_TYPE } from "./perception.ts";
+import type { SoulConfig } from "./soul-content.ts";
+import { isSoulName, matchingModelKey } from "./soul-selection.ts";
+
+export { listSouls, loadSoul, readConfig, readSoul, soulFile, soulPerceptionPath, type SoulConfig, type SoulFile, type SoulVariables } from "./soul-content.ts";
+export { isSoulName } from "./soul-selection.ts";
 
 export const ENTRY_TYPE = "pi-souls:selection";
-export interface SoulFile {
-  body: string;
-  icon?: string;
-}
-export interface SoulConfig {
-  defaultSoul?: unknown;
-  modelSouls: Record<string, unknown>;
-  dir: string;
-  timeaware: boolean;
-}
 export interface Selection {
   name: string;
   source: "session" | "model" | "default";
 }
-export interface SoulVariables {
-  model: { provider: string; id: string };
-  cwd: string;
-}
-
-const EMPTY_VARIABLES: SoulVariables = { model: { provider: "", id: "" }, cwd: "" };
-
-export function isSoulName(value: unknown): value is string {
-  return typeof value === "string" && /^[\p{L}\p{N}_-][\p{L}\p{N}_.-]*$/u.test(value);
-}
 
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Only the shape is checked here; soul names are checked when used, so one bad entry never disables the rest. */
-export function readConfig(settings: unknown, cwd: string): SoulConfig {
-  if (!object(settings)) throw new Error("Invalid Pi settings");
-  const { defaultSoul, modelSouls = {}, soulsDir = "~/.agents/souls" } = settings;
-  if (!object(modelSouls)) throw new Error("modelSouls must be an object");
-  if (typeof soulsDir !== "string" || !soulsDir.trim()) throw new Error("soulsDir must be a path");
-  const dir = soulsDir === "~" || soulsDir.startsWith("~/") ? join(homedir(), soulsDir.slice(2)) : resolve(cwd, soulsDir);
-  return { defaultSoul, modelSouls, dir, timeaware: settings.timeaware !== false };
 }
 
 /** Keys that can never match a model; surfaced by /soul instead of failing every request. */
@@ -102,13 +73,10 @@ export function resolveSoul(config: SoulConfig, override: SoulOverride, model?: 
   if (override) return { name: override, source: "session" };
   if (soulless) return undefined;
   const key = model && `${model.provider}/${model.id}`;
-  if (key && Object.hasOwn(config.modelSouls, key)) return named(config.modelSouls[key], "model", `modelSouls["${key}"]`);
   if (key) {
-    for (const [pattern, name] of Object.entries(config.modelSouls)) {
-      if (!pattern.includes("*") || !/^[^/]+\/.+$/.test(pattern)) continue;
-      const escaped = pattern.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*");
-      if (new RegExp(`^${escaped}$`).test(key)) return named(name, "model", `modelSouls["${pattern}"]`);
-    }
+    const keys = Object.keys(config.modelSouls).filter((pattern) => pattern === key || /^[^/]+\/.+$/.test(pattern));
+    const match = matchingModelKey(key, keys);
+    if (match !== undefined) return named(config.modelSouls[match], "model", `modelSouls["${match}"]`);
   }
   if (config.defaultSoul !== undefined) return named(config.defaultSoul, "default", "defaultSoul");
   return undefined;
@@ -117,72 +85,4 @@ export function resolveSoul(config: SoulConfig, override: SoulOverride, model?: 
 /** A settings soul is only a default: the user's explicit system prompt outranks it, a session choice does not. */
 export function effectiveSoul(selection: Selection | undefined, customPrompt: string | undefined): Selection | undefined {
   return selection?.source === "session" || !customPrompt ? selection : undefined;
-}
-
-/** A single file soul is `<name>.md`; a directory soul is `<name>/SOUL.md` plus whatever it keeps beside it. */
-export function soulFile(dir: string, name: string): { path: string; root: string[] } {
-  const nested = join(dir, name, "SOUL.md");
-  if (existsSync(nested)) return { path: nested, root: [join(dir, name), dir] };
-  return { path: join(dir, `${name}.md`), root: [dir] };
-}
-
-const PERCEPTION_EXTENSIONS = [".ts", ".mjs", ".js"] as const;
-
-/** The executable perception of a directory soul, if it ships one. */
-export function soulPerceptionPath(dir: string, name: string): string | undefined {
-  if (!isSoulName(name)) return undefined;
-  for (const extension of PERCEPTION_EXTENSIONS) {
-    const path = join(dir, name, `perception${extension}`);
-    if (existsSync(path)) return path;
-  }
-  return undefined;
-}
-
-/** File souls and directory souls are one list of names, sorted once. */
-export function listSouls(dir: string): string[] {
-  let entries;
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-  const names = new Set<string>();
-  for (const entry of entries) {
-    const name = entry.isDirectory() ? entry.name : entry.name.endsWith(".md") ? entry.name.slice(0, -3) : undefined;
-    if (name === undefined || !isSoulName(name)) continue;
-    if (entry.isDirectory() ? existsSync(join(dir, name, "SOUL.md")) : entry.isFile()) names.add(name);
-  }
-  return [...names].sort();
-}
-
-/** Small local files are read fresh; no cache invalidation protocol or watchers needed. */
-export function readSoul(dir: string, name: string, variables: SoulVariables = EMPTY_VARIABLES): SoulFile {
-  if (!isSoulName(name)) throw new Error(`Invalid soul name: ${name}`);
-  const { path, root } = soulFile(dir, name);
-  let text: string;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") throw new Error(`Soul "${name}" not found: ${path}`);
-    throw new Error(`Soul "${name}" unreadable: ${path} (${code ?? String(error)})`);
-  }
-  const parsed = parseFrontmatter<Record<string, unknown>>(text);
-  // A directory soul renders from its own folder first, so `parts/` next to it wins over the shared one.
-  const engine = new Liquid({ root, extname: ".md", strictVariables: true, strictFilters: true, globals: variables });
-  let body: string;
-  try {
-    body = engine.renderSync(engine.parse(parsed.body, path)).trim();
-  } catch (error) {
-    throw new Error(`Soul "${name}" template: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (!body) throw new Error(`Soul "${name}" is empty`);
-  const raw = object(parsed.frontmatter) ? parsed.frontmatter.icon : undefined;
-  const icon = typeof raw === "string" ? raw.trim() : "";
-  return { body, ...(icon ? { icon } : {}) };
-}
-
-export function loadSoul(dir: string, name: string, variables?: SoulVariables): string {
-  return readSoul(dir, name, variables).body;
 }

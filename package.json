@@ -15,6 +15,7 @@
   },
   "files": [
     "src",
+    "plugins/claude",
     "README.md"
   ],
   "pi": {
@@ -26,6 +27,9 @@
     "node": ">=22.18"
   },
   "scripts": {
+    "build:claude": "node scripts/build-claude.mjs",
+    "pretest": "npm run build:claude",
+    "prepack": "npm run build:claude",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check:load": "pi --no-extensions -e ./src/index.ts --list-models __load_check__"
@@ -41,6 +45,7 @@
     "@earendil-works/pi-coding-agent": "1.1.0",
     "@earendil-works/pi-tui": "1.1.0",
     "@types/node": "^22.0.0",
+    "esbuild": "^0.28.2",
     "typescript": "^6.0.3"
   },
   "dependencies": {

@@ -1,9 +1,11 @@
 import type { EngineInterface, On, PluginOptions } from "claude-code";
+import { isSoulName, matchingModelKey } from "../../../src/soul-selection.ts";
 
-type Engine = Pick<EngineInterface, "fs" | "env" | "session" | "ui" | "clock" | "process">;
+type Engine = Pick<EngineInterface, "env" | "session" | "ui" | "clock" | "process">;
 
-/** Executed by the host's `node`, never loaded here: this sandbox has no dynamic import and no Node. */
+/** Executed by the host's `node`, never loaded by the sandbox. */
 const RUNNER = `${import.meta.dir}/perception-runner.mjs`;
+const SOULS_RUNNER = `${import.meta.dir}/souls-runner.cjs`;
 
 /** How the host saw a tool call; a perception module reads this instead of parsing tool names. */
 type ToolCategory = "reading" | "running" | "writing" | "other";
@@ -73,25 +75,30 @@ function timePerception(lastNoteAt?: number): Perception {
   };
 }
 
-function isName(value: unknown): value is string {
-  return typeof value === "string" && /^[\p{L}\p{N}_-][\p{L}\p{N}_.-]*$/u.test(value);
-}
 async function homeDir($: Engine): Promise<string | undefined> {
   return await $.env.get("HOME") ?? await $.env.get("USERPROFILE");
 }
-/** A directory soul is `<name>/SOUL.md`; a single-file soul stays `<name>.md`. */
-async function load($: Engine, name: string): Promise<string> {
-  if (!isName(name)) throw new Error(`Invalid soul: ${name}`);
-  const home = await homeDir($);
-  if (!home) throw new Error("Home directory unavailable");
-  const nested = `${home}/.agents/souls/${name}/SOUL.md`;
-  const path = await $.fs.exists(nested) ? nested : `${home}/.agents/souls/${name}.md`;
-  if (!await $.fs.exists(path)) throw new Error(`Soul "${name}" not found`);
-  const text = await $.fs.read(path);
-  // Strip only a leading, closed YAML frontmatter block; no YAML runtime is needed.
-  const body = text.replace(/^\uFEFF?---\r?\n(?:[\s\S]*?\r?\n)?---(?:\r?\n|$)/, "").trim();
-  if (!body) throw new Error(`Soul "${name}" is empty`);
-  return body;
+
+/** Only JSON crosses the process boundary; installed plugins carry their own dependencies. */
+async function soulFiles<T>($: Engine, options: PluginOptions, task: Record<string, unknown>): Promise<T> {
+  const { exitCode, stdout, isStdoutTruncated } = await $.process.run(
+    ["node", SOULS_RUNNER, JSON.stringify({ ...task, soulsDir: options.soulsDir, cwd: await $.session.cwd() })],
+    { timeoutMs: 10_000 },
+  );
+  if (isStdoutTruncated) throw new Error("Soul helper output was truncated");
+  const result = JSON.parse(stdout);
+  if (exitCode !== 0) throw new Error(typeof result.error === "string" ? result.error : "Soul helper failed");
+  return result as T;
+}
+
+interface SoulContent {
+  dir: string;
+  body: string;
+  icon?: string;
+}
+
+async function load($: Engine, options: PluginOptions, name: string, model: string): Promise<SoulContent> {
+  return soulFiles<SoulContent>($, options, { op: "read", name, model: { provider: "", id: model } });
 }
 
 /** Keep leading whitespace and the first paragraph's exact separator and suffix. */
@@ -109,16 +116,17 @@ async function warnOnce($: Engine, reported: Set<string>, message: string) {
   $.ui.log(`Soul: ${message}`);
 }
 async function select($: Engine, options: PluginOptions, model: string, reported: Set<string>): Promise<string | undefined> {
-  let name = options.defaultSoul as string | undefined;
+  const mappings = new Map<string, string>();
   for (const entry of (options.modelSouls ?? []) as readonly string[]) {
     const match = /^([^=\s]+)=([^=]+)$/.exec(entry);
-    if (!match || !isName(match[2])) {
+    if (!match || !isSoulName(match[2])) {
       await warnOnce($, reported, `Ignoring invalid model entry: ${JSON.stringify(entry)} (expected model=soul)`);
       continue;
     }
-    if (match[1] === model) name = match[2];
+    mappings.set(match[1]!, match[2]);
   }
-  return name || undefined;
+  const key = matchingModelKey(model, [...mappings.keys()]);
+  return key === undefined ? (options.defaultSoul as string | undefined) || undefined : mappings.get(key);
 }
 
 interface Identity {
@@ -188,15 +196,9 @@ function categoryOf(toolName: string): ToolCategory {
   return Object.hasOwn(CATEGORIES, toolName) ? CATEGORIES[toolName]! : "other";
 }
 
-/** A directory soul's executable perception, when it ships one. */
-async function perceptionPath($: Engine, name: string): Promise<string | undefined> {
-  const home = await homeDir($);
-  if (!home) return undefined;
-  for (const extension of [".ts", ".mjs", ".js"]) {
-    const path = `${home}/.agents/souls/${name}/perception${extension}`;
-    if (await $.fs.exists(path)) return path;
-  }
-  return undefined;
+/** Discovery shares the configured directory and extension precedence with Pi. */
+async function perceptionPath($: Engine, options: PluginOptions, name: string): Promise<string | undefined> {
+  return (await soulFiles<{ path?: string }>($, options, { op: "perception", name })).path;
 }
 
 function utterance(value: unknown): Utterance | undefined {
@@ -224,9 +226,9 @@ async function worldFor($: Engine, name: string, absenceMs?: number): Promise<Wo
  * Run one soul's `perception(moment, world)` in a Node child process: the sandbox has
  * no dynamic import, and a broken module must never break the host's request.
  */
-async function perceive($: Engine, name: string, moment: Moment, world: World): Promise<Utterance | undefined> {
+async function perceive($: Engine, options: PluginOptions, name: string, moment: Moment, world: World): Promise<Utterance | undefined> {
   try {
-    const path = await perceptionPath($, name);
+    const path = await perceptionPath($, options, name);
     if (!path) return undefined;
     const { exitCode, stdout } = await $.process.run(
       ["node", "--experimental-strip-types", RUNNER, path, JSON.stringify({ moment, world })],
@@ -277,7 +279,7 @@ async function toolNote($: Engine, options: PluginOptions, reported: Set<string>
     const filePath = toolPath(input);
     const detail = toolText(input);
     const seen = toolText(output);
-    return await perceive($, name, {
+    return await perceive($, options, name, {
       kind: "tool", phase: "after", category: categoryOf(toolName), toolName,
       ...(filePath ? { filePath } : {}), ...(detail ? { input: detail } : {}), ...(seen ? { output: seen } : {}), ok,
     }, await worldFor($, name, await absence($, promptStates)));
@@ -307,7 +309,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const name = await soulName($, options, reported);
       if (!name) return result;
       const absenceMs = typeof e.seconds_since_last_response === "number" ? e.seconds_since_last_response * 1000 : undefined;
-      return withContext(result, await perceive($, name, { kind: "wake", source: e.source }, await worldFor($, name, absenceMs)));
+      return withContext(result, await perceive($, options, name, { kind: "wake", source: e.source }, await worldFor($, name, absenceMs)));
     } catch {
       return result;
     }
@@ -321,7 +323,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const args = toolArgs(e);
       const filePath = toolPath(args);
       const input = toolText(args);
-      return withContext(result, await perceive($, name, {
+      return withContext(result, await perceive($, options, name, {
         kind: "tool", phase: "before", category: categoryOf(e.tool), toolName: e.tool,
         ...(filePath ? { filePath } : {}), ...(input ? { input } : {}),
       }, await worldFor($, name, await absence($, promptStates))));
@@ -353,7 +355,8 @@ export function register(on: On, options: PluginOptions = {}) {
         await warnOnce($, reported, "Skipped: no matching opening paragraph");
         return result;
       }
-      const text = replaceIdentity(section.text, await load($, name));
+      const soul = await load($, options, name, e.model);
+      const text = replaceIdentity(section.text, soul.body);
       if (text === undefined) {
         await warnOnce($, reported, "Skipped: no matching opening paragraph");
         return result;
@@ -379,7 +382,7 @@ export function register(on: On, options: PluginOptions = {}) {
     try {
       const name = await soulName($, options, reported);
       if (name) {
-        await load($, name);
+        await load($, options, name, await $.session.model());
         const world = await worldFor($, name);
         const state = promptStates.get(world.sessionId);
         if (state?.humanAt !== undefined) world.absenceMs = Math.max(0, world.now - state.humanAt);
@@ -389,7 +392,7 @@ export function register(on: On, options: PluginOptions = {}) {
           timeSaid = timePerception(state?.noteAt)(moment, world);
           if (timeSaid) notes.push(timeSaid.text);
         }
-        const said = await perceive($, name, moment, world);
+        const said = await perceive($, options, name, moment, world);
         if (said) notes.push(said.text);
       }
     } catch {

@@ -5,6 +5,7 @@
     "types": [],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
