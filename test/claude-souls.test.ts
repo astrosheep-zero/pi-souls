@@ -1,631 +1,319 @@
 /// <reference path="../plugins/claude/types/claude-code.d.ts" />
+/// <reference path="../plugins/claude/types/sandbox.d.ts" />
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { after, test } from "node:test";
-import { pathToFileURL } from "node:url";
-import { readSoul } from "../src/soul-content.ts";
-import type { SoulTask } from "../src/claude-souls-runner.ts";
-import type { EngineInterface, On, PluginOptions, PromptComposeResult, PromptSubmitInput, PromptSubmitResult } from "claude-code";
+import { encodeChoice, readClaudeSession, type SoulChoice } from "../src/claude-session.ts";
+import { openingParagraph, register, retainedMessages } from "../plugins/claude/hooks/register.ts";
+import type { On, PromptComposeResult, SessionMessage } from "claude-code";
 
-const HOOKS = join(import.meta.dirname, "..", "plugins", "claude", "hooks");
+type Hook = ($: any, event: any, next: any) => any;
+type HookEntry = { event: string; matcher?: Record<string, unknown>; hook: Hook };
+type SoulFile = { body: string; icon?: string };
 
-/** Load the shipped entry with the loader's `import.meta.dir`, outside the checkout. */
-async function loadHooks(prefix = "pi-souls hooks ") {
-  const root = mkdtempSync(join(tmpdir(), prefix));
-  const hooks = join(root, "plugin", "hooks");
-  cpSync(join(HOOKS, ".."), join(root, "plugin"), { recursive: true });
-  const source = readFileSync(join(hooks, "register.js"), "utf8");
-  writeFileSync(join(hooks, "register.mjs"), `import.meta.dir = ${JSON.stringify(hooks)};\n${source}`);
-  return { root, hooks, ...(await import(pathToFileURL(join(hooks, "register.mjs")).href)) };
-}
+const roots: string[] = [];
+after(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
 
-const plugin = await loadHooks();
-const { register, replaceIdentity } = plugin;
-after(() => rmSync(plugin.root, { recursive: true, force: true }));
+const NATIVE = "\nYou are the native agent.\n\nIMPORTANT: Keep every native rule.\n";
+const GUIDANCE = "Original session guidance.";
 
-// Exercise the shipped hooks and real helper processes; only the host API is stubbed.
-type Hook = ($: EngineInterface, event: any, next: any) => Promise<any>;
-function processRunner(env: Map<string, string>) {
-  return async (argv: readonly string[], init?: { cwd?: string; timeoutMs?: number }) => {
-    const child = spawnSync(argv[0]!, argv.slice(1), {
-      encoding: "utf8", cwd: init?.cwd, timeout: init?.timeoutMs ?? 20_000,
-      env: { ...process.env, ...Object.fromEntries(env), NODE_PATH: "" },
+/**
+ * Exercise the real hooks module with only the engine boundary stubbed. The
+ * in-memory transcript is read back through the real readClaudeSession().
+ */
+function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "pi-souls-hooks-"));
+  roots.push(root);
+  const souls = new Map<string, SoulFile>(Object.entries(options.souls ?? {
+    A: { body: "You are soul A.", icon: "✦" },
+    B: { body: "You are soul B." },
+  }));
+
+  const hooks: HookEntry[] = [];
+  const transcript: any[] = [];
+  const statuses: (string | undefined)[] = [];
+  const invalidations: string[] = [];
+  const logs: string[] = [];
+  const commands: any[] = [];
+  const sectionResults: { name: string; text: string | null }[] = [];
+  let seq = 0;
+  let lastUuid: string | undefined;
+  let now = Date.UTC(2026, 10, 17, 11, 30, 0);
+  let denyNote: string | undefined;
+  let pendingAppend: { message: any; uuid: string } | undefined;
+
+  const jsonl = () => transcript.map((row) => JSON.stringify(row)).join("\n") + (transcript.length ? "\n" : "");
+
+  const rowFor = (message: any, uuid: string, parentUuid: string | null) => {
+    const at = new Date(now += 1000).toISOString();
+    const base = { uuid, parentUuid, timestamp: at, isSidechain: false };
+    if (message.type === "system") {
+      return { ...base, type: "system", subtype: message.subtype ?? "informational", content: message.content.map((block: any) => block.text ?? "").join("") };
+    }
+    if (message.type === "attachment") return { ...base, type: "attachment", attachment: message.attachment };
+    return { ...base, type: message.type, message: { role: message.type, content: message.content, ...(message.model ? { model: message.model } : {}) } };
+  };
+
+  function save(message: any, uuid: string) {
+    const parentUuid = lastUuid ?? null;
+    lastUuid = uuid;
+    transcript.push(rowFor(message, uuid, parentUuid));
+    return { message, uuid };
+  }
+
+  const append = async (message: any, door: string, origin: any = { kind: "plugin", name: "pi-souls" }) => {
+    if (door === "note" && denyNote !== undefined) return { deny: denyNote };
+    const uuid = `row-${++seq}`;
+    pendingAppend = { message, uuid };
+    const event = { message, door, origin, uuid };
+    const result = await invoke("session.append", event, async (e) => {
+      pendingAppend = undefined;
+      return save(e.message, e.uuid);
     });
-    return { exitCode: child.status ?? 1, stdout: child.stdout ?? "", stderr: child.stderr ?? "", isStdoutTruncated: false, isStderrTruncated: false };
+    return result ?? pendingAppend;
   };
-}
-function host(options: PluginOptions = { defaultSoul: "faye", modelSouls: ["claude-test=reviewer"], timeaware: false }) {
-  const home = mkdtempSync(join(tmpdir(), "claude-souls-"));
-  after(() => rmSync(home, { recursive: true, force: true }));
-  const dir = join(home, ".agents", "souls");
-  const write = (name: string, text: string) => {
-    const path = join(dir, name);
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, text);
-  };
-  write("faye.md", "---\nname: Faye\n---\nYou are Faye. $&\n\nKeep your own voice.\n");
-  write("reviewer.md", "You are a reviewer.");
-  const hooks = new Map<string, Hook>();
-  const env = new Map<string, string>([["HOME", home]]);
-  const warnings: string[] = [];
-  let now = new Date(2026, 9, 27, 2, 14, 0).getTime();
-  let sessionId = "session-a";
-  let currentModel = "claude-other";
+
   const $ = {
-    clock: { now: async () => now },
-    env: { get: async (key: string) => env.get(key) },
-    process: { run: processRunner(env) },
+    clock: { now: async () => now, sleep: async () => {} },
+    env: { get: async () => undefined },
     session: {
-      id: async () => sessionId,
-      model: async () => currentModel,
-      cwd: async () => "/work",
+      id: async () => "session-a",
+      model: async () => "claude-opus-5-5",
+      cwd: async () => root,
+      append: async ({ message }: { message: any }) => append(message, "note"),
     },
-    ui: { log: (text: string) => { warnings.push(text); } },
-  } as unknown as EngineInterface;
-  register(((event: string, hook: Hook) => { hooks.set(event, hook); }) as unknown as On, options);
-  assert.deepEqual([...hooks.keys()], [
-    "classic.SessionStart", "classic.PreToolUse", "classic.PostToolUse", "classic.PostToolUseFailure",
-    "prompt.compose", "prompt.submit", "session.end",
-  ]);
-  const compose = (result: PromptComposeResult, lean = false, model = "claude-other"): Promise<PromptComposeResult> =>
-    hooks.get("prompt.compose")!($, { model, traits: lean ? ["lean"] : [] }, async () => result);
-  const submit = (
-    overrides: Partial<PromptSubmitInput> & { drop?: boolean; strip?: boolean; reject?: boolean } = {},
-    next: (e: PromptSubmitInput) => Promise<PromptSubmitResult> = async (e) => ({ text: e.text, context: e.context, origin: e.origin }),
-  ): Promise<PromptSubmitResult> =>
-    hooks.get("prompt.submit")!($, { text: "hello", wait: false, origin: { kind: "composer" }, ...overrides }, async (e: any) => {
-      if (overrides.reject) throw new Error("blocked");
-      if (overrides.drop) return { drop: "no" };
-      if (overrides.strip) return { text: e.text, context: overrides.context, origin: e.origin };
-      return next(e);
-    });
-  const end = () => hooks.get("session.end")!($, {}, async (e: any) => e);
-  return {
-    home, dir, write, remove: (name: string) => rmSync(join(dir, name)), env, warnings, compose, submit, end, options,
-    setNow: (value: number) => { now = value; },
-    getNow: () => now,
-    setSession: (id: string) => { sessionId = id; },
-    setModel: (model: string) => { currentModel = model; },
-    setSessionModel: (model: string) => { currentModel = model; },
+    ui: {
+      log: (text: string) => logs.push(text),
+      status: (text: string | undefined) => statuses.push(text),
+      invalidate: (surface: string) => invalidations.push(surface),
+    },
+    process: {
+      run: async (argv: readonly string[]) => {
+        const task = JSON.parse(argv.at(-1)!);
+        if (task.op === "list") return { exitCode: 0, stdout: JSON.stringify({ dir: root, names: [...souls.keys()] }), isStdoutTruncated: false };
+        if (task.op === "read") {
+          const soul = souls.get(task.name);
+          return soul
+            ? { exitCode: 0, stdout: JSON.stringify({ dir: root, ...soul }), isStdoutTruncated: false }
+            : { exitCode: 1, stdout: JSON.stringify({ error: `Soul "${task.name}" not found` }), isStdoutTruncated: false };
+        }
+        if (task.op === "session") {
+          return { exitCode: 0, stdout: JSON.stringify(readClaudeSession(jsonl(), task.headUuid, task.handles, task.sessionId)), isStdoutTruncated: false };
+        }
+        return { exitCode: 1, stdout: JSON.stringify({ error: "unsupported test task" }), isStdoutTruncated: false };
+      },
+    },
+    prompt: { compose: async () => compose() },
+    command: { register: async (spec: any) => { commands.push(spec); return { name: spec.name }; } },
   };
-}
-const original: PromptComposeResult = {
-  sections: Object.freeze([
-    Object.freeze({ id: "intro", text: "\nYou are a coding agent.\n\nIMPORTANT: Keep this.\n", scope: "shared" as const }),
-    Object.freeze({ id: "tools", text: "Tools untouched", scope: "shared" as const }),
-    Object.freeze({ id: "rules", text: "Project rules untouched", scope: "session" as const }),
-  ]),
-};
 
-test("Claude default and lean replace only the opening paragraph, preserving every other character", async () => {
-  const h = host();
-  const before = structuredClone(original);
-  const output = await h.compose(original);
-  assert.deepEqual(original, before);
-  assert.equal(output.sections[0].text, "\nYou are Faye. $&\n\nKeep your own voice.\n\nIMPORTANT: Keep this.\n");
-  assert.equal(output.sections[1], original.sections[1]);
-  assert.equal(output.sections[2], original.sections[2]);
-  const lean = { sections: [{ ...original.sections[0], id: "lean_body", text: "You are a lean agent.\r\n \r\nRules\r\n" }, ...original.sections.slice(1)] };
-  const leanOutput = await h.compose(lean, true);
-  assert.equal(leanOutput.sections[0].text, "You are Faye. $&\n\nKeep your own voice.\r\n \r\nRules\r\n");
-  assert.equal(leanOutput.sections[1], lean.sections[1]);
-  assert.equal(replaceIdentity("You are an agent.", "Soul"), "Soul");
-  assert.equal(replaceIdentity("Rules first.\n\nYou are later.", "Soul"), undefined);
-});
-
-test("Claude missing or changed opening falls back unchanged and warns once, not per request", async () => {
-  const h = host();
-  const changed = { sections: [{ ...original.sections[0], text: "Changed opening\n\nKeep all of it" }] };
-  const missing = { sections: original.sections.slice(1) };
-  for (const input of [changed, changed, missing, original, changed]) {
-    const result = await h.compose(input);
-    if (input !== original) assert.equal(result, input);
+  async function invoke(event: string, eventObject: any, next: (e: any) => any, matcher?: Record<string, unknown>) {
+    for (const entry of hooks) {
+      if (entry.event !== event) continue;
+      if (entry.matcher && !Object.entries(entry.matcher).every(([key, value]) => eventObject[key] === value)) continue;
+      return await entry.hook($, eventObject, next);
+    }
+    return await next(eventObject);
   }
-  assert.equal(h.warnings.length, 1);
-  assert.doesNotMatch(h.warnings[0], /intro|lean_body/);
-});
 
-test("Claude SOULLESS > exact model > default; omitted options leave the prompt alone", async () => {
-  const h = host();
-  assert.equal((await h.compose(original, false, "claude-test")).sections[0].text, "\nYou are a reviewer.\n\nIMPORTANT: Keep this.\n");
-  assert.match((await h.compose(original, false, "claude-test-extra")).sections[0].text, /Faye/);
-  for (const value of ["1", "true"]) {
-    h.env.set("SOULLESS", value);
-    assert.equal(await h.compose(original, false, "claude-test"), original);
+  const on = ((event: string, matcherOrHook: any, maybeHook?: Hook) => {
+    const matcher = typeof matcherOrHook === "object" && matcherOrHook !== null ? matcherOrHook : undefined;
+    const hook = (typeof matcherOrHook === "function" ? matcherOrHook : maybeHook) as Hook;
+    hooks.push({ event, matcher, hook });
+  }) as unknown as On;
+  register(on, { timeaware: false, ...(options.defaultSoul ? { defaultSoul: options.defaultSoul } : {}) });
+
+  function sections(lean = false) {
+    return [
+      { id: lean ? "lean_body" : "intro", text: lean ? "\nYou are a lean native agent.\n\nLean rules.\n" : NATIVE, scope: "shared" as const, cursor: 0 },
+      { id: "tools", text: "Tools untouched.", scope: "shared" as const, cursor: 0 },
+      { id: "session_guidance", text: GUIDANCE, scope: "session" as const, cursor: 0 },
+      { id: "rules", text: "Rules untouched.", scope: "session" as const, cursor: 0 },
+    ];
   }
-  h.env.set("SOULLESS", "0");
-  assert.notEqual(await h.compose(original), original);
-  assert.equal(await host({}).compose(original), original);
-});
 
-test("Claude malformed model entries warn once and are ignored individually", async () => {
-  const h = host({ defaultSoul: "faye", modelSouls: ["bad-format", "claude-test=../escape", "claude-test=reviewer"] });
-  for (let i = 0; i < 2; i++) {
-    assert.match((await h.compose(original, false, "claude-test")).sections[0].text, /reviewer/);
-    assert.match((await h.compose(original)).sections[0].text, /Faye/);
+  async function compose(model = "claude-opus-5-5", lean = false): Promise<PromptComposeResult> {
+    const result = sections(lean).map((section) => ({ ...section }));
+    for (let index = 0; index < result.length; index++) {
+      const section = result[index]!;
+      const next = await invoke("prompt.section", { name: section.id, text: section.text }, async (e) => ({ text: e.text }));
+      sectionResults.push({ name: section.id, text: next.text });
+      if (next.text === null) result.splice(index--, 1);
+      else section.text = next.text;
+    }
+    return await invoke("prompt.compose", {
+      model, promptModel: model, surfaces: [], tools: [], outputStyle: null, traits: lean ? ["lean"] : [],
+    }, async () => ({ sections: result }));
   }
-  assert.equal(h.warnings.length, 2);
-  assert.ok(h.warnings.every((warning) => warning.includes("Ignoring invalid model entry")));
-});
 
-test("Claude unreadable/empty soul leaves core prompt intact and deduplicates the error", async () => {
-  const h = host();
-  h.write("faye.md", "---\nname: Faye\n---\n");
-  assert.equal(await h.compose(original), original);
-  assert.equal(await h.compose(original), original);
-  assert.equal(h.warnings.length, 1);
-  assert.match(h.warnings[0], /empty/);
-  h.write("faye.md", "You are repaired.");
-  assert.match((await h.compose(original)).sections[0].text, /repaired/);
-});
-
-test("Claude transition context is exact, separate per session, and quiet on the first prompt", async () => {
-  const h = host();
-  await h.compose(original); // host evidence: faye is actually in the prompt
-  assert.equal((await h.submit()).context, undefined); // baseline
-
-  h.setModel("claude-test");
-  await h.compose(original, false, "claude-test"); // host evidence: reviewer is now in the prompt
-  assert.deepEqual((await h.submit()).context, ["new brain: claude-test\nnew soul: reviewer"]);
-  assert.equal((await h.submit()).context, undefined);
-});
-
-test("Claude omits a soul cue when prompt.compose has no evidence it applied one", async () => {
-  const h = host();
-  await h.compose(original);
-  await h.submit(); // baseline faye
-
-  h.setModel("claude-test");
-  assert.deepEqual((await h.submit()).context, ["new brain: claude-test"]); // frozen snapshot: no compose evidence
-  assert.equal((await h.submit()).context, undefined);
-
-  await h.compose(original, false, "claude-test"); // now reviewer is actually composed
-  assert.deepEqual((await h.submit()).context, ["new soul: reviewer"]);
-});
-
-test("Claude does not trust a compose that skipped the opening or failed to load", async () => {
-  const h = host();
-  await h.compose(original);
-  await h.submit();
-  h.setModel("claude-test");
-
-  const changed = { sections: [{ ...original.sections[0], text: "Changed opening\n\nKeep all of it" }] };
-  assert.equal(await h.compose(changed, false, "claude-test"), changed);
-  assert.deepEqual((await h.submit()).context, ["new brain: claude-test"]);
-
-  h.write("reviewer.md", "You are repaired.");
-  assert.match((await h.compose(original, false, "claude-test")).sections[0].text, /repaired/);
-  assert.deepEqual((await h.submit()).context, ["new soul: reviewer"]);
-});
-
-test("Claude command, meta, drop and stripped context do not consume the cue", async () => {
-  const h = host();
-  await h.compose(original);
-  await h.submit();
-  h.setModel("claude-test");
-  await h.compose(original, false, "claude-test");
-
-  assert.equal((await h.submit({ command: { name: "compact", args: "" } })).context, undefined);
-  assert.equal((await h.submit({ isMeta: true })).context, undefined);
-  assert.deepEqual((await h.submit({ drop: true })).drop, "no");
-  await assert.rejects(h.submit({ reject: true }), /blocked/);
-  assert.equal((await h.submit({ strip: true })).context, undefined);
-  assert.deepEqual((await h.submit()).context, ["new brain: claude-test\nnew soul: reviewer"]);
-});
-
-test("Claude does not establish a baseline until the first prompt is accepted", async () => {
-  const dropped = host();
-  await dropped.compose(original);
-  assert.deepEqual((await dropped.submit({ drop: true })).drop, "no");
-  dropped.setModel("claude-test");
-  await dropped.compose(original, false, "claude-test");
-  assert.equal((await dropped.submit()).context, undefined); // accepted prompt is the baseline
-  dropped.setModel("claude-other");
-  await dropped.compose(original);
-  assert.deepEqual((await dropped.submit()).context, ["new brain: claude-other\nnew soul: faye"]);
-
-  const rejected = host();
-  await rejected.compose(original);
-  await assert.rejects(rejected.submit({ reject: true }), /blocked/);
-  rejected.setModel("claude-test");
-  await rejected.compose(original, false, "claude-test");
-  assert.equal((await rejected.submit()).context, undefined);
-});
-
-test("Claude keeps one baseline per session and clears it at session end", async () => {
-  const h = host();
-  await h.compose(original);
-  await h.submit();
-  h.setSession("session-b");
-  h.setModel("claude-test");
-  await h.compose(original, false, "claude-test");
-  assert.equal((await h.submit()).context, undefined);
-  h.setSession("session-a");
-  await h.compose(original, false, "claude-test");
-  assert.deepEqual((await h.submit()).context, ["new brain: claude-test\nnew soul: reviewer"]);
-  h.setSession("session-b");
-  assert.equal((await h.submit()).context, undefined);
-
-  await h.end();
-  h.setModel("claude-other");
-  await h.compose(original);
-  assert.equal((await h.submit()).context, undefined);
-});
-
-test("Claude never announces a soul that failed to compose", async () => {
-  const h = host({ defaultSoul: "faye", modelSouls: ["claude-broken=missing"], timeaware: false });
-  await h.compose(original);
-  await h.submit();
-  h.setModel("claude-broken");
-  assert.equal(await h.compose(original, false, "claude-broken"), original);
-  assert.deepEqual((await h.submit()).context, ["new brain: claude-broken"]);
-  h.write("missing.md", "You are missing.");
-  assert.match((await h.compose(original, false, "claude-broken")).sections[0].text, /missing/);
-  assert.deepEqual((await h.submit()).context, ["new soul: missing"]);
-});
-
-test("Claude timeaware: false disables time reminders without affecting soul projection", async () => {
-  const h = host({ defaultSoul: "faye", timeaware: false });
-  assert.deepEqual((await h.submit({ context: ["earlier"] })).context, ["earlier"]);
-  assert.match((await h.compose(original)).sections[0].text, /Faye/);
-});
-
-test("Claude prompt.submit refreshes the watch hourly by default and notes the human's absence only after >= 1h", async () => {
-  const h = host({ defaultSoul: "faye" });
-  const t0 = h.getNow();
-
-  // First prompt in session gets current time without double-wrapping <system-reminder>.
-  const first = await h.submit({ context: ["earlier"] });
-  assert.equal(first.context?.length, 2);
-  assert.equal(first.context?.[0], "earlier");
-  assert.equal(first.context![1], "⌚ 02:14 · Tue, Oct 27");
-
-  // Within 1 hour of the note: no time context, but the human's presence still advances.
-  h.setNow(t0 + 40 * 60_000);
-  const withinHour = await h.submit();
-  assert.equal(withinHour.context, undefined);
-
-  // 80m after the note: clock is due for a refresh, but the human spoke 40m ago — one-liner, no parenthetical.
-  h.setNow(t0 + 80 * 60_000);
-  const refresh = await h.submit();
-  assert.equal(refresh.context?.length, 1);
-  assert.equal(refresh.context![0], "⌚ 03:34 · Tue, Oct 27");
-
-  // 3 hours later with no prompt in between: clock due and human away — both lines.
-  h.setNow(t0 + 80 * 60_000 + 3 * 3_600_000);
-  const afterThreeHours = await h.submit();
-  assert.equal(afterThreeHours.context?.length, 1);
-  assert.match(afterThreeHours.context![0]!, /^⌚ .*\n\(3h since \*human\* was last present\)$/);
-
-  // Slash commands, meta prompts, dropped prompts, and soulless sessions do not inject or advance.
-  h.setNow(t0 + 10 * 3_600_000);
-  assert.equal((await h.submit({ command: { name: "help", args: "" } })).context, undefined);
-  assert.equal((await h.submit({ isMeta: true })).context, undefined);
-  h.env.set("SOULLESS", "1");
-  assert.equal((await h.submit()).context, undefined);
-  h.env.set("SOULLESS", "0");
-  const dropped = await h.submit({}, async () => ({ drop: "blocked" }));
-  assert.equal(dropped.drop, "blocked");
-  // Because the dropped prompt did not enter, the next accepted prompt still sees the gap.
-  const accepted = await h.submit();
-  assert.equal(accepted.context?.length, 1);
-  assert.match(accepted.context![0]!, /since \*human\* was last present\)$/);
-});
-
-test("Claude rejected, dropped, command and meta prompts preserve the clock and human absence", async () => {
-  for (const skipped of [{ reject: true }, { drop: true }, { command: { name: "help", args: "" } }, { isMeta: true }] as const) {
-    const h = host({ defaultSoul: "faye" });
-    const t0 = h.getNow();
-    await h.submit();
-    h.setNow(t0 + 2 * 3_600_000);
-    if ("reject" in skipped) await assert.rejects(h.submit(skipped), /blocked/);
-    else await h.submit(skipped);
-    h.setNow(t0 + 3 * 3_600_000);
-    assert.deepEqual((await h.submit()).context, ["⌚ 05:14 · Tue, Oct 27\n(3h since *human* was last present)"]);
-  }
-  const stripped = host({ defaultSoul: "faye" });
-  await stripped.submit({ strip: true });
-  assert.deepEqual((await stripped.submit()).context, ["⌚ 02:14 · Tue, Oct 27"]);
-});
-
-test("Claude unreadable souls do not emit a time note or consume human presence", async () => {
-  const h = host({ defaultSoul: "faye" });
-  const t0 = h.getNow();
-  await h.submit();
-  h.remove("faye.md");
-  h.setNow(t0 + 2 * 3_600_000);
-  assert.equal((await h.submit()).context, undefined);
-  h.write("faye.md", "You are repaired.");
-  h.setNow(t0 + 3 * 3_600_000);
-  assert.deepEqual((await h.submit()).context, ["⌚ 05:14 · Tue, Oct 27\n(3h since *human* was last present)"]);
-});
-
-test("Claude loads a directory soul and prefers its SOUL.md over a same-named file", async () => {
-  const h = host();
-  h.write("faye/SOUL.md", "---\nicon: \u{1F988}\n---\nYou are Directory Faye.");
-  assert.match((await h.compose(original)).sections[0].text, /Directory Faye/);
-  h.remove("faye/SOUL.md");
-  assert.match((await h.compose(original)).sections[0].text, /You are Faye/);
-});
-
-const PERCEPTION = `export function perception(moment, world) {
-  return { text: JSON.stringify({ moment, world }) };
-}
-`;
-
-// The perception path is a real file and a real child process: only the engine's IO is stubbed.
-function diskHost(perception: Record<string, string> | string, options: PluginOptions = { defaultSoul: "faye", timeaware: false }, pluginModule = plugin) {
-  const home = mkdtempSync(join(tmpdir(), "claude-perception-"));
-  const souls = join(home, ".agents", "souls", "faye");
-  mkdirSync(souls, { recursive: true });
-  writeFileSync(join(souls, "SOUL.md"), "You are Faye.");
-  for (const [name, text] of Object.entries(typeof perception === "string" ? { "perception.ts": perception } : perception)) writeFileSync(join(souls, name), text);
-  const hooks = new Map<string, Hook>();
-  const toasts: string[] = [];
-  const env = new Map<string, string>([["HOME", home]]);
-  let now = new Date(2026, 9, 27, 2, 14, 0).getTime();
-  const session = { id: "session-a", model: "claude-test", cwd: "/work" };
-  let clockReads = 0;
-  const $ = {
-    clock: { now: async () => { clockReads++; return now; } },
-    env: { get: async (key: string) => env.get(key) },
-    session: { id: async () => session.id, model: async () => session.model, cwd: async () => session.cwd },
-    ui: { log: () => {}, toast: (text: string) => { toasts.push(text); } },
-    process: { run: processRunner(env) },
-  } as unknown as EngineInterface;
-  pluginModule.register(((event: string, hook: Hook) => { hooks.set(event, hook); }) as unknown as On, options);
-  const classic = (name: string, event: Record<string, unknown>, answer: Record<string, unknown> = {}) =>
-    hooks.get(name)!($, event, async (_e: unknown) => ({ ...answer }));
-  return {
-    home, souls, toasts, env, session,
-    clockReads: () => clockReads,
-    fire: (name: string, event: Record<string, unknown>) => hooks.get(name)!($, { session_id: session.id, transcript_path: "", cwd: session.cwd, ...event }, async (x: any) => x),
-    classic,
-    compose: (model = session.model) => hooks.get("prompt.compose")!($, { model, traits: [] }, async () => original),
-    submit: (event: Partial<PromptSubmitInput> = {}) =>
-      hooks.get("prompt.submit")!($, { text: "hello", wait: false, origin: { kind: "composer" }, ...event }, async (x: any) => ({ text: x.text, context: x.context, origin: x.origin })),
-    at: (value: number) => { now = value; },
-    close: () => rmSync(home, { recursive: true, force: true }),
+  const h = {
+    transcript, statuses, invalidations, logs, commands, sectionResults,
+    souls,
+    deny(value: string | undefined) { denyNote = value; },
+    choice(): SoulChoice | undefined { return lastUuid ? readClaudeSession(jsonl(), lastUuid).choice : undefined; },
+    async start(source = "startup") {
+      await invoke("classic.SessionStart", {
+        hook_event_name: "SessionStart", source, session_id: "session-a", transcript_path: join(root, "transcript.jsonl"),
+      }, async (e) => e);
+      await invoke("session.start", { cwd: root }, async () => ({ cwd: root }));
+    },
+    compose,
+    async complete(token = "") {
+      return invoke("prompt.autocomplete", { text: `/soul ${token}`, start: 6, token }, async () => ({ suggestions: [] }));
+    },
+    async command(args: string) {
+      return await invoke("command.run", { command: "soul", args, origin: { kind: "composer" }, presentation: {} }, async () => ({ text: "" }));
+    },
+    async echo(args: string, echoed = args) {
+      return await append({
+        type: "user",
+        content: [{ type: "text", text: `<command-name>/soul</command-name><command-message>soul</command-message><command-args>${echoed}</command-args>` }],
+      }, "command", { kind: "composer" });
+    },
+    async assistant(text = "intermediate") {
+      return await append({ type: "assistant", model: "claude-opus-5-5", content: [{ type: "text", text }] }, "response", { kind: "model", model: "claude-opus-5-5" });
+    },
+    async prompt(text = "next prompt") {
+      return await append({ type: "user", content: [{ type: "text", text }] }, "prompt", { kind: "composer" });
+    },
+    snapshot(parts: string[]) {
+      const uuid = `row-${++seq}`;
+      const parentUuid = lastUuid ?? null;
+      lastUuid = uuid;
+      transcript.push({ uuid, parentUuid, timestamp: new Date(now += 1000).toISOString(), isSidechain: false, type: "attachment", attachment: { type: "prompt_snapshot", systemPrompt: parts } });
+    },
   };
+  return h;
 }
 
-const momentOf = (entry: string | undefined) => JSON.parse(entry!).moment;
+const choiceRows = (h: ReturnType<typeof host>) => h.transcript.filter((row) => row.type === "system" && row.content.startsWith("Soul choice:"));
 
-test("Claude runs the real perception runner from a plugin path with spaces, # and %", async () => {
-  const spaced = await loadHooks("pi-souls plugin #% ");
-  const h = diskHost(PERCEPTION, { defaultSoul: "faye", timeaware: false }, spaced);
-  try {
-    assert.ok(spaced.hooks.includes(" ") && spaced.hooks.includes("#") && spaced.hooks.includes("%"));
-    const result = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
-    assert.equal(result.additionalContext.length, 1);
-    assert.deepEqual(momentOf(result.additionalContext[0]), { kind: "wake", source: "startup" });
-  } finally {
-    h.close();
-    rmSync(spaced.root, { recursive: true, force: true });
-  }
-});
+test("native opening: only the first paragraph moves, and the slot carries body plus guidance", async () => {
+  assert.deepEqual(openingParagraph("\nYou are native.\r\n \r\nREST\r\n"), { body: "You are native.", rest: "\n\r\n \r\nREST\r\n" });
+  assert.equal(openingParagraph("Rules first.\n\nYou are later."), undefined);
 
-test("Claude wakes a directory soul's perception with the world it can see", async () => {
-  const h = diskHost(PERCEPTION);
-  try {
-    const result = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "resume", seconds_since_last_response: 120 });
-    assert.equal(result.additionalContext.length, 1);
-    assert.equal(h.toasts.length, 0);
-    const { moment, world } = JSON.parse(result.additionalContext[0]);
-    assert.deepEqual(moment, { kind: "wake", source: "resume" });
-    assert.equal(world.now, new Date(2026, 9, 27, 2, 14, 0).getTime());
-    assert.equal(world.sessionId, "session-a");
-    assert.equal(world.cwd, "/work");
-    assert.equal(world.absenceMs, 120_000);
-    assert.equal(world.storeDir, `${h.home}/.local/share/pi-souls/faye`);
-    assert.deepEqual([world.facts.hour, world.facts.night, world.facts.weekday, world.facts.weekend], [2, true, 2, false]);
-
-    // Nothing to resume: no absence is invented.
-    const fresh = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "clear" });
-    assert.equal(JSON.parse(fresh.additionalContext[0]).world.absenceMs, undefined);
-    assert.deepEqual(momentOf(fresh.additionalContext[0]), { kind: "wake", source: "clear" });
-  } finally { h.close(); }
-
-  // A plain ES module works the same way: the runner reads `perception` or the default export.
-  const esm = diskHost({ "perception.mjs": "export default (moment) => ({ text: `mjs:${moment.source}` });" });
-  try {
-    const result = await esm.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
-    assert.deepEqual(result.additionalContext, ["mjs:startup"]);
-  } finally { esm.close(); }
-});
-
-test("Claude loads a top-level CommonJS function export", async () => {
-  const h = diskHost({ "perception.js": "module.exports = function perception() { return { text: 'callable' }; };" });
-  try {
-    const result = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
-    assert.deepEqual(result.additionalContext, ["callable"]);
-  } finally { h.close(); }
-});
-
-test("Claude hands the human's prompt to the perception and appends what the model should read", async () => {
-  const h = diskHost(PERCEPTION);
-  try {
-    const result = await h.submit({ text: "what now", context: ["earlier"] });
-    assert.deepEqual(result.context?.slice(0, 1), ["earlier"]);
-    const said = JSON.parse(result.context!.at(-1)!);
-    assert.deepEqual(said.moment, { kind: "human", text: "what now" });
-    assert.equal(said.world.sessionId, "session-a");
-    assert.equal(h.toasts.length, 0);
-
-    // The next prompt learns how long the human was away.
-    h.at(new Date(2026, 9, 27, 2, 14, 0).getTime() + 90_000);
-    const next = await h.submit({ text: "again" });
-    assert.equal(JSON.parse(next.context!.at(-1)!).world.absenceMs, 90_000);
-  } finally { h.close(); }
-});
-
-test("Claude builtin and directory perceptions share the prompt's clock and absence", async () => {
-  const h = diskHost(PERCEPTION, { defaultSoul: "faye" });
-  try {
-    const t0 = new Date(2026, 9, 27, 2, 14, 0).getTime();
-    const first = await h.submit({ text: "first", context: ["host"] });
-    assert.deepEqual(first.context?.slice(0, 2), ["host", "⌚ 02:14 · Tue, Oct 27"]);
-    assert.deepEqual(JSON.parse(first.context![2]!).moment, { kind: "human", text: "first" });
-    assert.equal(JSON.parse(first.context![2]!).world.now, t0);
-    assert.equal(h.clockReads(), 1);
-    h.at(t0 + 2 * 3_600_000);
-    const later = await h.submit({ text: "back" });
-    assert.equal(later.context![0], "⌚ 04:14 · Tue, Oct 27\n(2h since *human* was last present)");
-    const { moment, world } = JSON.parse(later.context![1]!);
-    assert.deepEqual(moment, { kind: "human", text: "back" });
-    assert.equal(world.now, t0 + 2 * 3_600_000);
-    assert.equal(world.absenceMs, 2 * 3_600_000);
-    assert.equal(h.clockReads(), 2);
-    assert.ok(later.context!.every((text: string) => !text.includes("<system-reminder>")));
-    const withinHour = await h.submit();
-    assert.equal(withinHour.context!.length, 1); // The directory perception still speaks while time is throttled.
-    assert.equal(JSON.parse(withinHour.context![0]!).world.absenceMs, 0);
-  } finally { h.close(); }
-});
-
-test("Claude answers tool calls on both phases and keeps the host's own context", async () => {
-  const h = diskHost(PERCEPTION);
-  try {
-    const before = await h.classic("classic.PreToolUse", { tool: "Read", tool_use_id: "t1", file_path: "/work/a.md" }, { additionalContext: ["host"] });
-    assert.deepEqual(before.additionalContext[0], "host");
-    const pre = JSON.parse(before.additionalContext[1]);
-    assert.deepEqual(pre.moment, {
-      kind: "tool", phase: "before", category: "reading", toolName: "Read",
-      filePath: "/work/a.md", input: JSON.stringify({ file_path: "/work/a.md" }),
-    });
-
-    const after = await h.classic("classic.PostToolUse", {
-      hook_event_name: "PostToolUse", tool_name: "Edit", tool_input: { file_path: "/work/b.md", old_string: "a", new_string: "b" }, tool_response: "done", tool_use_id: "t2",
-    }, { additionalContext: ["host"] });
-    const post = JSON.parse(after.additionalContext[1]);
-    assert.equal(post.moment.phase, "after");
-    assert.equal(post.moment.category, "writing");
-    assert.equal(post.moment.filePath, "/work/b.md");
-    assert.equal(post.moment.output, "done");
-    assert.equal(post.moment.ok, true);
-
-    const failed = await h.classic("classic.PostToolUseFailure", {
-      hook_event_name: "PostToolUseFailure", tool_name: "Bash", tool_input: { command: "false" }, error: "exit 1", tool_use_id: "t3",
-    });
-    const fail = JSON.parse(failed.additionalContext[0]);
-    assert.deepEqual([fail.moment.phase, fail.moment.category, fail.moment.ok, fail.moment.output], ["after", "running", false, "exit 1"]);
-  } finally { h.close(); }
-});
-
-test("Claude keeps silence when soulless, without a perception, or the perception module is broken", async () => {
-  const soulless = diskHost(PERCEPTION);
-  try {
-    soulless.env.set("SOULLESS", "1");
-    const result = await soulless.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
-    assert.equal(result.additionalContext, undefined);
-    assert.equal((await soulless.submit()).context, undefined);
-  } finally { soulless.close(); }
-
-  const plain = diskHost({});
-  try {
-    assert.equal((await plain.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" })).additionalContext, undefined);
-  } finally { plain.close(); }
-
-  const broken = diskHost({ "perception.ts": "export const perception = () => { throw new Error('boom'); };" });
-  try {
-    assert.equal((await broken.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" })).additionalContext, undefined);
-    assert.equal((await broken.submit()).context, undefined);
-  } finally { broken.close(); }
-});
-
-test("Claude hooks typecheck without Node globals", () => {
-  const result = spawnSync(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "plugins/claude/tsconfig.json"], { encoding: "utf8" });
-  assert.ifError(result.error);
-  assert.equal(result.status, 0, result.stdout + result.stderr);
-});
-
-function runSoulTask(task: SoulTask, home = plugin.root) {
-  const child = spawnSync(process.execPath, [join(plugin.hooks, "souls-runner.cjs"), JSON.stringify(task)], {
-    encoding: "utf8", cwd: plugin.root, env: { ...process.env, HOME: home, NODE_PATH: "" }, timeout: 10_000,
-  });
-  assert.ifError(child.error);
-  return { status: child.status, value: JSON.parse(child.stdout) };
-}
-
-test("standalone helper matches Pi content, roots, icons and listing without checkout dependencies", () => {
-  for (let parent = plugin.root; ; parent = dirname(parent)) {
-    assert.equal(existsSync(join(parent, "node_modules")), false);
-    if (dirname(parent) === parent) break;
-  }
-  const cwd = join(plugin.root, "work #%");
-  const dir = join(cwd, "souls");
-  const write = (name: string, text: string) => {
-    const path = join(dir, name);
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, text);
-  };
-  write("alpha.md", "Flat {{ model.id }} @ {{ cwd }}");
-  write("faye.md", "Flat loses");
-  write("faye/SOUL.md", "\uFEFF---\r\nicon: ' 🦈 '\r\n---\r\n{% if model.provider == '' %}Unknown provider{% endif %}\r\n{% include 'parts/local' %}\r\n{% render 'parts/shared' %}");
-  write("faye/parts/local.md", "Local {{ model.id }} @ {{ cwd }}");
-  write("parts/local.md", "Shared loses");
-  write("parts/shared.md", "Shared {{ model.id }} @ {{ cwd }}");
-  mkdirSync(join(dir, "incomplete"));
-  const variables = { model: { provider: "", id: "claude-requested" }, cwd };
-  for (const name of ["alpha", "faye"]) {
-    const result = runSoulTask({ op: "read", soulsDir: "souls", name, ...variables });
-    assert.equal(result.status, 0);
-    assert.deepEqual(result.value, { dir, ...readSoul(dir, name, variables) });
-  }
-  const task: SoulTask = { op: "read", soulsDir: "souls", name: "faye", ...variables };
-  assert.deepEqual(runSoulTask(task).value, {
-    dir, icon: "🦈", body: `Unknown provider\nLocal claude-requested @ ${cwd}\nShared claude-requested @ ${cwd}`,
-  });
-  assert.deepEqual(runSoulTask({ op: "list", soulsDir: "souls", cwd }).value, { dir, names: ["alpha", "faye"] });
-  assert.deepEqual(runSoulTask({ op: "list", soulsDir: "~/work #%/souls", cwd: "/unrelated" }).value, { dir, names: ["alpha", "faye"] });
-  write("faye/parts/local.md", "Edited {{ model.id }}");
-  assert.match(runSoulTask(task).value.body, /Edited claude-requested/);
-  write("alpha.md", "---\nicon: 42\n---\nFlat");
-  assert.deepEqual(runSoulTask({ ...task, name: "alpha" }).value, { dir, body: "Flat" });
-});
-
-test("helper failures are JSON errors, and malformed content falls back and recovers in compose", async () => {
   const h = host();
-  for (const text of ["{{ model.typo }}", "{% render 'missing' %}", "---\nicon: [unclosed\n---\nSoul"]) {
-    h.write("faye.md", text);
-    const result = runSoulTask({ op: "read", soulsDir: h.dir, name: "faye", cwd: "/work", model: { provider: "", id: "claude-other" } });
-    assert.equal(result.status, 1);
-    assert.equal(typeof result.value.error, "string");
-    assert.equal(result.value.body, undefined);
-    const before = h.warnings.length;
-    assert.equal(await h.compose(original), original);
-    assert.equal(await h.compose(original), original);
-    assert.equal(h.warnings.length, before + 1);
-  }
-  h.write("faye.md", "---\nicon: 🦈\n---\n{{ model.id }} @ {{ cwd }} provider='{{ model.provider }}'");
-  assert.equal((await h.compose(original, false, "claude-requested")).sections[0].text,
-    "\nclaude-requested @ /work provider=''\n\nIMPORTANT: Keep this.\n");
+  await h.start();
+  await h.command("@A");
+  await h.echo("@A");
+  const composed = await h.compose();
+  const intro = composed.sections.find((section) => section.id === "intro")!;
+  const guidance = composed.sections.find((section) => section.id === "session_guidance")!;
+  assert.equal(intro.text, "\n\n\nIMPORTANT: Keep every native rule.\n");
+  assert.equal(guidance.text, "You are soul A.\n\nOriginal session guidance.");
+  assert.equal(composed.sections.find((section) => section.id === "tools")!.text, "Tools untouched.");
+  assert.equal(composed.sections.find((section) => section.id === "rules")!.text, "Rules untouched.");
+  assert.equal(h.sectionResults.findLast((result) => result.name === "session_guidance")!.text, "You are soul A.\n\nOriginal session guidance.");
+  assert.equal(h.invalidations.includes("prompt.section"), true);
+
+  const lean = await h.compose("claude-opus-5-5", true);
+  assert.equal(lean.sections.find((section) => section.id === "lean_body")!.text, "\n\n\nLean rules.\n");
 });
 
-test("Claude exact beats wildcards, first wildcard wins, and duplicate exact keeps its last valid value", async () => {
-  const h = host({ defaultSoul: "missing", modelSouls: [
-    "claude.1-*=faye", "claude*=reviewer", "*=fallback", "claude.1-exact=faye",
-    "claude.1-exact=reviewer", "claude.1-exact=../invalid",
-  ], timeaware: false });
-  h.write("fallback.md", "Fallback");
-  assert.match((await h.compose(original, false, "claude.1-exact")).sections[0].text, /reviewer/);
-  assert.match((await h.compose(original, false, "claude.1-new")).sections[0].text, /Faye/);
-  assert.match((await h.compose(original, false, "claudex1-new")).sections[0].text, /reviewer/);
-  assert.match((await h.compose(original, false, "other")).sections[0].text, /Fallback/);
-  assert.equal(h.warnings.length, 1);
+test("native registration and completion expose named souls and controls", async () => {
+  const h = host();
+  await h.start();
+  assert.equal(h.commands[0].name, "soul");
+  assert.deepEqual((await h.complete()).suggestions.map((item: any) => item.text), ["@A", "@B", "clear", "reset", "reload"]);
+  assert.deepEqual((await h.complete("@B")).suggestions.map((item: any) => item.text), ["@B"]);
 });
 
-test("Claude uses the configured relative directory for both content and perception discovery", async () => {
-  const h = diskHost(PERCEPTION, { defaultSoul: "faye", soulsDir: "custom", timeaware: false });
-  try {
-    cpSync(join(h.home, ".agents", "souls"), join(h.home, "custom"), { recursive: true });
-    rmSync(join(h.home, ".agents"), { recursive: true });
-    h.session.cwd = h.home;
-    assert.match((await h.compose()).sections[0].text, /Faye/);
-    const result = await h.classic("classic.SessionStart", { hook_event_name: "SessionStart", source: "startup" });
-    assert.deepEqual(momentOf(result.additionalContext[0]), { kind: "wake", source: "startup" });
-  } finally { h.close(); }
+test("choice commits only after a late, exact kept command echo", async () => {
+  const h = host();
+  await h.start();
+  const requested = await h.command("@A");
+  assert.match(requested.text, /changes only when its receipt is accepted/);
+  assert.equal(h.choice(), undefined);
+
+  await h.assistant();
+  assert.equal(h.choice(), undefined, "an unrelated row does not consume the pending choice");
+  await h.echo("@A");
+  assert.deepEqual(h.choice(), { mode: "named", name: "A" });
+
+  const choices = choiceRows(h);
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0]!.content, encodeChoice({ mode: "named", name: "A" }));
+  const echo = h.transcript.find((row) => row.message?.content?.[0]?.text?.includes("<command-name>/soul</command-name>"));
+  assert.equal(choices[0]!.parentUuid, echo.uuid, "the receipt is appended after the kept echo");
+
+  const again = await h.command("@A");
+  assert.match(again.text, /Already @A/);
+  await h.echo("@A");
+  assert.equal(choiceRows(h).length, 1);
+  assert.deepEqual(h.choice(), { mode: "named", name: "A" });
+});
+
+test("denied, invalid, and altered receipts preserve the previous choice", async () => {
+  const h = host();
+  await h.start();
+  await h.command("@A");
+  await h.echo("@A");
+  assert.deepEqual(h.choice(), { mode: "named", name: "A" });
+
+  await h.command("@B");
+  h.deny("receipt refused");
+  await h.echo("@B");
+  h.deny(undefined);
+  assert.deepEqual(h.choice(), { mode: "named", name: "A" });
+  assert.equal(choiceRows(h).length, 1);
+  assert.ok(h.logs.some((line) => line.includes("receipt refused")));
+
+  const invalid = await h.command("@missing");
+  assert.equal(invalid.exitCode, 1);
+  await h.echo("@missing");
+  assert.deepEqual(h.choice(), { mode: "named", name: "A" });
+
+  await h.command("@B");
+  await h.echo("@B", "@A");
+  assert.deepEqual(h.choice(), { mode: "named", name: "A" }, "a changed native echo is not a receipt");
+  assert.equal(choiceRows(h).length, 1);
+});
+
+test("snapshot-backed status confirms only a matching recorded prompt", async () => {
+  const h = host();
+  await h.start();
+  const unconfirmed = await h.command("");
+  assert.match(unconfirmed.text, /Active: unconfirmed/);
+  assert.equal(h.statuses.at(-1), undefined);
+
+  await h.command("@A");
+  await h.echo("@A");
+  const before = (await h.compose()).sections.filter((section) => section.text !== "").map((section) => section.text);
+  h.snapshot(before);
+  await h.prompt("after the snapshot");
+  const confirmed = await h.command("");
+  assert.match(confirmed.text, /Active: A/);
+  assert.equal(h.statuses.at(-1), "✦");
+});
+
+const message = (handle: string, role: "user" | "assistant", extra: Partial<SessionMessage> = {}): SessionMessage => ({
+  handle, role, text: "", toolUses: [], ...extra,
+});
+const use = (id: string) => ({ tool_use_id: id, tool: "Read", input: {} });
+const result = (id: string) => ({ tool_use_id: id, text: id, isError: false });
+
+test("retainedMessages restores a tool-result batch in original order, before the new tail", () => {
+  const before = [
+    message("summary", "assistant", { text: "native summary" }),
+    message("u1", "user", { text: "old question" }),
+    message("a1", "assistant", { toolUses: [use("t1"), use("t2")] }),
+    message("r1", "user", { toolResults: [result("t1")] }),
+    message("r2", "user", { toolResults: [result("t2")] }),
+    message("a2", "assistant", { text: "old answer" }),
+    message("u2", "user", { text: "old tail" }),
+  ];
+  const after = [
+    before[0]!,
+    message("n1", "user", { text: "new question" }),
+    message("n2", "assistant", { text: "new answer" }),
+  ];
+
+  const fromResult = retainedMessages(before, after, ["r1"]);
+  assert.deepEqual(fromResult.map((item) => item.handle), ["summary", "a1", "r1", "r2", "n1", "n2"]);
+  assert.ok(!fromResult.some((item) => ["u1", "a2", "u2"].includes(item.handle!)));
+
+  const fromAssistant = retainedMessages(before, after, ["a1"]);
+  assert.deepEqual(fromAssistant.map((item) => item.handle), ["summary", "a1", "r1", "r2", "n1", "n2"]);
 });

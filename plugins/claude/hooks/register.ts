@@ -1,456 +1,378 @@
-import type { EngineInterface, On, PluginOptions } from "claude-code";
+import type { On, PluginOptions, PromptComposeSection, SessionMessage } from "claude-code";
 import { isSoulName, matchingModelKey } from "../../../src/soul-selection.ts";
+import { encodeChoice, type ClaudeSession, type SoulChoice } from "../../../src/claude-session.ts";
+import { timePerception } from "../../../src/time.ts";
+import { files, load, type Engine } from "./files.ts";
+import { perceive, toolMoment, worldFor, type Moment } from "./perception.ts";
 
-type Engine = Pick<EngineInterface, "env" | "session" | "ui" | "clock" | "process">;
-
-/** Executed by the host's `node`, never loaded by the sandbox. */
-const RUNNER = `${import.meta.dir}/perception-runner.mjs`;
-const SOULS_RUNNER = `${import.meta.dir}/souls-runner.cjs`;
-
-/** How the host saw a tool call; a perception module reads this instead of parsing tool names. */
-type ToolCategory = "reading" | "running" | "writing" | "other";
-
-/** One lifecycle beat a soul may answer. Kept in step with `src/perception.ts`. */
-type Moment =
-  | { kind: "wake"; source: "startup" | "resume" | "compact" | "clear" | "fork" }
-  | { kind: "human"; text: string }
-  | { kind: "tool"; phase: "before" | "after"; category: ToolCategory; toolName: string; filePath?: string; input?: string; output?: string; ok?: boolean };
-
-interface Utterance {
-  text: string;
-}
-
-interface World {
-  now: number;
-  sessionId: string;
-  cwd: string;
-  storeDir: string;
-  facts: Record<string, unknown>;
-  absenceMs?: number;
-}
-
-type Perception = (moment: Moment, world: World) => Utterance | undefined;
-
-const CATEGORIES: Readonly<Record<string, ToolCategory>> = {
-  read: "reading", Read: "reading", grep: "reading", Grep: "reading",
-  glob: "reading", Glob: "reading", find: "reading",
-  bash: "running", Bash: "running", codemode: "running",
-  edit: "writing", Edit: "writing", MultiEdit: "writing", write: "writing", Write: "writing",
-};
-const DETAIL_LIMIT = 2000;
-
-const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
-const HOUR_MS = 3_600_000;
-const DAY_MS = 24 * HOUR_MS;
-
-/** Watch-face style: big time first, then the small date window. No year, like a real watch. */
-function formatClock(now: number): string {
-  const date = new Date(now);
-  const hours = String(date.getHours()).padStart(2, "0");
-  const minutes = String(date.getMinutes()).padStart(2, "0");
-  return `${hours}:${minutes} · ${DAYS[date.getDay()]}, ${MONTHS[date.getMonth()]} ${date.getDate()}`;
-}
-function formatElapsed(ms: number): string {
-  if (ms >= DAY_MS) {
-    const days = Math.floor(ms / DAY_MS);
-    const hours = Math.floor((ms % DAY_MS) / HOUR_MS);
-    return hours ? `${days}d ${hours}h` : `${days}d`;
-  }
-  const hours = Math.floor(ms / HOUR_MS);
-  const minutes = Math.round((ms % HOUR_MS) / 60_000);
-  if (minutes === 60) return `${hours + 1}h`;
-  return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
-}
-/** Refresh the watch on human moments, at most once an hour. */
-function timePerception(lastNoteAt?: number): Perception {
-  return (moment, world) => {
-    if (moment.kind !== "human" || !Number.isFinite(world.now)) return undefined;
-    if (lastNoteAt !== undefined && Number.isFinite(lastNoteAt) && world.now - lastNoteAt < HOUR_MS) return undefined;
-    const clock = `⌚ ${formatClock(world.now)}`;
-    const away = world.absenceMs !== undefined && Number.isFinite(world.absenceMs) && world.absenceMs >= HOUR_MS
-      ? formatElapsed(world.absenceMs)
-      : undefined;
-    return { text: away ? `${clock}\n(${away} since *human* was last present)` : clock };
-  };
-}
-
-async function homeDir($: Engine): Promise<string | undefined> {
-  return await $.env.get("HOME") ?? await $.env.get("USERPROFILE");
-}
-
-/** Only JSON crosses the process boundary; installed plugins carry their own dependencies. */
-async function soulFiles<T>($: Engine, options: PluginOptions, task: Record<string, unknown>): Promise<T> {
-  const { exitCode, stdout, isStdoutTruncated } = await $.process.run(
-    ["node", SOULS_RUNNER, JSON.stringify({ ...task, soulsDir: options.soulsDir, cwd: await $.session.cwd() })],
-    { timeoutMs: 10_000 },
-  );
-  if (isStdoutTruncated) throw new Error("Soul helper output was truncated");
-  const result = JSON.parse(stdout);
-  if (exitCode !== 0) throw new Error(typeof result.error === "string" ? result.error : "Soul helper failed");
-  return result as T;
-}
-
-interface SoulContent {
-  dir: string;
-  body: string;
+const DEFAULTS: SoulChoice = { mode: "defaults" };
+const ENVELOPE = new Set(["tool", "tool_use_id", "hook_event_name", "session_id", "transcript_path", "cwd"]);
+interface Projection {
+  soul: string | null;
   icon?: string;
+  /** Exact composed section and shared opening remainder, checked against the recorded snapshot. */
+  section: string;
+  opening: string;
+}
+interface State {
+  sessionId?: string;
+  transcriptPath?: string;
+  head?: string;
+  journalHead?: string;
+  journal: ClaudeSession;
+  choice: SoulChoice;
+  choiceKnown: boolean;
+  seeding: boolean;
+  native?: string;
+  sectionIdentity?: { soul: string | null; icon?: string };
+  proposals: Map<string, Projection>;
+  applied?: Projection;
+  observed?: string | null;
+  suppression: string;
+  human?: { text: string; now: number; previousHumanAt?: number };
+  wake?: Extract<Moment, { kind: "wake" }>;
+  pendingBrain?: string;
+  pendingChoice?: { choice: SoulChoice; args: string };
+  renderModel?: string;
+  toolNotes: string[];
+  paths: Map<string, string | undefined>;
+  reported: Set<string>;
 }
 
-async function load($: Engine, options: PluginOptions, name: string, model: string): Promise<SoulContent> {
-  return soulFiles<SoulContent>($, options, { op: "read", name, model: { provider: "", id: model } });
-}
-
-/** Keep leading whitespace and the first paragraph's exact separator and suffix. */
-export function replaceIdentity(text: string, body: string): string | undefined {
+/** Keep the leading whitespace and every byte after the native first paragraph. */
+export function openingParagraph(text: string): { body: string; rest: string } | undefined {
   const start = /^\s*/.exec(text)![0].length;
   if (!/^You are\b/.test(text.slice(start))) return undefined;
   const separator = /\r?\n[\t ]*\r?\n/.exec(text.slice(start));
   const end = separator ? start + separator.index : text.length;
-  return text.slice(0, start) + body + text.slice(end);
+  return { body: text.slice(start, end), rest: text.slice(0, start) + text.slice(end) };
 }
-async function warnOnce($: Engine, reported: Set<string>, message: string) {
-  const key = `${await $.session.id()}:${message}`;
-  if (reported.has(key)) return;
-  reported.add(key);
-  $.ui.log(`Soul: ${message}`);
+
+// The sandbox follows $ only through top-level functions, including bundled modules.
+function warn($: Engine, s: State, error: unknown): void {
+  const text = error instanceof Error ? error.message : String(error);
+  if (!s.reported.has(text)) { s.reported.add(text); $.ui.log(`Soul: ${text}`); }
 }
-async function select($: Engine, options: PluginOptions, model: string, reported: Set<string>): Promise<string | undefined> {
+async function hydrate($: Engine, s: State, options: PluginOptions, handles?: string[], rewind = false): Promise<void> {
+  if (!s.head || !s.transcriptPath || (s.head === s.journalHead && handles === undefined && !rewind)) return;
+  // The writer can trail a kept append. Never substitute a different leaf.
+  for (const delay of [0, 15, 40, 100]) {
+    if (delay) await $.clock.sleep(delay);
+    const result = await files<ClaudeSession>($, options, { op: "session", transcriptPath: s.transcriptPath, headUuid: s.head, ...(handles ? { handles } : {}), ...(rewind ? { sessionId: s.sessionId } : {}) });
+    if (!result.known) continue;
+    if (result.headUuid !== undefined) {
+      s.head = result.headUuid ?? undefined;
+      s.pendingChoice = undefined; s.pendingBrain = undefined; s.human = undefined; s.toolNotes = [];
+      s.observed = undefined; s.applied = undefined; status($, s);
+    }
+    s.journal = result; s.journalHead = s.head;
+    s.choice = result.choice ?? DEFAULTS; s.choiceKnown = true;
+    return;
+  }
+  throw new Error("The current soul branch is not persisted yet; try again after the transcript write");
+}
+async function selected($: Engine, s: State, options: PluginOptions, model: string, choice = s.choice, known = s.choiceKnown): Promise<string | undefined> {
+  if (!known) return undefined;
+  if (choice.mode === "named") return choice.name;
+  if (choice.mode === "disabled" || /^(1|true)$/i.test(await $.env.get("SOULLESS") ?? "")) return undefined;
   const mappings = new Map<string, string>();
   for (const entry of (options.modelSouls ?? []) as readonly string[]) {
     const match = /^([^=\s]+)=([^=]+)$/.exec(entry);
-    if (!match || !isSoulName(match[2])) {
-      await warnOnce($, reported, `Ignoring invalid model entry: ${JSON.stringify(entry)} (expected model=soul)`);
-      continue;
-    }
-    mappings.set(match[1]!, match[2]);
+    if (!match || !isSoulName(match[2])) warn($, s, `Ignoring invalid model entry: ${JSON.stringify(entry)} (expected model=soul)`);
+    else mappings.set(match[1]!, match[2]);
   }
   const key = matchingModelKey(model, [...mappings.keys()]);
-  return key === undefined ? (options.defaultSoul as string | undefined) || undefined : mappings.get(key);
+  const name = key === undefined ? options.defaultSoul : mappings.get(key);
+  if (name === undefined || name === "") return undefined;
+  if (!isSoulName(name)) throw new Error(`Invalid default soul: ${JSON.stringify(name)}`);
+  return name;
+}
+async function append($: Engine, s: State, type: "user" | "system", text: string): Promise<boolean> {
+  const result = await $.session.append({ message: { type, content: [{ type: "text", text }] } });
+  if (result.deny !== undefined) { warn($, s, result.deny); return false; }
+  s.head = result.uuid; s.journalHead = undefined;
+  return true;
+}
+function reminder($: Engine, s: State, text: string): Promise<boolean> {
+  return append($, s, "user", `<system-reminder>\n${text}\n</system-reminder>`);
+}
+function invalidate($: Engine): void { $.ui.invalidate("prompt.section"); }
+function status($: Engine, s: State): void { $.ui.status(s.applied?.soul ? s.applied.icon ?? s.applied.soul : undefined); }
+function prove($: Engine, s: State): Projection | undefined {
+  const parts = s.journal.snapshot?.systemPrompt;
+  const proposal = parts && [...s.proposals.values()].find((p) => parts[0] === p.opening && parts.includes(p.section));
+  s.applied = proposal;
+  s.suppression = proposal ? "" : s.journal.snapshot ? "recorded prompt has no applicable dynamic soul slot (--system-prompt, or a legacy snapshot until /compact or a new session)" : "waiting for a recorded prompt";
+  status($, s);
+  return proposal;
+}
+async function preview($: Engine, model?: string): Promise<void> {
+  invalidate($);
+  await $.prompt.compose(model ? { model } : {});
+}
+async function perceiveActive($: Engine, s: State, options: PluginOptions, moment: Moment, absenceMs?: number, now?: number): Promise<void> {
+  const name = s.applied?.soul;
+  if (!name) return;
+  const world = await worldFor($, name, absenceMs, now);
+  const said = await perceive($, options, s.paths, name, moment, world);
+  // Tool context waits until the whole batch's results are kept; never split tool pairs.
+  if (said && moment.kind === "tool") s.toolNotes.push(said.text);
+  else if (said) await reminder($, s, said.text);
 }
 
-interface Identity {
-  model: string;
-  /** The soul the host actually put in the prompt, or undefined when it has not shown one. */
-  soul: string | null | undefined;
-}
-
-/** The path a tool call touches, from Claude's `file_path` or Pi's `path`. */
-function toolPath(input: unknown): string | undefined {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
-  const value = (input as { path?: unknown; file_path?: unknown }).file_path ?? (input as { path?: unknown }).path;
-  return typeof value === "string" && value ? value : undefined;
-}
-
-const ENVELOPE = new Set(["tool", "tool_use_id", "hook_event_name", "session_id", "transcript_path", "cwd"]);
-
-/** A tool's own arguments: the classic `PreToolUse` envelope spreads them beside its own keys. */
-function toolArgs(event: unknown): unknown {
-  if (typeof event !== "object" || event === null || Array.isArray(event)) return undefined;
-  const args = Object.entries(event).filter(([key]) => !ENVELOPE.has(key));
-  return args.length ? Object.fromEntries(args) : undefined;
-}
-
-/** A tool argument or result as bounded text: strings as they are, anything else as JSON. */
-function toolText(value: unknown): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  let text: string;
-  if (typeof value === "string") text = value;
-  else {
-    try {
-      const json = JSON.stringify(value);
-      if (typeof json !== "string") return undefined;
-      text = json;
-    } catch {
-      return undefined;
+export function retainedMessages(before: readonly SessionMessage[], after: readonly SessionMessage[], handles: readonly string[]): readonly SessionMessage[] {
+  const wanted = new Set([...handles, ...after.flatMap((message) => message.handle ? [message.handle] : [])]);
+  const ids = new Set<string>();
+  const toolIds = (message: SessionMessage) => [...message.toolUses, ...(message.toolResults ?? [])].map((tool) => tool.tool_use_id);
+  for (const message of after) for (const id of toolIds(message)) ids.add(id);
+  // A carrier can be a tool-result row, or an assistant with several calls.
+  // Retain the entire connected batch, not intervening unrelated messages.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const message of before) {
+      const tools = toolIds(message);
+      if (!message.handle || (!wanted.has(message.handle) && !tools.some((id) => ids.has(id)))) continue;
+      if (!wanted.has(message.handle)) { wanted.add(message.handle); changed = true; }
+      for (const id of tools) if (!ids.has(id)) { ids.add(id); changed = true; }
     }
   }
-  if (!text) return undefined;
-  return text.length > DETAIL_LIMIT ? `${text.slice(0, DETAIL_LIMIT)}…` : text;
-}
-
-/** Clock facts a perception module can branch on without re-reading the clock. */
-function facts(now: number): Record<string, unknown> {
-  const date = new Date(now);
-  const hour = date.getHours();
-  const weekday = date.getDay();
-  return {
-    hour,
-    morning: hour >= 5 && hour < 12,
-    afternoon: hour >= 12 && hour < 17,
-    evening: hour >= 17 && hour < 22,
-    night: hour < 5 || hour >= 22,
-    weekday,
-    weekend: weekday === 0 || weekday === 6,
-  };
-}
-
-/** The soul the mod would apply, or nothing when soulless or unnamed. */
-async function soulName($: Engine, options: PluginOptions, reported: Set<string>): Promise<string | undefined> {
-  if (/^(1|true)$/i.test(await $.env.get("SOULLESS") ?? "")) return undefined;
-  return select($, options, await $.session.model(), reported);
-}
-
-/** A tool name mapped to the category a perception module reads. */
-function categoryOf(toolName: string): ToolCategory {
-  return Object.hasOwn(CATEGORIES, toolName) ? CATEGORIES[toolName]! : "other";
-}
-
-/** Discovery shares the configured directory and extension precedence with Pi. */
-async function perceptionPath($: Engine, options: PluginOptions, name: string): Promise<string | undefined> {
-  return (await soulFiles<{ path?: string }>($, options, { op: "perception", name })).path;
-}
-
-function utterance(value: unknown): Utterance | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const { text } = value as { text?: unknown };
-  if (typeof text !== "string" || !text.trim()) return undefined;
-  return { text };
-}
-
-/** Build one world shared by every perception answering a moment. */
-async function worldFor($: Engine, name: string, absenceMs?: number): Promise<World> {
-  const home = await homeDir($) ?? "";
-  const now = await $.clock.now();
-  return {
-    now,
-    sessionId: await $.session.id(),
-    cwd: await $.session.cwd(),
-    storeDir: `${home}/.local/share/pi-souls/${name}`,
-    facts: facts(now),
-    ...(absenceMs !== undefined && Number.isFinite(absenceMs) && absenceMs >= 0 ? { absenceMs } : {}),
-  };
-}
-
-/**
- * Run one soul's `perception(moment, world)` in a Node child process: the sandbox has
- * no dynamic import, and a broken module must never break the host's request.
- */
-async function perceive($: Engine, options: PluginOptions, name: string, moment: Moment, world: World): Promise<Utterance | undefined> {
-  try {
-    const path = await perceptionPath($, options, name);
-    if (!path) return undefined;
-    const { exitCode, stdout } = await $.process.run(
-      ["node", "--experimental-strip-types", RUNNER, path, JSON.stringify({ moment, world })],
-      { timeoutMs: 10_000 },
-    );
-    if (exitCode !== 0) return undefined;
-    // The last line is the runner's answer; a perception module may print on its own.
-    const line = stdout.trim().split("\n").pop();
-    return line ? utterance(JSON.parse(line)) : undefined;
-  } catch {
-    return undefined;
+  const positions = new Map(before.map((message, index) => [message.handle, index]));
+  const result = [...after];
+  for (const [index, message] of before.entries()) {
+    if (!message.handle || !wanted.has(message.handle) || result.some((item) => item.handle === message.handle)) continue;
+    const later = result.findIndex((item) => item.handle !== undefined && (positions.get(item.handle) ?? -1) > index);
+    // Native synthetic summary stays first. Old carriers go before newer native
+    // retained messages, or just after the last original (before new tail rows).
+    const lastOriginal = result.findLastIndex((item) => item.handle !== undefined && positions.has(item.handle));
+    result.splice(later >= 0 ? later : lastOriginal >= 0 ? lastOriginal + 1 : Math.min(1, result.length), 0, message);
   }
-}
-
-/** A classic result with the utterance added: the host's own fields pass through untouched. */
-function withContext<T extends { additionalContext?: string[] }>(result: T, said: Utterance | undefined): T {
-  return said ? { ...result, additionalContext: [...(result.additionalContext ?? []), said.text] } : result;
-}
-
-interface SessionState {
-  baseline?: Identity;
-  /** Only a successful prompt.compose replacement is evidence of the active soul. */
-  applied?: { model: string; soul: string };
-}
-
-interface PromptState {
-  /** When the last time note was delivered. */
-  noteAt?: number;
-  /** When the human last submitted a prompt. */
-  humanAt?: number;
-}
-
-/** How long the human has been away, when this session already heard from them. */
-async function absence($: Engine, promptStates: Map<string, PromptState>): Promise<number | undefined> {
-  try {
-    const state = promptStates.get(await $.session.id());
-    return state?.humanAt === undefined ? undefined : Math.max(0, (await $.clock.now()) - state.humanAt);
-  } catch {
-    return undefined;
-  }
-}
-
-/** The tool moment the two result hooks share; `output` is the response or the failure. */
-async function toolNote($: Engine, options: PluginOptions, reported: Set<string>, promptStates: Map<string, PromptState>, toolName: string, input: unknown, ok: boolean, output?: unknown): Promise<Utterance | undefined> {
-  try {
-    const name = await soulName($, options, reported);
-    if (!name) return undefined;
-    const filePath = toolPath(input);
-    const detail = toolText(input);
-    const seen = toolText(output);
-    return await perceive($, options, name, {
-      kind: "tool", phase: "after", category: categoryOf(toolName), toolName,
-      ...(filePath ? { filePath } : {}), ...(detail ? { input: detail } : {}), ...(seen ? { output: seen } : {}), ok,
-    }, await worldFor($, name, await absence($, promptStates)));
-  } catch {
-    return undefined;
-  }
-}
-
-function transitionLines(previous: Identity, current: Identity): string[] {
-  const lines: string[] = [];
-  if (previous.model !== current.model) lines.push(`new brain: ${current.model}`);
-  if (previous.soul !== undefined && current.soul !== undefined && previous.soul !== current.soul && current.soul !== null) {
-    lines.push(`new soul: ${current.soul}`);
-  }
-  return lines;
+  return result;
 }
 
 export function register(on: On, options: PluginOptions = {}) {
-  const reported = new Set<string>();
-  // Transient, like the rest of this host's session state; the engine's framing wraps context.
-  const sessions = new Map<string, SessionState>();
-  const promptStates = new Map<string, PromptState>();
-
+  const s: State = {
+    journal: { known: false }, choice: DEFAULTS, choiceKnown: false, seeding: false,
+    proposals: new Map(), paths: new Map(), toolNotes: [], reported: new Set(), suppression: "waiting for a recorded prompt",
+  };
   on("classic.SessionStart", async ($, e, next) => {
-    const result = await next(e);
-    try {
-      const name = await soulName($, options, reported);
-      if (!name) return result;
-      const absenceMs = typeof e.seconds_since_last_response === "number" ? e.seconds_since_last_response * 1000 : undefined;
-      return withContext(result, await perceive($, options, name, { kind: "wake", source: e.source }, await worldFor($, name, absenceMs)));
-    } catch {
-      return result;
+    if (e.agent_id !== undefined) return next(e);
+    const same = s.sessionId === e.session_id;
+    s.sessionId = e.session_id; s.transcriptPath = e.transcript_path;
+    if (!same || e.source !== "compact") {
+      s.head = undefined; s.journalHead = undefined; s.journal = { known: false };
+      s.choiceKnown = e.source === "startup" || e.source === "clear";
+      s.choice = DEFAULTS; s.proposals.clear(); s.applied = undefined; s.observed = undefined;
+      s.human = undefined; s.pendingBrain = undefined; s.pendingChoice = undefined; s.paths.clear(); s.toolNotes = []; s.reported.clear();
     }
+    s.pendingChoice = undefined;
+    s.wake = { kind: "wake", source: e.source };
+    return next(e);
   });
-
-  on("classic.PreToolUse", async ($, e, next) => {
+  on("session.start", async ($, e, next) => {
     const result = await next(e);
-    try {
-      const name = await soulName($, options, reported);
-      if (!name) return result;
-      const args = toolArgs(e);
-      const filePath = toolPath(args);
-      const input = toolText(args);
-      return withContext(result, await perceive($, options, name, {
-        kind: "tool", phase: "before", category: categoryOf(e.tool), toolName: e.tool,
-        ...(filePath ? { filePath } : {}), ...(input ? { input } : {}),
-      }, await worldFor($, name, await absence($, promptStates))));
-    } catch {
-      return result;
-    }
+    status($, s);
+    await $.command.register({ name: "soul", description: "Soul: status, @name, clear, reset or reload", argumentHint: "[@name|clear|reset|reload]" });
+    // Detached preview sends nothing; the session slot is unmodified while seeding.
+    s.seeding = true;
+    try { await $.prompt.compose(); } finally { s.seeding = false; invalidate($); }
+    return result;
   });
-
-  on("classic.PostToolUse", async ($, e, next) => {
+  on("session.append", async ($, e, next) => {
     const result = await next(e);
-    return withContext(result, await toolNote($, options, reported, promptStates, e.tool_name, e.tool_input, true, e.tool_response));
-  });
-
-  on("classic.PostToolUseFailure", async ($, e, next) => {
-    const result = await next(e);
-    return withContext(result, await toolNote($, options, reported, promptStates, e.tool_name, e.tool_input, false, e.error));
-  });
-
-  on("prompt.compose", async ($, e, next) => {
-    const result = await next(e);
-    try {
-      if (/^(1|true)$/i.test(await $.env.get("SOULLESS") ?? "")) return result;
-      const name = await select($, options, e.model, reported);
-      if (!name) return result;
-      const target = e.traits.includes("lean") ? "lean_body" : "intro";
-      const index = result.sections.findIndex((section) => section.id === target);
-      const section = result.sections[index];
-      if (!section) {
-        await warnOnce($, reported, "Skipped: no matching opening paragraph");
-        return result;
-      }
-      const soul = await load($, options, name, e.model);
-      const text = replaceIdentity(section.text, soul.body);
-      if (text === undefined) {
-        await warnOnce($, reported, "Skipped: no matching opening paragraph");
-        return result;
-      }
-      const id = await $.session.id().catch(() => undefined);
-      if (id) {
-        const state = sessions.get(id) ?? {};
-        state.applied = { model: e.model, soul: name };
-        sessions.set(id, state);
-      }
-      return { ...result, sections: result.sections.map((item, i) => i === index ? { ...item, text } : item) };
-    } catch (error) {
-      await warnOnce($, reported, `Skipped: ${error instanceof Error ? error.message : String(error)}`);
-      return result;
-    }
-  });
-
-  on("prompt.submit", async ($, e, next) => {
-    if (e.command || e.isMeta) return next(e);
-    const notes: string[] = [];
-    let timeSaid: Utterance | undefined;
-    let presence: World | undefined;
-    try {
-      const name = await soulName($, options, reported);
-      if (name) {
-        await load($, options, name, await $.session.model());
-        const world = await worldFor($, name);
-        const state = promptStates.get(world.sessionId);
-        if (state?.humanAt !== undefined) world.absenceMs = Math.max(0, world.now - state.humanAt);
-        presence = world;
-        const moment: Moment = { kind: "human", text: e.text };
-        if (options.timeaware !== false) {
-          timeSaid = timePerception(state?.noteAt)(moment, world);
-          if (timeSaid) notes.push(timeSaid.text);
+    if (e.agentId !== undefined || e.door === "queue" || result.uuid === undefined) return result;
+    s.head = result.uuid;
+    const pending = s.pendingChoice;
+    if (pending && e.door === "command") {
+      const text = result.message.content.map((block) => block.type === "text" ? block.text : "").join("");
+      const echo = result.message.type === "user" && !result.message.isMeta
+        ? /^<command-name>\/soul<\/command-name>\s*<command-message>soul<\/command-message>\s*<command-args>([\s\S]*)<\/command-args>$/.exec(text)
+        : undefined;
+      if (echo?.[1] === pending.args) {
+        s.pendingChoice = undefined;
+        // The kept native echo is the command's rewind coordinate. Commit AFTER it.
+        if (await append($, s, "system", encodeChoice(pending.choice))) {
+          s.choice = pending.choice; s.choiceKnown = true; invalidate($);
         }
-        const said = await perceive($, options, name, moment, world);
-        if (said) notes.push(said.text);
-      }
-    } catch {
-      // A missing or unreadable soul neither speaks nor consumes human presence.
-    }
-
-    let id: string | undefined;
-    let previous: Identity | undefined;
-    let current: Identity | undefined;
-    let state: SessionState | undefined;
-    try {
-      id = await $.session.id();
-      const model = await $.session.model();
-      state = sessions.get(id) ?? {};
-      sessions.set(id, state);
-      previous = state.baseline;
-      const applied = state.applied?.model === model ? state.applied.soul : undefined;
-      current = {
-        model,
-        soul: applied !== undefined ? applied : previous?.soul,
-      };
-    } catch {
-      return next(notes.length ? { ...e, context: [...(e.context ?? []), ...notes] } : e);
-    }
-    let transitionNote: string | undefined;
-    if (previous && (previous.model !== current.model || previous.soul !== current.soul)) {
-      const lines = transitionLines(previous, current);
-      if (lines.length) {
-        transitionNote = lines.join("\n");
-        notes.push(transitionNote);
-      }
-    }
-
-    // Let a downstream rejection propagate; calling next twice would submit twice.
-    const result = await next(notes.length ? { ...e, context: [...(e.context ?? []), ...notes] } : e);
-
-    if (!("drop" in result)) {
-      if (presence) {
-        const promptState = promptStates.get(presence.sessionId);
-        promptStates.set(presence.sessionId, {
-          humanAt: presence.now,
-          noteAt: timeSaid && result.context?.includes(timeSaid.text) ? presence.now : promptState?.noteAt,
-        });
-      }
-      // A dropped prompt or a downstream hook that strips the block did not deliver it.
-      if (state !== undefined && current !== undefined && (!previous || transitionNote === undefined || result.context?.includes(transitionNote))) {
-        state.baseline = current;
+      } else if (result.message.type === "system" && result.message.name === "local_command") {
+        s.pendingChoice = undefined;
+        warn($, s, "Soul choice was not committed: its command echo was not kept unchanged");
       }
     }
     return result;
   });
-
-  on("session.end", async ($, e, next) => {
+  on("prompt.section", { name: "session_guidance" }, async ($, e, next) => {
+    const result = await next(e);
+    if (s.seeding || s.native === undefined) return result;
+    s.sectionIdentity = undefined;
+    let body = s.native, name: string | undefined, icon: string | undefined;
     try {
-      const id = await $.session.id();
-      sessions.delete(id);
-      promptStates.delete(id);
-    } catch {}
+      await hydrate($, s, options);
+      const model = s.renderModel ?? await $.session.model();
+      name = await selected($, s, options, model);
+      if (name) { const content = await load($, options, name, model); body = content.body; icon = content.icon; }
+    } catch (error) { warn($, s, error); name = undefined; }
+    s.sectionIdentity = { soul: name ?? null, ...(icon ? { icon } : {}) };
+    return { ...result, text: body + (result.text ? `\n\n${result.text}` : ""), breakPromptCache: true };
+  });
+  on("prompt.compose", async ($, e, next) => {
+    if (!s.seeding) {
+      try { await hydrate($, s, options, undefined, true); } catch (error) { warn($, s, error); }
+    }
+    s.renderModel = e.model;
+    const result = await next(e);
+    const target = result.sections.find((item) => item.id === (e.traits.includes("lean") ? "lean_body" : "intro"));
+    const opening = target && openingParagraph(target.text);
+    if (!opening) { if (!s.seeding) warn($, s, "Skipped: no matching opening paragraph"); return result; }
+    s.native = opening.body;
+    if (s.seeding) return result;
+    const slot = result.sections.find((item) => item.id === "session_guidance");
+    if (!slot || !s.sectionIdentity) return result;
+    const sections = result.sections.map((item): PromptComposeSection => item === target ? { ...item, text: opening.rest } : item);
+    const first = sections.find((item) => item.text !== "")?.text;
+    if (first !== undefined) {
+      s.proposals.delete(slot.text);
+      s.proposals.set(slot.text, { ...s.sectionIdentity, section: slot.text, opening: first });
+      if (s.proposals.size > 8) s.proposals.delete(s.proposals.keys().next().value!);
+    }
+    return { ...result, sections };
+  });
+  on("command.run", { command: "soul" }, async ($, e) => {
+    s.pendingChoice = undefined;
+    try {
+      await hydrate($, s, options);
+      const model = await $.session.model(), input = e.args.trim();
+      if (!input) {
+        await preview($, model); prove($, s);
+        const available = await files<{ dir: string; names: string[] }>($, options, { op: "list" });
+        const name = await selected($, s, options, model);
+        return { text: [
+          `Soul choice: ${s.choiceKnown ? s.choice.mode === "named" ? `@${s.choice.name}` : s.choice.mode : "unknown until the next kept session row"}`,
+          `Active: ${s.applied ? s.applied.soul ?? "none" : `unconfirmed (${s.suppression})`}`,
+          `Configured: ${name ?? "none"}`, `Souls: ${available.names.map((n) => `@${n}`).join(", ") || "none"}`, `Dir: ${available.dir}`,
+        ].join("\n") };
+      }
+      if (input === "reload") {
+        const name = await selected($, s, options, model);
+        if (!name) return { text: "No soul to reload." };
+        await load($, options, name, model);
+        s.paths.delete(name); invalidate($);
+        return { text: `Reloaded ${name}; projection is checked on the next request.` };
+      }
+      let target: SoulChoice;
+      if (input === "clear") target = { mode: "disabled" };
+      else if (input === "reset") target = DEFAULTS;
+      else if (input.startsWith("@") && isSoulName(input.slice(1))) {
+        target = { mode: "named", name: input.slice(1) };
+        await load($, options, target.name, model);
+      } else return { text: "Usage: /soul [@name|clear|reset|reload]", exitCode: 1 };
+      if (target.mode === "defaults") {
+        const name = await selected($, s, options, model, target, true);
+        if (name) await load($, options, name, model);
+      }
+      if (s.choiceKnown && encodeChoice(s.choice) === encodeChoice(target)) {
+        invalidate($); return { text: `Already ${encodeChoice(target).slice("Soul choice: ".length)}.` };
+      }
+      s.pendingChoice = { choice: target, args: e.args };
+      return { text: `Requested ${encodeChoice(target).slice("Soul choice: ".length)}; the choice changes only when its receipt is accepted.` };
+    } catch (error) { return { text: `Soul: ${error instanceof Error ? error.message : String(error)}`, exitCode: 1 }; }
+    finally { invalidate($); }
+  });
+  on("prompt.autocomplete", async ($, e, next) => {
+    const result = await next(e);
+    if (!/^\/soul\s+$/.test(e.text.slice(0, e.start))) return result;
+    try {
+      const { names } = await files<{ names: string[] }>($, options, { op: "list" });
+      const items = [...names.map((name) => `@${name}`), "clear", "reset", "reload"];
+      return { suggestions: [...result.suggestions, ...items.filter((text) => text.startsWith(e.token)).map((text) => ({ text }))] };
+    } catch (error) { warn($, s, error); return result; }
+  });
+  on("prompt.submit", async ($, e, next) => {
+    if (e.command || e.isMeta) return next(e);
+    s.pendingChoice = undefined;
+    try { await hydrate($, s, options); } catch (error) { warn($, s, error); }
+    const pending = { text: e.text, now: await $.clock.now(), previousHumanAt: s.journal.lastHumanAt };
+    const result = await next(e);
+    if (result.drop === undefined) s.human = pending;
+    return result;
+  });
+  on("classic.PostModelSwitch", async ($, e, next) => {
+    const result = await next(e);
+    invalidate($);
+    if (e.source !== "resume" && e.from_model !== e.to_model) s.pendingBrain = e.to_model;
+    return result;
+  });
+  on("turn.step", async function* ($, e, next) {
+    if (e.agentId !== undefined) return yield* next(e);
+    try {
+      await hydrate($, s, options);
+      await preview($, e.model);
+      const actual = prove($, s);
+      if (s.choiceKnown && s.choice.mode === "disabled" && actual?.soul) {
+        warn($, s, `Clear was recorded, but Claude’s current prompt still uses @${actual.soul}. Start a new session, or use /soul reset if its default is a different soul.`);
+      }
+      for (const text of s.toolNotes.splice(0)) await reminder($, s, text);
+      if (s.pendingBrain && s.journal.model !== s.pendingBrain) {
+        if (await reminder($, s, `new brain: ${s.pendingBrain}`)) s.pendingBrain = undefined;
+      }
+      if (actual) {
+        const previous = s.journal.soul === undefined ? s.observed : s.journal.soul;
+        let delivered = true;
+        if (previous !== undefined && previous !== actual.soul && actual.soul !== null) delivered = await reminder($, s, `new soul: ${actual.soul}`);
+        // A denied cue must not be consumed by a successful human divider.
+        if (delivered && previous !== actual.soul && (previous !== undefined || actual.soul !== null)) {
+          delivered = await append($, s, "system", actual.soul ? `── soul: ${actual.soul} ──` : "── soulless ──");
+        }
+        if (delivered) s.observed = actual.soul;
+        if (actual.soul) {
+          if (s.wake) { const moment = s.wake; s.wake = undefined; await perceiveActive($, s, options, moment); }
+          if (e.index === 0 && s.human) {
+            const pending = s.human; s.human = undefined;
+            const previousAt = pending.previousHumanAt ?? (s.journal.lastHumanAt !== undefined && s.journal.lastHumanAt < pending.now ? s.journal.lastHumanAt : s.journal.previousHumanAt);
+            const absenceMs = previousAt === undefined ? undefined : Math.max(0, pending.now - previousAt);
+            const world = await worldFor($, actual.soul, absenceMs, pending.now);
+            if (options.timeaware !== false) {
+              const said = await timePerception(s.journal.noteAt)({ kind: "human", text: pending.text }, world);
+              if (said) await reminder($, s, said.text);
+            }
+            await perceiveActive($, s, options, { kind: "human", text: pending.text }, absenceMs, pending.now);
+          }
+        }
+      }
+    } catch (error) { s.applied = undefined; status($, s); warn($, s, error); }
+    const result = yield* next(e);
+    invalidate($);
+    return result;
+  });
+  on("classic.PreToolUse", async ($, e, next) => {
+    const result = await next(e);
+    if (e.agent_id === undefined) {
+      const args = Object.fromEntries(Object.entries(e).filter(([key]) => !ENVELOPE.has(key)));
+      await perceiveActive($, s, options, toolMoment(e.tool, "before", args), s.journal.lastHumanAt === undefined ? undefined : Math.max(0, await $.clock.now() - s.journal.lastHumanAt));
+    }
+    return result;
+  });
+  on("classic.PostToolUse", async ($, e, next) => {
+    const result = await next(e);
+    if (e.agent_id === undefined) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.tool_response, true));
+    return result;
+  });
+  on("classic.PostToolUseFailure", async ($, e, next) => {
+    const result = await next(e);
+    if (e.agent_id === undefined) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.error, false));
+    return result;
+  });
+  on("session.compact", async ($, e, next) => {
+    if (e.agentId !== undefined) return next(e);
+    await hydrate($, s, options, e.messages.flatMap((message) => message.handle ? [message.handle] : []));
+    const handles = s.journal.retainHandles ?? [];
+    const result = await next(e);
+    if (result.skip !== undefined) return result;
+    // Unchanged native handles retain their trailing notices/attachments/meta rows too.
+    return { ...result, messages: retainedMessages(e.messages, result.messages, handles) };
+  });
+  on("session.end", async ($, e, next) => {
+    s.paths.clear(); s.pendingChoice = undefined; s.toolNotes = []; s.applied = undefined; status($, s);
     return next(e);
   });
 }

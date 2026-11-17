@@ -31,6 +31,7 @@
     "pretest": "npm run build:claude",
     "prepack": "npm run build:claude",
     "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:claude-wire": "node --experimental-strip-types --test test/claude-wire.ts test/claude-wire-tools.ts",
     "typecheck": "tsc --noEmit",
     "check:load": "pi --no-extensions -e ./src/index.ts --list-models __load_check__"
   },
