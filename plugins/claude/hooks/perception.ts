@@ -1,10 +1,10 @@
 import type { EngineInterface, PluginOptions } from "claude-code";
 import { files } from "./files.ts";
+import { runPerception, type PerceptionRuntime } from "./perception-runtime.ts";
 import type { Moment, Utterance, World } from "../../../src/perception.ts";
 
 export type { Moment, Utterance, World };
-type Engine = Pick<EngineInterface, "env" | "session" | "clock" | "process">;
-const RUNNER = `${import.meta.dir}/perception-runner.mjs`;
+type Engine = Pick<EngineInterface, "env" | "session" | "clock" | "process" | "http">;
 const CATEGORIES: Record<string, "reading" | "running" | "writing"> = {
   read: "reading", Read: "reading", grep: "reading", Grep: "reading", glob: "reading", Glob: "reading", find: "reading",
   bash: "running", Bash: "running", codemode: "running",
@@ -41,18 +41,12 @@ export async function worldFor($: Engine, name: string, absenceMs?: number, now?
   };
 }
 
-/** A one-shot module is fresh on every call; reload clears entry discovery. */
-export async function perceive($: Engine, options: PluginOptions, paths: Map<string, string | undefined>, name: string, moment: Moment, world: World): Promise<Utterance | undefined> {
+/** Discover fresh, then reuse the shared loader's cached closure in the session child. */
+export async function perceive($: Engine, options: PluginOptions, runtime: PerceptionRuntime, generation: number, name: string, moment: Moment, world: World, signal?: AbortSignal): Promise<Utterance | undefined> {
   try {
-    if (!paths.has(name)) paths.set(name, (await files<{ path?: string }>($, options, { op: "perception", name })).path);
-    const path = paths.get(name);
-    if (!path) return undefined;
-    const { exitCode, stdout, isStdoutTruncated } = await $.process.run(
-      ["node", "--experimental-strip-types", RUNNER, path, JSON.stringify({ moment, world })], { timeoutMs: 10_000 },
-    );
-    if (exitCode !== 0 || isStdoutTruncated) return undefined;
-    const line = stdout.trim().split("\n").pop();
-    const said = line ? JSON.parse(line) : undefined;
-    return said && typeof said.text === "string" && said.text.trim() ? { text: said.text } : undefined;
+    const { path } = await files<{ path?: string }>($, options, { op: "perception", name });
+    if (!path || generation !== runtime.generation || signal?.aborted) return undefined;
+    const said = await runPerception($, runtime, { path, moment, world }, signal) as Utterance | undefined;
+    return said && generation === runtime.generation && !signal?.aborted && typeof said.text === "string" && said.text.trim() ? { text: said.text } : undefined;
   } catch { return undefined; }
 }

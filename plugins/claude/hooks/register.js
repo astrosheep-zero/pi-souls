@@ -75,8 +75,108 @@ function load($, options, name, model) {
   return files($, options, { op: "read", name, model: { provider: "", id: model } });
 }
 
+// plugins/claude/hooks/perception-runtime.ts
+var RUNTIME = `${import.meta.dir}/perception-runtime.mjs`;
+var TIMEOUT_MS = 1e4;
+var createPerceptionRuntime = () => ({ generation: 0 });
+function invalidateRuntime(state) {
+  state.generation++;
+}
+async function cleanup($, child) {
+  if (!child.socket) return;
+  child.cleanup ??= $.process.run(["node", RUNTIME, "--cleanup", child.socket], { timeoutMs: 2e3 }).then(() => void 0, () => void 0);
+  await child.cleanup;
+}
+async function stopRuntime($, state, expected = state.child) {
+  if (expected !== state.child) return;
+  invalidateRuntime(state);
+  if (!expected) return;
+  await expected.stream.return({ code: null, signal: null }).catch(() => void 0);
+  await cleanup($, expected);
+  if (state.child === expected) state.child = void 0;
+}
+async function drain($, state, child, ready, failed) {
+  let pending = "";
+  try {
+    for await (const chunk of child.stream) {
+      if (child.socket || chunk.stream !== "stdout") continue;
+      pending += chunk.text;
+      const end = pending.indexOf("\n");
+      if (end < 0) {
+        if (pending.length > 16384) throw new Error("Invalid runtime readiness");
+        continue;
+      }
+      const message = JSON.parse(pending.slice(0, end));
+      if (typeof message.socketPath !== "string") throw new Error("Missing runtime socket");
+      child.socket = message.socketPath;
+      ready(message.socketPath);
+    }
+  } catch {
+  } finally {
+    failed(new Error("Perception runtime stopped"));
+    if (state.child === child) invalidateRuntime(state);
+    await cleanup($, child);
+    if (state.child === child) state.child = void 0;
+  }
+}
+function start($, state) {
+  if (state.child) return state.child;
+  const stream = $.process.spawn({ argv: ["node", RUNTIME] });
+  void stream.result.catch(() => void 0);
+  let ready;
+  let failed;
+  const child = { stream, ready: new Promise((resolve, reject) => {
+    ready = resolve;
+    failed = reject;
+  }) };
+  state.child = child;
+  void drain($, state, child, ready, failed).catch(() => void 0);
+  return child;
+}
+async function request($, state, child, generation, operation, task, signal) {
+  const socketPath = await child.ready;
+  if (generation !== state.generation || signal?.aborted) return void 0;
+  const response = await $.http.fetch(`http://perception/${operation}`, {
+    method: "POST",
+    socketPath,
+    body: JSON.stringify(task)
+  });
+  if (!response.ok || generation !== state.generation || signal?.aborted) return void 0;
+  return JSON.parse(response.text);
+}
+async function invoke($, state, operation, task, signal) {
+  const generation = state.generation;
+  let child;
+  let timer;
+  let abort;
+  try {
+    child = start($, state);
+    return await Promise.race([
+      request($, state, child, generation, operation, task, signal),
+      new Promise((_, reject) => {
+        timer = $.clock.after(TIMEOUT_MS, () => reject(new Error("Perception runtime timeout")));
+        abort = () => reject(new Error("Perception aborted"));
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+      })
+    ]);
+  } catch {
+    if (child) await stopRuntime($, state, child);
+    return void 0;
+  } finally {
+    timer?.cancel();
+    if (abort) signal?.removeEventListener("abort", abort);
+  }
+}
+function runPerception($, state, task, signal) {
+  return invoke($, state, "perceive", task, signal);
+}
+async function reloadRuntime($, state, sessionId, dir) {
+  invalidateRuntime(state);
+  if (state.child) await invoke($, state, "reload", { sessionId, dir });
+}
+
 // plugins/claude/hooks/perception.ts
-var RUNNER2 = `${import.meta.dir}/perception-runner.mjs`;
 var CATEGORIES = {
   read: "reading",
   Read: "reading",
@@ -131,19 +231,12 @@ async function worldFor($, name, absenceMs, now) {
     ...absenceMs !== void 0 && Number.isFinite(absenceMs) && absenceMs >= 0 ? { absenceMs } : {}
   };
 }
-async function perceive($, options, paths, name, moment, world) {
+async function perceive($, options, runtime, generation, name, moment, world, signal) {
   try {
-    if (!paths.has(name)) paths.set(name, (await files($, options, { op: "perception", name })).path);
-    const path = paths.get(name);
-    if (!path) return void 0;
-    const { exitCode, stdout, isStdoutTruncated } = await $.process.run(
-      ["node", "--experimental-strip-types", RUNNER2, path, JSON.stringify({ moment, world })],
-      { timeoutMs: 1e4 }
-    );
-    if (exitCode !== 0 || isStdoutTruncated) return void 0;
-    const line = stdout.trim().split("\n").pop();
-    const said = line ? JSON.parse(line) : void 0;
-    return said && typeof said.text === "string" && said.text.trim() ? { text: said.text } : void 0;
+    const { path } = await files($, options, { op: "perception", name });
+    if (!path || generation !== runtime.generation || signal?.aborted) return void 0;
+    const said = await runPerception($, runtime, { path, moment, world }, signal);
+    return said && generation === runtime.generation && !signal?.aborted && typeof said.text === "string" && said.text.trim() ? { text: said.text } : void 0;
   } catch {
     return void 0;
   }
@@ -153,11 +246,11 @@ async function perceive($, options, paths, name, moment, world) {
 var DEFAULTS = { mode: "defaults" };
 var ENVELOPE = /* @__PURE__ */ new Set(["tool", "tool_use_id", "hook_event_name", "session_id", "transcript_path", "cwd"]);
 function openingParagraph(text) {
-  const start = /^\s*/.exec(text)[0].length;
-  if (!/^You are\b/.test(text.slice(start))) return void 0;
-  const separator = /\r?\n[\t ]*\r?\n/.exec(text.slice(start));
-  const end = separator ? start + separator.index : text.length;
-  return { body: text.slice(start, end), rest: text.slice(0, start) + text.slice(end) };
+  const start2 = /^\s*/.exec(text)[0].length;
+  if (!/^You are\b/.test(text.slice(start2))) return void 0;
+  const separator = /\r?\n[\t ]*\r?\n/.exec(text.slice(start2));
+  const end = separator ? start2 + separator.index : text.length;
+  return { body: text.slice(start2, end), rest: text.slice(0, start2) + text.slice(end) };
 }
 function warn($, s, error) {
   const text = error instanceof Error ? error.message : String(error);
@@ -173,6 +266,7 @@ async function hydrate($, s, options, handles, rewind = false) {
     const result = await files($, options, { op: "session", transcriptPath: s.transcriptPath, headUuid: s.head, ...handles ? { handles } : {}, ...rewind ? { sessionId: s.sessionId } : {} });
     if (!result.known) continue;
     if (result.headUuid !== void 0) {
+      invalidateRuntime(s.runtime);
       s.head = result.headUuid ?? void 0;
       s.pendingChoice = void 0;
       s.pendingBrain = void 0;
@@ -230,6 +324,7 @@ function status($, s) {
 function prove($, s) {
   const parts = s.journal.snapshot?.systemPrompt;
   const proposal = parts && [...s.proposals.values()].find((p) => parts[0] === p.opening && parts.includes(p.section));
+  if (s.applied?.soul !== proposal?.soul) invalidateRuntime(s.runtime);
   s.applied = proposal;
   s.suppression = proposal ? "" : s.journal.snapshot ? "recorded prompt has no applicable dynamic soul slot (--system-prompt, or a legacy snapshot until /compact or a new session)" : "waiting for a recorded prompt";
   status($, s);
@@ -239,13 +334,20 @@ async function preview($, model) {
   invalidate($);
   await $.prompt.compose(model ? { model } : {});
 }
-async function perceiveActive($, s, options, moment, absenceMs, now) {
+async function perceiveActive($, s, options, moment, absenceMs, now, signal) {
   const name = s.applied?.soul;
+  const generation = s.runtime.generation;
   if (!name) return;
-  const world = await worldFor($, name, absenceMs, now);
-  const said = await perceive($, options, s.paths, name, moment, world);
-  if (said && moment.kind === "tool") s.toolNotes.push(said.text);
-  else if (said) await reminder($, s, said.text);
+  try {
+    const world = await worldFor($, name, absenceMs, now);
+    if (world.absenceMs === void 0 && s.journal.lastHumanAt !== void 0) world.absenceMs = Math.max(0, world.now - s.journal.lastHumanAt);
+    if (generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
+    const said = await perceive($, options, s.runtime, generation, name, moment, world, signal);
+    if (!said || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
+    if (moment.kind === "tool") s.toolNotes.push({ text: said.text, generation });
+    else await reminder($, s, said.text);
+  } catch {
+  }
 }
 function retainedMessages(before, after, handles) {
   const wanted = /* @__PURE__ */ new Set([...handles, ...after.flatMap((message) => message.handle ? [message.handle] : [])]);
@@ -285,7 +387,7 @@ function register(on, options = {}) {
     choiceKnown: false,
     seeding: false,
     proposals: /* @__PURE__ */ new Map(),
-    paths: /* @__PURE__ */ new Map(),
+    runtime: createPerceptionRuntime(),
     toolNotes: [],
     reported: /* @__PURE__ */ new Set(),
     suppression: "waiting for a recorded prompt"
@@ -293,6 +395,8 @@ function register(on, options = {}) {
   on("classic.SessionStart", async ($, e, next) => {
     if (e.agent_id !== void 0) return next(e);
     const same = s.sessionId === e.session_id;
+    if (!same || e.source !== "compact") await stopRuntime($, s.runtime);
+    else invalidateRuntime(s.runtime);
     s.sessionId = e.session_id;
     s.transcriptPath = e.transcript_path;
     if (!same || e.source !== "compact") {
@@ -307,7 +411,6 @@ function register(on, options = {}) {
       s.human = void 0;
       s.pendingBrain = void 0;
       s.pendingChoice = void 0;
-      s.paths.clear();
       s.toolNotes = [];
       s.reported.clear();
     }
@@ -339,6 +442,7 @@ function register(on, options = {}) {
       if (echo?.[1] === pending.args) {
         s.pendingChoice = void 0;
         if (await append($, s, "system", encodeChoice(pending.choice))) {
+          invalidateRuntime(s.runtime);
           s.choice = pending.choice;
           s.choiceKnown = true;
           invalidate($);
@@ -423,8 +527,8 @@ ${result.text}` : ""), breakPromptCache: true };
       if (input === "reload") {
         const name = await selected($, s, options, model);
         if (!name) return { text: "No soul to reload." };
-        await load($, options, name, model);
-        s.paths.delete(name);
+        const content = await load($, options, name, model);
+        await reloadRuntime($, s.runtime, await $.session.id(), `${content.dir}/${name}`);
         invalidate($);
         return { text: `Reloaded ${name}; projection is checked on the next request.` };
       }
@@ -478,6 +582,7 @@ ${result.text}` : ""), breakPromptCache: true };
   });
   on("classic.PostModelSwitch", async ($, e, next) => {
     const result = await next(e);
+    invalidateRuntime(s.runtime);
     invalidate($);
     if (e.source !== "resume" && e.from_model !== e.to_model) s.pendingBrain = e.to_model;
     return result;
@@ -488,14 +593,17 @@ ${result.text}` : ""), breakPromptCache: true };
       await hydrate($, s, options);
       await preview($, e.model);
       const actual = prove($, s);
+      const generation = s.runtime.generation;
       if (s.choiceKnown && s.choice.mode === "disabled" && actual?.soul) {
         warn($, s, `Clear was recorded, but Claude\u2019s current prompt still uses @${actual.soul}. Start a new session, or use /soul reset if its default is a different soul.`);
       }
-      for (const text of s.toolNotes.splice(0)) await reminder($, s, text);
+      for (const note of s.toolNotes.splice(0)) {
+        if (note.generation === s.runtime.generation && !next.signal?.aborted) await reminder($, s, note.text);
+      }
       if (s.pendingBrain && s.journal.model !== s.pendingBrain) {
         if (await reminder($, s, `new brain: ${s.pendingBrain}`)) s.pendingBrain = void 0;
       }
-      if (actual) {
+      if (actual && generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) {
         const previous = s.journal.soul === void 0 ? s.observed : s.journal.soul;
         let delivered = true;
         if (previous !== void 0 && previous !== actual.soul && actual.soul !== null) delivered = await reminder($, s, `new soul: ${actual.soul}`);
@@ -507,9 +615,9 @@ ${result.text}` : ""), breakPromptCache: true };
           if (s.wake) {
             const moment = s.wake;
             s.wake = void 0;
-            await perceiveActive($, s, options, moment);
+            await perceiveActive($, s, options, moment, void 0, void 0, next.signal);
           }
-          if (e.index === 0 && s.human) {
+          if (e.index === 0 && s.human && generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) {
             const pending = s.human;
             s.human = void 0;
             const previousAt = pending.previousHumanAt ?? (s.journal.lastHumanAt !== void 0 && s.journal.lastHumanAt < pending.now ? s.journal.lastHumanAt : s.journal.previousHumanAt);
@@ -517,13 +625,16 @@ ${result.text}` : ""), breakPromptCache: true };
             const world = await worldFor($, actual.soul, absenceMs, pending.now);
             if (options.timeaware !== false) {
               const said = await timePerception(s.journal.noteAt)({ kind: "human", text: pending.text }, world);
-              if (said) await reminder($, s, said.text);
+              if (said && generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) await reminder($, s, said.text);
             }
-            await perceiveActive($, s, options, { kind: "human", text: pending.text }, absenceMs, pending.now);
+            if (generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) {
+              await perceiveActive($, s, options, { kind: "human", text: pending.text }, absenceMs, pending.now, next.signal);
+            }
           }
         }
       }
     } catch (error) {
+      invalidateRuntime(s.runtime);
       s.applied = void 0;
       status($, s);
       warn($, s, error);
@@ -536,18 +647,18 @@ ${result.text}` : ""), breakPromptCache: true };
     const result = await next(e);
     if (e.agent_id === void 0) {
       const args = Object.fromEntries(Object.entries(e).filter(([key]) => !ENVELOPE.has(key)));
-      await perceiveActive($, s, options, toolMoment(e.tool, "before", args), s.journal.lastHumanAt === void 0 ? void 0 : Math.max(0, await $.clock.now() - s.journal.lastHumanAt));
+      await perceiveActive($, s, options, toolMoment(e.tool, "before", args), void 0, void 0, next.signal);
     }
     return result;
   });
   on("classic.PostToolUse", async ($, e, next) => {
     const result = await next(e);
-    if (e.agent_id === void 0) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.tool_response, true));
+    if (e.agent_id === void 0) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.tool_response, true), void 0, void 0, next.signal);
     return result;
   });
   on("classic.PostToolUseFailure", async ($, e, next) => {
     const result = await next(e);
-    if (e.agent_id === void 0) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.error, false));
+    if (e.agent_id === void 0) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.error, false), void 0, void 0, next.signal);
     return result;
   });
   on("session.compact", async ($, e, next) => {
@@ -559,7 +670,7 @@ ${result.text}` : ""), breakPromptCache: true };
     return { ...result, messages: retainedMessages(e.messages, result.messages, handles) };
   });
   on("session.end", async ($, e, next) => {
-    s.paths.clear();
+    await stopRuntime($, s.runtime);
     s.pendingChoice = void 0;
     s.toolNotes = [];
     s.applied = void 0;

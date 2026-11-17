@@ -1,7 +1,7 @@
 import type { EngineInterface, PluginOptions } from "claude-code";
 
 const RUNNER = `${import.meta.dir}/souls-runner.cjs`;
-export type Engine = Pick<EngineInterface, "env" | "session" | "ui" | "clock" | "process" | "prompt" | "command">;
+export type Engine = Pick<EngineInterface, "env" | "session" | "ui" | "clock" | "process" | "prompt" | "command" | "http">;
 export interface SoulContent { dir: string; body: string; icon?: string }
 
 /** One bundled Node entry; only JSON crosses the sandbox boundary. */

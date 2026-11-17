@@ -23,7 +23,7 @@ const GUIDANCE = "Original session guidance.";
  * Exercise the real hooks module with only the engine boundary stubbed. The
  * in-memory transcript is read back through the real readClaudeSession().
  */
-function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string } = {}) {
+function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string; timeaware?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "pi-souls-hooks-"));
   roots.push(root);
   const souls = new Map<string, SoulFile>(Object.entries(options.souls ?? {
@@ -43,6 +43,12 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string 
   let now = Date.UTC(2026, 10, 17, 11, 30, 0);
   let denyNote: string | undefined;
   let pendingAppend: { message: any; uuid: string } | undefined;
+  let pauseWorld: (() => Promise<void>) | undefined;
+  let pauseDiscovery: (() => Promise<void>) | undefined;
+  let discoveries = 0;
+  let spawns = 0;
+  const streamEnded = { code: 0, signal: null };
+  let releaseStream: (() => void) | undefined;
 
   const jsonl = () => transcript.map((row) => JSON.stringify(row)).join("\n") + (transcript.length ? "\n" : "");
 
@@ -76,8 +82,8 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string 
   };
 
   const $ = {
-    clock: { now: async () => now, sleep: async () => {} },
-    env: { get: async () => undefined },
+    clock: { now: async () => now, sleep: async () => {}, after: () => ({ cancel() {} }) },
+    env: { get: async () => { await pauseWorld?.(); return undefined; } },
     session: {
       id: async () => "session-a",
       model: async () => "claude-opus-5-5",
@@ -90,8 +96,25 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string 
       invalidate: (surface: string) => invalidations.push(surface),
     },
     process: {
+      spawn: () => {
+        spawns++;
+        const stream = (async function* () {
+          yield { stream: "stdout", text: JSON.stringify({ socketPath: "/test/private/p" }) + "\n" };
+          await new Promise<void>((resolve) => { releaseStream = resolve; });
+          return streamEnded;
+        })();
+        const finish = stream.return.bind(stream);
+        stream.return = (value) => { releaseStream?.(); return finish(value); };
+        return Object.assign(stream, { result: Promise.resolve(streamEnded) });
+      },
       run: async (argv: readonly string[]) => {
+        if (argv.includes("--cleanup")) return { exitCode: 0, stdout: "" };
         const task = JSON.parse(argv.at(-1)!);
+        if (task.op === "perception") {
+          discoveries++;
+          await pauseDiscovery?.();
+          return { exitCode: 0, stdout: JSON.stringify({ dir: root, path: join(root, task.name, "perception.mjs") }) };
+        }
         if (task.op === "list") return { exitCode: 0, stdout: JSON.stringify({ dir: root, names: [...souls.keys()] }), isStdoutTruncated: false };
         if (task.op === "read") {
           const soul = souls.get(task.name);
@@ -105,6 +128,7 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string 
         return { exitCode: 1, stdout: JSON.stringify({ error: "unsupported test task" }), isStdoutTruncated: false };
       },
     },
+    http: { fetch: async () => ({ ok: true, text: JSON.stringify({ text: "perception utterance" }) }) },
     prompt: { compose: async () => compose() },
     command: { register: async (spec: any) => { commands.push(spec); return { name: spec.name }; } },
   };
@@ -123,7 +147,7 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string 
     const hook = (typeof matcherOrHook === "function" ? matcherOrHook : maybeHook) as Hook;
     hooks.push({ event, matcher, hook });
   }) as unknown as On;
-  register(on, { timeaware: false, ...(options.defaultSoul ? { defaultSoul: options.defaultSoul } : {}) });
+  register(on, { timeaware: options.timeaware ?? false, ...(options.defaultSoul ? { defaultSoul: options.defaultSoul } : {}) });
 
   function sections(lean = false) {
     return [
@@ -151,6 +175,18 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string 
   const h = {
     transcript, statuses, invalidations, logs, commands, sectionResults,
     souls,
+    pauseWorld(fn?: () => Promise<void>) { pauseWorld = fn; },
+    pauseDiscovery(fn?: () => Promise<void>) { pauseDiscovery = fn; },
+    discoveries: () => discoveries,
+    spawns: () => spawns,
+    async tool() { await invoke("classic.PreToolUse", { tool: "Read", path: "/a" }, async () => ({})); },
+    async step(index = 1) {
+      const hook = hooks.find((entry) => entry.event === "turn.step")!.hook;
+      const next = Object.assign(async function* () { return {}; }, { signal: new AbortController().signal });
+      for await (const _chunk of hook($, { model: "claude-opus-5-5", index }, next)) {}
+    },
+    async submit() { await invoke("prompt.submit", { text: "human prompt" }, async (e) => ({ text: e.text })); },
+    async end() { await invoke("session.end", {}, async () => ({})); },
     deny(value: string | undefined) { denyNote = value; },
     choice(): SoulChoice | undefined { return lastUuid ? readClaudeSession(jsonl(), lastUuid).choice : undefined; },
     async start(source = "startup") {
@@ -286,6 +322,72 @@ test("snapshot-backed status confirms only a matching recorded prompt", async ()
   const confirmed = await h.command("");
   assert.match(confirmed.text, /Active: A/);
   assert.equal(h.statuses.at(-1), "✦");
+});
+
+test("slow world/discovery cannot start an old identity's runtime after a kept switch", async () => {
+  for (const boundary of ["world", "discovery"] as const) {
+    const h = host();
+    await h.start();
+    await h.command("@A"); await h.echo("@A");
+    h.snapshot((await h.compose()).sections.filter((section) => section.text !== "").map((section) => section.text));
+    await h.prompt(); await h.command("");
+    let entered!: () => void, release!: () => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const pause = async () => { entered(); await blocked; };
+    if (boundary === "world") h.pauseWorld(pause); else h.pauseDiscovery(pause);
+    const pending = h.tool();
+    await waiting;
+    await h.command("@B"); await h.echo("@B");
+    release();
+    await pending;
+    assert.equal(h.spawns(), 0, `${boundary} invalidation stops the call before child startup`);
+    if (boundary === "world") assert.equal(h.discoveries(), 0);
+    await h.end();
+  }
+});
+
+test("tool utterances wait for the safe boundary and a kept switch/reload drops queued generations", async () => {
+  for (const change of ["switch", "reload", "none"] as const) {
+    const h = host();
+    await h.start();
+    await h.command("@A"); await h.echo("@A");
+    h.snapshot((await h.compose()).sections.filter((section) => section.text !== "").map((section) => section.text));
+    await h.prompt(); await h.command("");
+    try {
+      await h.step(); // Deliver startup wake before measuring tool-only notes.
+      const notes = () => h.transcript.filter((row) => row.message?.content?.some((block: any) => block.text?.includes("perception utterance")));
+      const baseline = notes().length;
+      await h.tool();
+      assert.equal(notes().length, baseline, "tool hook does not append between a call and its result");
+      if (change === "switch") { await h.command("@B"); await h.echo("@B"); }
+      if (change === "reload") await h.command("reload");
+      await h.step();
+      assert.equal(notes().length - baseline, change === "none" ? 1 : 0);
+    } finally { await h.end(); }
+  }
+});
+
+test("clear during a wake await suppresses the old turn's clock and human perception", async () => {
+  const h = host({ timeaware: true });
+  await h.start();
+  await h.command("@A"); await h.echo("@A");
+  h.snapshot((await h.compose()).sections.filter((section) => section.text !== "").map((section) => section.text));
+  await h.prompt(); await h.command("");
+  await h.submit(); await h.prompt("human prompt");
+  let entered!: () => void, release!: () => void;
+  const waiting = new Promise<void>((resolve) => { entered = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  h.pauseDiscovery(async () => { entered(); await blocked; });
+  const pending = h.step(0);
+  await waiting;
+  await h.command("clear"); await h.echo("clear");
+  release();
+  await pending;
+  assert.equal(h.spawns(), 0);
+  assert.equal(h.discoveries(), 1, "the pending human event is not redispatched after the switch");
+  assert.ok(!h.transcript.some((row) => row.message?.content?.some((block: any) => /⌚|perception utterance/.test(block.text ?? ""))));
+  await h.end();
 });
 
 const message = (handle: string, role: "user" | "assistant", extra: Partial<SessionMessage> = {}): SessionMessage => ({

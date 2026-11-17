@@ -1,3 +1,4 @@
+import { copyFileSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,10 +23,30 @@ const helper = await build({
   alias: { "@earendil-works/pi-coding-agent": frontmatter },
   metafile: true,
 });
-const dependencies = Object.values(helper.metafile.outputs).flatMap((output) => output.imports);
-if (dependencies.some(({ path }) => !builtinModules.includes(path) && !builtinModules.includes(path.replace(/^node:/, "")))) {
-  throw new Error("Soul helper has an unbundled runtime dependency");
+function assertBundled(result) {
+  const dependencies = Object.values(result.metafile.outputs).flatMap((output) => output.imports);
+  if (dependencies.some(({ path }) => !builtinModules.includes(path) && !builtinModules.includes(path.replace(/^node:/, "")))) {
+    throw new Error("Claude helper has an unbundled runtime dependency");
+  }
 }
+assertBundled(helper);
+const runtime = await build({
+  absWorkingDir: root,
+  entryPoints: ["src/claude-perception-runtime.ts"],
+  outfile: "plugins/claude/hooks/perception-runtime.mjs",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node22.18",
+  minify: true,
+  legalComments: "eof",
+  banner: { js: `${banner.js}\nimport { createRequire as __runtimeRequire } from "node:module";\nconst require = __runtimeRequire(import.meta.url);` },
+  alias: { jiti: fileURLToPath(import.meta.resolve("jiti/static")) },
+  metafile: true,
+});
+assertBundled(runtime);
+copyFileSync(resolve(root, "src/perception-import.mjs"), resolve(root, "plugins/claude/hooks/perception-import.mjs"));
+copyFileSync(fileURLToPath(new URL("./LICENSE", import.meta.resolve("jiti/package.json"))), resolve(root, "plugins/claude/hooks/perception-runtime.LICENSE"));
 await build({
   absWorkingDir: root,
   entryPoints: ["plugins/claude/hooks/register.ts"],

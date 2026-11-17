@@ -4,6 +4,7 @@ import { encodeChoice, type ClaudeSession, type SoulChoice } from "../../../src/
 import { timePerception } from "../../../src/time.ts";
 import { files, load, type Engine } from "./files.ts";
 import { perceive, toolMoment, worldFor, type Moment } from "./perception.ts";
+import { createPerceptionRuntime, invalidateRuntime, reloadRuntime, stopRuntime, type PerceptionRuntime } from "./perception-runtime.ts";
 
 const DEFAULTS: SoulChoice = { mode: "defaults" };
 const ENVELOPE = new Set(["tool", "tool_use_id", "hook_event_name", "session_id", "transcript_path", "cwd"]);
@@ -34,8 +35,8 @@ interface State {
   pendingBrain?: string;
   pendingChoice?: { choice: SoulChoice; args: string };
   renderModel?: string;
-  toolNotes: string[];
-  paths: Map<string, string | undefined>;
+  toolNotes: { text: string; generation: number }[];
+  runtime: PerceptionRuntime;
   reported: Set<string>;
 }
 
@@ -61,6 +62,7 @@ async function hydrate($: Engine, s: State, options: PluginOptions, handles?: st
     const result = await files<ClaudeSession>($, options, { op: "session", transcriptPath: s.transcriptPath, headUuid: s.head, ...(handles ? { handles } : {}), ...(rewind ? { sessionId: s.sessionId } : {}) });
     if (!result.known) continue;
     if (result.headUuid !== undefined) {
+      invalidateRuntime(s.runtime);
       s.head = result.headUuid ?? undefined;
       s.pendingChoice = undefined; s.pendingBrain = undefined; s.human = undefined; s.toolNotes = [];
       s.observed = undefined; s.applied = undefined; status($, s);
@@ -101,6 +103,7 @@ function status($: Engine, s: State): void { $.ui.status(s.applied?.soul ? s.app
 function prove($: Engine, s: State): Projection | undefined {
   const parts = s.journal.snapshot?.systemPrompt;
   const proposal = parts && [...s.proposals.values()].find((p) => parts[0] === p.opening && parts.includes(p.section));
+  if (s.applied?.soul !== proposal?.soul) invalidateRuntime(s.runtime);
   s.applied = proposal;
   s.suppression = proposal ? "" : s.journal.snapshot ? "recorded prompt has no applicable dynamic soul slot (--system-prompt, or a legacy snapshot until /compact or a new session)" : "waiting for a recorded prompt";
   status($, s);
@@ -110,14 +113,22 @@ async function preview($: Engine, model?: string): Promise<void> {
   invalidate($);
   await $.prompt.compose(model ? { model } : {});
 }
-async function perceiveActive($: Engine, s: State, options: PluginOptions, moment: Moment, absenceMs?: number, now?: number): Promise<void> {
+async function perceiveActive($: Engine, s: State, options: PluginOptions, moment: Moment, absenceMs?: number, now?: number, signal?: AbortSignal): Promise<void> {
   const name = s.applied?.soul;
+  const generation = s.runtime.generation;
   if (!name) return;
-  const world = await worldFor($, name, absenceMs, now);
-  const said = await perceive($, options, s.paths, name, moment, world);
-  // Tool context waits until the whole batch's results are kept; never split tool pairs.
-  if (said && moment.kind === "tool") s.toolNotes.push(said.text);
-  else if (said) await reminder($, s, said.text);
+  try {
+    const world = await worldFor($, name, absenceMs, now);
+    if (world.absenceMs === undefined && s.journal.lastHumanAt !== undefined) world.absenceMs = Math.max(0, world.now - s.journal.lastHumanAt);
+    if (generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
+    const said = await perceive($, options, s.runtime, generation, name, moment, world, signal);
+    if (!said || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
+    // Tool context waits until the whole batch's results are kept; never split tool pairs.
+    if (moment.kind === "tool") s.toolNotes.push({ text: said.text, generation });
+    else await reminder($, s, said.text);
+  } catch {
+    // Discovery, world facts and executable perceptions fail independently of the host.
+  }
 }
 
 export function retainedMessages(before: readonly SessionMessage[], after: readonly SessionMessage[], handles: readonly string[]): readonly SessionMessage[] {
@@ -153,17 +164,19 @@ export function retainedMessages(before: readonly SessionMessage[], after: reado
 export function register(on: On, options: PluginOptions = {}) {
   const s: State = {
     journal: { known: false }, choice: DEFAULTS, choiceKnown: false, seeding: false,
-    proposals: new Map(), paths: new Map(), toolNotes: [], reported: new Set(), suppression: "waiting for a recorded prompt",
+    proposals: new Map(), runtime: createPerceptionRuntime(), toolNotes: [], reported: new Set(), suppression: "waiting for a recorded prompt",
   };
   on("classic.SessionStart", async ($, e, next) => {
     if (e.agent_id !== undefined) return next(e);
     const same = s.sessionId === e.session_id;
+    if (!same || e.source !== "compact") await stopRuntime($, s.runtime);
+    else invalidateRuntime(s.runtime);
     s.sessionId = e.session_id; s.transcriptPath = e.transcript_path;
     if (!same || e.source !== "compact") {
       s.head = undefined; s.journalHead = undefined; s.journal = { known: false };
       s.choiceKnown = e.source === "startup" || e.source === "clear";
       s.choice = DEFAULTS; s.proposals.clear(); s.applied = undefined; s.observed = undefined;
-      s.human = undefined; s.pendingBrain = undefined; s.pendingChoice = undefined; s.paths.clear(); s.toolNotes = []; s.reported.clear();
+      s.human = undefined; s.pendingBrain = undefined; s.pendingChoice = undefined; s.toolNotes = []; s.reported.clear();
     }
     s.pendingChoice = undefined;
     s.wake = { kind: "wake", source: e.source };
@@ -192,6 +205,7 @@ export function register(on: On, options: PluginOptions = {}) {
         s.pendingChoice = undefined;
         // The kept native echo is the command's rewind coordinate. Commit AFTER it.
         if (await append($, s, "system", encodeChoice(pending.choice))) {
+          invalidateRuntime(s.runtime);
           s.choice = pending.choice; s.choiceKnown = true; invalidate($);
         }
       } else if (result.message.type === "system" && result.message.name === "local_command") {
@@ -255,8 +269,9 @@ export function register(on: On, options: PluginOptions = {}) {
       if (input === "reload") {
         const name = await selected($, s, options, model);
         if (!name) return { text: "No soul to reload." };
-        await load($, options, name, model);
-        s.paths.delete(name); invalidate($);
+        const content = await load($, options, name, model);
+        await reloadRuntime($, s.runtime, await $.session.id(), `${content.dir}/${name}`);
+        invalidate($);
         return { text: `Reloaded ${name}; projection is checked on the next request.` };
       }
       let target: SoulChoice;
@@ -298,6 +313,7 @@ export function register(on: On, options: PluginOptions = {}) {
   });
   on("classic.PostModelSwitch", async ($, e, next) => {
     const result = await next(e);
+    invalidateRuntime(s.runtime);
     invalidate($);
     if (e.source !== "resume" && e.from_model !== e.to_model) s.pendingBrain = e.to_model;
     return result;
@@ -308,14 +324,17 @@ export function register(on: On, options: PluginOptions = {}) {
       await hydrate($, s, options);
       await preview($, e.model);
       const actual = prove($, s);
+      const generation = s.runtime.generation;
       if (s.choiceKnown && s.choice.mode === "disabled" && actual?.soul) {
         warn($, s, `Clear was recorded, but Claude’s current prompt still uses @${actual.soul}. Start a new session, or use /soul reset if its default is a different soul.`);
       }
-      for (const text of s.toolNotes.splice(0)) await reminder($, s, text);
+      for (const note of s.toolNotes.splice(0)) {
+        if (note.generation === s.runtime.generation && !next.signal?.aborted) await reminder($, s, note.text);
+      }
       if (s.pendingBrain && s.journal.model !== s.pendingBrain) {
         if (await reminder($, s, `new brain: ${s.pendingBrain}`)) s.pendingBrain = undefined;
       }
-      if (actual) {
+      if (actual && generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) {
         const previous = s.journal.soul === undefined ? s.observed : s.journal.soul;
         let delivered = true;
         if (previous !== undefined && previous !== actual.soul && actual.soul !== null) delivered = await reminder($, s, `new soul: ${actual.soul}`);
@@ -325,21 +344,23 @@ export function register(on: On, options: PluginOptions = {}) {
         }
         if (delivered) s.observed = actual.soul;
         if (actual.soul) {
-          if (s.wake) { const moment = s.wake; s.wake = undefined; await perceiveActive($, s, options, moment); }
-          if (e.index === 0 && s.human) {
+          if (s.wake) { const moment = s.wake; s.wake = undefined; await perceiveActive($, s, options, moment, undefined, undefined, next.signal); }
+          if (e.index === 0 && s.human && generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) {
             const pending = s.human; s.human = undefined;
             const previousAt = pending.previousHumanAt ?? (s.journal.lastHumanAt !== undefined && s.journal.lastHumanAt < pending.now ? s.journal.lastHumanAt : s.journal.previousHumanAt);
             const absenceMs = previousAt === undefined ? undefined : Math.max(0, pending.now - previousAt);
             const world = await worldFor($, actual.soul, absenceMs, pending.now);
             if (options.timeaware !== false) {
               const said = await timePerception(s.journal.noteAt)({ kind: "human", text: pending.text }, world);
-              if (said) await reminder($, s, said.text);
+              if (said && generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) await reminder($, s, said.text);
             }
-            await perceiveActive($, s, options, { kind: "human", text: pending.text }, absenceMs, pending.now);
+            if (generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) {
+              await perceiveActive($, s, options, { kind: "human", text: pending.text }, absenceMs, pending.now, next.signal);
+            }
           }
         }
       }
-    } catch (error) { s.applied = undefined; status($, s); warn($, s, error); }
+    } catch (error) { invalidateRuntime(s.runtime); s.applied = undefined; status($, s); warn($, s, error); }
     const result = yield* next(e);
     invalidate($);
     return result;
@@ -348,18 +369,18 @@ export function register(on: On, options: PluginOptions = {}) {
     const result = await next(e);
     if (e.agent_id === undefined) {
       const args = Object.fromEntries(Object.entries(e).filter(([key]) => !ENVELOPE.has(key)));
-      await perceiveActive($, s, options, toolMoment(e.tool, "before", args), s.journal.lastHumanAt === undefined ? undefined : Math.max(0, await $.clock.now() - s.journal.lastHumanAt));
+      await perceiveActive($, s, options, toolMoment(e.tool, "before", args), undefined, undefined, next.signal);
     }
     return result;
   });
   on("classic.PostToolUse", async ($, e, next) => {
     const result = await next(e);
-    if (e.agent_id === undefined) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.tool_response, true));
+    if (e.agent_id === undefined) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.tool_response, true), undefined, undefined, next.signal);
     return result;
   });
   on("classic.PostToolUseFailure", async ($, e, next) => {
     const result = await next(e);
-    if (e.agent_id === undefined) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.error, false));
+    if (e.agent_id === undefined) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.error, false), undefined, undefined, next.signal);
     return result;
   });
   on("session.compact", async ($, e, next) => {
@@ -372,7 +393,8 @@ export function register(on: On, options: PluginOptions = {}) {
     return { ...result, messages: retainedMessages(e.messages, result.messages, handles) };
   });
   on("session.end", async ($, e, next) => {
-    s.paths.clear(); s.pendingChoice = undefined; s.toolNotes = []; s.applied = undefined; status($, s);
+    await stopRuntime($, s.runtime);
+    s.pendingChoice = undefined; s.toolNotes = []; s.applied = undefined; status($, s);
     return next(e);
   });
 }

@@ -197,7 +197,8 @@ export function loadPerception(perceptionPath: string): Perception {
       if (perceptionPath.endsWith(".ts")) return pick(await importTypeScript.import(perceptionPath));
       // CommonJS also caches by filename, independently of the fresh ESM URL.
       delete perceptionRequire.cache[perceptionRequire.resolve(perceptionPath)];
-      return pick(await importModule(`${pathToFileURL(perceptionPath).href}?v=${randomUUID()}`));
+      const imported = await importModule(`${pathToFileURL(perceptionPath).href}?v=${randomUUID()}`);
+      return pick(imported) ?? pick(object(imported) ? imported.default : undefined);
     })().catch(() => undefined));
   return async (moment, world) => {
     const perception = await load();
