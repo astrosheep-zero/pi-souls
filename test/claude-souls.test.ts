@@ -260,7 +260,7 @@ test("choice commits only after a late, exact kept command echo", async () => {
   const h = host();
   await h.start();
   const requested = await h.command("@A");
-  assert.match(requested.text, /changes only when its receipt is accepted/);
+  assert.match(requested.text, /Switching to @A for your next message/);
   assert.equal(h.choice(), undefined);
 
   await h.assistant();
@@ -275,7 +275,7 @@ test("choice commits only after a late, exact kept command echo", async () => {
   assert.equal(choices[0]!.parentUuid, echo.uuid, "the receipt is appended after the kept echo");
 
   const again = await h.command("@A");
-  assert.match(again.text, /Already @A/);
+  assert.match(again.text, /@A is already selected/);
   await h.echo("@A");
   assert.equal(choiceRows(h).length, 1);
   assert.deepEqual(h.choice(), { mode: "named", name: "A" });

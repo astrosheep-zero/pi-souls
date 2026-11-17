@@ -11,7 +11,7 @@ const souls = { a: A, b: B };
 const settings = (options: Record<string, unknown> = {}) => ["--settings", JSON.stringify({ pluginConfigs: { "pi-souls@inline": { options: { defaultSoul: "a", ...options } } } })];
 const system = (turn: WireTurn) => turn.apiBodies.at(-1)?.system.map((block: any) => block.text).join("\n\n") ?? "";
 const text = (row: any): string => typeof row.message?.content === "string" ? row.message.content : (row.message?.content ?? []).map((b: any) => b.text ?? "").join("\n");
-const clearWarnings = (host: WireHost) => host.events.filter((event) => event.type === "system" && event.subtype === "ui_log" && String(event.text).includes("Clear was recorded, but Claude’s current prompt still uses"));
+const clearWarnings = (host: WireHost) => host.events.filter((event) => event.type === "system" && event.subtype === "ui_log" && String(event.text).includes("turning off souls did not take effect"));
 const wait = () => new Promise((resolve) => setTimeout(resolve, 400));
 async function command(host: WireHost, input: string) {
   const turn = await host.send(input);
@@ -120,8 +120,8 @@ test("observe compact-fork clear defect and reset recovery while checking native
     assert.equal(clearWarnings(host).length, 0, "clear/status must not warn before a model request proves the mismatch");
     const frozenTurn = await human(host, "fork clear keeps inherited host snapshot", B);
     assert.equal(clearWarnings(host).length, 1);
-    assert.match(String(clearWarnings(host)[0].text), /still uses @b.*new session.*\/soul reset/);
-    assert.ok(!JSON.stringify(frozenTurn.apiBodies).includes("Clear was recorded"), "warning is human-only");
+    assert.match(String(clearWarnings(host)[0].text), /still using @b.*new session.*\/soul reset/);
+    assert.ok(!JSON.stringify(frozenTurn.apiBodies).includes("turning off souls did not take effect"), "warning is human-only");
     await human(host, "same frozen prompt again", B);
     assert.equal(clearWarnings(host).length, 1, "the existing warning dedup prevents repeated logs");
     assert.deepEqual((await session(host)).state.choice, { mode: "disabled" }, "clear receipt is durable even while host snapshot is frozen");

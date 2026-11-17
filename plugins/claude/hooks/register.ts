@@ -71,7 +71,7 @@ async function hydrate($: Engine, s: State, options: PluginOptions, handles?: st
     s.choice = result.choice ?? DEFAULTS; s.choiceKnown = true;
     return;
   }
-  throw new Error("The current soul branch is not persisted yet; try again after the transcript write");
+  throw new Error("Could not read this session’s soul settings yet. Please try again.");
 }
 async function selected($: Engine, s: State, options: PluginOptions, model: string, choice = s.choice, known = s.choiceKnown): Promise<string | undefined> {
   if (!known) return undefined;
@@ -105,7 +105,7 @@ function prove($: Engine, s: State): Projection | undefined {
   const proposal = parts && [...s.proposals.values()].find((p) => parts[0] === p.opening && parts.includes(p.section));
   if (s.applied?.soul !== proposal?.soul) invalidateRuntime(s.runtime);
   s.applied = proposal;
-  s.suppression = proposal ? "" : s.journal.snapshot ? "recorded prompt has no applicable dynamic soul slot (--system-prompt, or a legacy snapshot until /compact or a new session)" : "waiting for a recorded prompt";
+  s.suppression = proposal ? "" : s.journal.snapshot ? "Claude is using a custom or older system prompt. For an older session, run /compact or start a new session to enable soul switching." : "send a message to see the active soul";
   status($, s);
   return proposal;
 }
@@ -164,7 +164,7 @@ export function retainedMessages(before: readonly SessionMessage[], after: reado
 export function register(on: On, options: PluginOptions = {}) {
   const s: State = {
     journal: { known: false }, choice: DEFAULTS, choiceKnown: false, seeding: false,
-    proposals: new Map(), runtime: createPerceptionRuntime(), toolNotes: [], reported: new Set(), suppression: "waiting for a recorded prompt",
+    proposals: new Map(), runtime: createPerceptionRuntime(), toolNotes: [], reported: new Set(), suppression: "send a message to see the active soul",
   };
   on("classic.SessionStart", async ($, e, next) => {
     if (e.agent_id !== undefined) return next(e);
@@ -210,7 +210,7 @@ export function register(on: On, options: PluginOptions = {}) {
         }
       } else if (result.message.type === "system" && result.message.name === "local_command") {
         s.pendingChoice = undefined;
-        warn($, s, "Soul choice was not committed: its command echo was not kept unchanged");
+        warn($, s, "Soul selection could not be saved. Try /soul again.");
       }
     }
     return result;
@@ -237,7 +237,7 @@ export function register(on: On, options: PluginOptions = {}) {
     const result = await next(e);
     const target = result.sections.find((item) => item.id === (e.traits.includes("lean") ? "lean_body" : "intro"));
     const opening = target && openingParagraph(target.text);
-    if (!opening) { if (!s.seeding) warn($, s, "Skipped: no matching opening paragraph"); return result; }
+    if (!opening) { if (!s.seeding) warn($, s, "Could not apply the soul to Claude’s system prompt. The current prompt was left unchanged."); return result; }
     s.native = opening.body;
     if (s.seeding) return result;
     const slot = result.sections.find((item) => item.id === "session_guidance");
@@ -261,7 +261,7 @@ export function register(on: On, options: PluginOptions = {}) {
         const available = await files<{ dir: string; names: string[] }>($, options, { op: "list" });
         const name = await selected($, s, options, model);
         return { text: [
-          `Soul choice: ${s.choiceKnown ? s.choice.mode === "named" ? `@${s.choice.name}` : s.choice.mode : "unknown until the next kept session row"}`,
+          `Soul choice: ${s.choiceKnown ? s.choice.mode === "named" ? `@${s.choice.name}` : s.choice.mode : "send a message to restore this session’s selection"}`,
           `Active: ${s.applied ? s.applied.soul ?? "none" : `unconfirmed (${s.suppression})`}`,
           `Configured: ${name ?? "none"}`, `Souls: ${available.names.map((n) => `@${n}`).join(", ") || "none"}`, `Dir: ${available.dir}`,
         ].join("\n") };
@@ -272,7 +272,7 @@ export function register(on: On, options: PluginOptions = {}) {
         const content = await load($, options, name, model);
         await reloadRuntime($, s.runtime, await $.session.id(), `${content.dir}/${name}`);
         invalidate($);
-        return { text: `Reloaded ${name}; projection is checked on the next request.` };
+        return { text: `Reloaded @${name}. Updated content will be used on your next message.` };
       }
       let target: SoulChoice;
       if (input === "clear") target = { mode: "disabled" };
@@ -286,10 +286,10 @@ export function register(on: On, options: PluginOptions = {}) {
         if (name) await load($, options, name, model);
       }
       if (s.choiceKnown && encodeChoice(s.choice) === encodeChoice(target)) {
-        invalidate($); return { text: `Already ${encodeChoice(target).slice("Soul choice: ".length)}.` };
+        invalidate($); return { text: target.mode === "disabled" ? "Souls are already set to turn off. Use /soul to check the active identity." : target.mode === "defaults" ? "Already following your default soul settings." : `@${target.name} is already selected.` };
       }
       s.pendingChoice = { choice: target, args: e.args };
-      return { text: `Requested ${encodeChoice(target).slice("Soul choice: ".length)}; the choice changes only when its receipt is accepted.` };
+      return { text: target.mode === "disabled" ? "Turning off souls for your next message." : target.mode === "defaults" ? "Restoring your default soul settings for the next message." : `Switching to @${target.name} for your next message.` };
     } catch (error) { return { text: `Soul: ${error instanceof Error ? error.message : String(error)}`, exitCode: 1 }; }
     finally { invalidate($); }
   });
@@ -326,7 +326,7 @@ export function register(on: On, options: PluginOptions = {}) {
       const actual = prove($, s);
       const generation = s.runtime.generation;
       if (s.choiceKnown && s.choice.mode === "disabled" && actual?.soul) {
-        warn($, s, `Clear was recorded, but Claude’s current prompt still uses @${actual.soul}. Start a new session, or use /soul reset if its default is a different soul.`);
+        warn($, s, `Claude is still using @${actual.soul}; turning off souls did not take effect. Start a new session, or use /soul reset if its default is a different soul.`);
       }
       for (const note of s.toolNotes.splice(0)) {
         if (note.generation === s.runtime.generation && !next.signal?.aborted) await reminder($, s, note.text);
