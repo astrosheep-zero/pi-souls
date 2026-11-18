@@ -7,6 +7,16 @@ import { perceive, toolMoment, worldFor, type Moment } from "./perception.ts";
 import { createPerceptionRuntime, invalidateRuntime, reloadRuntime, stopRuntime, type PerceptionRuntime } from "./perception-runtime.ts";
 
 const DEFAULTS: SoulChoice = { mode: "defaults" };
+const PRONOUNS = "pronouns";
+const GUIDANCE = "session_guidance";
+type IdentitySlot = typeof PRONOUNS | typeof GUIDANCE;
+interface NativeOpening {
+  body: string;
+  raw: string;
+  rest: string;
+  /** Native remainder followed by the original second section, for matching a folded snapshot. */
+  foldedTail?: string;
+}
 const ENVELOPE = new Set(["tool", "tool_use_id", "hook_event_name", "session_id", "transcript_path", "cwd"]);
 interface Projection {
   soul: string | null;
@@ -24,8 +34,9 @@ interface State {
   choice: SoulChoice;
   choiceKnown: boolean;
   seeding: boolean;
-  native?: string;
-  sectionIdentity?: { soul: string | null; icon?: string };
+  native?: NativeOpening;
+  compactedOpening?: string;
+  sectionIdentity?: { slot: IdentitySlot; soul: string | null; icon?: string };
   proposals: Map<string, Projection>;
   applied?: Projection;
   observed?: string | null;
@@ -49,6 +60,19 @@ export function openingParagraph(text: string): { body: string; rest: string } |
   return { body: text.slice(start, end), rest: text.slice(0, start) + text.slice(end) };
 }
 
+function identitySlot(s: State): IdentitySlot | undefined {
+  const native = s.native;
+  if (!native || !s.choiceKnown) return undefined;
+  const first = s.journal.snapshot?.systemPrompt[0];
+  // A resumed snapshot owns its layout; never project over an unrecognized
+  // opening. Native compaction releases that snapshot, even if its attachment
+  // is still visible through ancestry until the next request records a new one.
+  if (first === native.rest) return GUIDANCE;
+  if (native.foldedTail && first?.endsWith(native.foldedTail)) return PRONOUNS;
+  if (first === undefined || first === s.compactedOpening) return native.foldedTail ? PRONOUNS : GUIDANCE;
+  return undefined;
+}
+
 // The sandbox follows $ only through top-level functions, including bundled modules.
 function warn($: Engine, s: State, error: unknown): void {
   const text = error instanceof Error ? error.message : String(error);
@@ -65,6 +89,7 @@ async function hydrate($: Engine, s: State, options: PluginOptions, handles?: st
       invalidateRuntime(s.runtime);
       s.head = result.headUuid ?? undefined;
       s.pendingChoice = undefined; s.pendingBrain = undefined; s.human = undefined; s.toolNotes = [];
+      s.compactedOpening = undefined;
       s.observed = undefined; s.applied = undefined; status($, s);
     }
     s.journal = result; s.journalHead = s.head;
@@ -176,8 +201,9 @@ export function register(on: On, options: PluginOptions = {}) {
       s.head = undefined; s.journalHead = undefined; s.journal = { known: false };
       s.choiceKnown = e.source === "startup" || e.source === "clear";
       s.choice = DEFAULTS; s.proposals.clear(); s.applied = undefined; s.observed = undefined;
+      s.native = undefined; s.compactedOpening = undefined; s.sectionIdentity = undefined;
       s.human = undefined; s.pendingBrain = undefined; s.pendingChoice = undefined; s.toolNotes = []; s.reported.clear();
-    }
+    } else s.compactedOpening = s.journal.snapshot?.systemPrompt[0];
     s.pendingChoice = undefined;
     s.wake = { kind: "wake", source: e.source };
     return next(e);
@@ -215,19 +241,22 @@ export function register(on: On, options: PluginOptions = {}) {
     }
     return result;
   });
-  on("prompt.section", { name: "session_guidance" }, async ($, e, next) => {
+  on("prompt.section", { name: ["pronouns", "session_guidance"] }, async ($, e, next) => {
     const result = await next(e);
-    if (s.seeding || s.native === undefined) return result;
-    s.sectionIdentity = undefined;
-    let body = s.native, name: string | undefined, icon: string | undefined;
+    const native = s.native;
+    if (s.seeding || !native) return result;
+    try { await hydrate($, s, options); } catch (error) { warn($, s, error); return result; }
+    const slot = identitySlot(s);
+    if (slot === undefined || e.name !== slot) return result;
+    let body = native.body, name: string | undefined, icon: string | undefined;
     try {
-      await hydrate($, s, options);
       const model = s.renderModel ?? await $.session.model();
       name = await selected($, s, options, model);
       if (name) { const content = await load($, options, name, model); body = content.body; icon = content.icon; }
     } catch (error) { warn($, s, error); name = undefined; }
-    s.sectionIdentity = { soul: name ?? null, ...(icon ? { icon } : {}) };
-    return { ...result, text: body + (result.text ? `\n\n${result.text}` : ""), breakPromptCache: true };
+    s.sectionIdentity = { slot, soul: name ?? null, ...(icon ? { icon } : {}) };
+    const prefix = slot === PRONOUNS ? native.raw.replace(native.body, () => body) : body;
+    return { ...result, text: prefix + (result.text ? `\n\n${result.text}` : ""), breakPromptCache: true };
   });
   on("prompt.compose", async ($, e, next) => {
     if (!s.seeding) {
@@ -237,16 +266,27 @@ export function register(on: On, options: PluginOptions = {}) {
     const result = await next(e);
     const target = result.sections.find((item) => item.id === (e.traits.includes("lean") ? "lean_body" : "intro"));
     const opening = target && openingParagraph(target.text);
-    if (!opening) { if (!s.seeding) warn($, s, "Could not apply the soul to Claude’s system prompt. The current prompt was left unchanged."); return result; }
-    s.native = opening.body;
-    if (s.seeding) return result;
-    const slot = result.sections.find((item) => item.id === "session_guidance");
-    if (!slot || !s.sectionIdentity) return result;
-    const sections = result.sections.map((item): PromptComposeSection => item === target ? { ...item, text: opening.rest } : item);
+    if (!target || !opening) { if (!s.seeding) warn($, s, "Could not apply the soul to Claude’s system prompt. The current prompt was left unchanged."); return result; }
+    if (s.seeding || !s.native) {
+      const following = result.sections[1];
+      // Fold only across the actual join between a sole shared opening and
+      // an adjacent session section; moving just the identity changes order.
+      const adjacent = result.sections[0] === target && target.scope === "shared"
+        && following?.id === PRONOUNS && following.scope === "session" && following.text;
+      const suffix = target.text.slice(target.text.indexOf(opening.body) + opening.body.length);
+      s.native = { ...opening, raw: target.text, ...(adjacent ? { foldedTail: `${suffix}\n\n${following.text}` } : {}) };
+      return result;
+    }
+    const identity = s.sectionIdentity;
+    const slot = identity && result.sections.find((item) => item.id === identity.slot);
+    if (!identity || !slot || identity.slot !== identitySlot(s)) return result;
+    const sections = identity.slot === PRONOUNS
+      ? result.sections.filter((item) => item !== target)
+      : result.sections.map((item): PromptComposeSection => item === target ? { ...item, text: opening.rest } : item);
     const first = sections.find((item) => item.text !== "")?.text;
     if (first !== undefined) {
       s.proposals.delete(slot.text);
-      s.proposals.set(slot.text, { ...s.sectionIdentity, section: slot.text, opening: first });
+      s.proposals.set(slot.text, { soul: identity.soul, icon: identity.icon, section: slot.text, opening: first });
       if (s.proposals.size > 8) s.proposals.delete(s.proposals.keys().next().value!);
     }
     return { ...result, sections };

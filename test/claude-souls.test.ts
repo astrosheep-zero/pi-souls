@@ -136,7 +136,7 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string;
   async function invoke(event: string, eventObject: any, next: (e: any) => any, matcher?: Record<string, unknown>) {
     for (const entry of hooks) {
       if (entry.event !== event) continue;
-      if (entry.matcher && !Object.entries(entry.matcher).every(([key, value]) => eventObject[key] === value)) continue;
+      if (entry.matcher && !Object.entries(entry.matcher).every(([key, value]) => Array.isArray(value) ? value.includes(eventObject[key]) : eventObject[key] === value)) continue;
       return await entry.hook($, eventObject, next);
     }
     return await next(eventObject);
@@ -159,17 +159,17 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string;
   }
 
   async function compose(model = "claude-opus-5-5", lean = false): Promise<PromptComposeResult> {
-    const result = sections(lean).map((section) => ({ ...section }));
-    for (let index = 0; index < result.length; index++) {
-      const section = result[index]!;
-      const next = await invoke("prompt.section", { name: section.id, text: section.text }, async (e) => ({ text: e.text }));
-      sectionResults.push({ name: section.id, text: next.text });
-      if (next.text === null) result.splice(index--, 1);
-      else section.text = next.text;
-    }
     return await invoke("prompt.compose", {
       model, promptModel: model, surfaces: [], tools: [], outputStyle: null, traits: lean ? ["lean"] : [],
-    }, async () => ({ sections: result }));
+    }, async () => {
+      const result = [];
+      for (const section of sections(lean)) {
+        const next = await invoke("prompt.section", { name: section.id, text: section.text }, async (e) => ({ text: e.text }));
+        sectionResults.push({ name: section.id, text: next.text });
+        if (next.text !== null) result.push({ ...section, text: next.text });
+      }
+      return { sections: result };
+    });
   }
 
   const h = {

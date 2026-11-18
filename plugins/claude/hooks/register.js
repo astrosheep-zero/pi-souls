@@ -244,6 +244,8 @@ async function perceive($, options, runtime, generation, name, moment, world, si
 
 // plugins/claude/hooks/register.ts
 var DEFAULTS = { mode: "defaults" };
+var PRONOUNS = "pronouns";
+var GUIDANCE = "session_guidance";
 var ENVELOPE = /* @__PURE__ */ new Set(["tool", "tool_use_id", "hook_event_name", "session_id", "transcript_path", "cwd"]);
 function openingParagraph(text) {
   const start2 = /^\s*/.exec(text)[0].length;
@@ -251,6 +253,15 @@ function openingParagraph(text) {
   const separator = /\r?\n[\t ]*\r?\n/.exec(text.slice(start2));
   const end = separator ? start2 + separator.index : text.length;
   return { body: text.slice(start2, end), rest: text.slice(0, start2) + text.slice(end) };
+}
+function identitySlot(s) {
+  const native = s.native;
+  if (!native || !s.choiceKnown) return void 0;
+  const first = s.journal.snapshot?.systemPrompt[0];
+  if (first === native.rest) return GUIDANCE;
+  if (native.foldedTail && first?.endsWith(native.foldedTail)) return PRONOUNS;
+  if (first === void 0 || first === s.compactedOpening) return native.foldedTail ? PRONOUNS : GUIDANCE;
+  return void 0;
 }
 function warn($, s, error) {
   const text = error instanceof Error ? error.message : String(error);
@@ -272,6 +283,7 @@ async function hydrate($, s, options, handles, rewind = false) {
       s.pendingBrain = void 0;
       s.human = void 0;
       s.toolNotes = [];
+      s.compactedOpening = void 0;
       s.observed = void 0;
       s.applied = void 0;
       status($, s);
@@ -408,12 +420,15 @@ function register(on, options = {}) {
       s.proposals.clear();
       s.applied = void 0;
       s.observed = void 0;
+      s.native = void 0;
+      s.compactedOpening = void 0;
+      s.sectionIdentity = void 0;
       s.human = void 0;
       s.pendingBrain = void 0;
       s.pendingChoice = void 0;
       s.toolNotes = [];
       s.reported.clear();
-    }
+    } else s.compactedOpening = s.journal.snapshot?.systemPrompt[0];
     s.pendingChoice = void 0;
     s.wake = { kind: "wake", source: e.source };
     return next(e);
@@ -454,13 +469,20 @@ function register(on, options = {}) {
     }
     return result;
   });
-  on("prompt.section", { name: "session_guidance" }, async ($, e, next) => {
+  on("prompt.section", { name: ["pronouns", "session_guidance"] }, async ($, e, next) => {
     const result = await next(e);
-    if (s.seeding || s.native === void 0) return result;
-    s.sectionIdentity = void 0;
-    let body = s.native, name, icon;
+    const native = s.native;
+    if (s.seeding || !native) return result;
     try {
       await hydrate($, s, options);
+    } catch (error) {
+      warn($, s, error);
+      return result;
+    }
+    const slot = identitySlot(s);
+    if (slot === void 0 || e.name !== slot) return result;
+    let body = native.body, name, icon;
+    try {
       const model = s.renderModel ?? await $.session.model();
       name = await selected($, s, options, model);
       if (name) {
@@ -472,8 +494,9 @@ function register(on, options = {}) {
       warn($, s, error);
       name = void 0;
     }
-    s.sectionIdentity = { soul: name ?? null, ...icon ? { icon } : {} };
-    return { ...result, text: body + (result.text ? `
+    s.sectionIdentity = { slot, soul: name ?? null, ...icon ? { icon } : {} };
+    const prefix = slot === PRONOUNS ? native.raw.replace(native.body, () => body) : body;
+    return { ...result, text: prefix + (result.text ? `
 
 ${result.text}` : ""), breakPromptCache: true };
   });
@@ -489,19 +512,27 @@ ${result.text}` : ""), breakPromptCache: true };
     const result = await next(e);
     const target = result.sections.find((item) => item.id === (e.traits.includes("lean") ? "lean_body" : "intro"));
     const opening = target && openingParagraph(target.text);
-    if (!opening) {
+    if (!target || !opening) {
       if (!s.seeding) warn($, s, "Could not apply the soul to Claude\u2019s system prompt. The current prompt was left unchanged.");
       return result;
     }
-    s.native = opening.body;
-    if (s.seeding) return result;
-    const slot = result.sections.find((item) => item.id === "session_guidance");
-    if (!slot || !s.sectionIdentity) return result;
-    const sections = result.sections.map((item) => item === target ? { ...item, text: opening.rest } : item);
+    if (s.seeding || !s.native) {
+      const following = result.sections[1];
+      const adjacent = result.sections[0] === target && target.scope === "shared" && following?.id === PRONOUNS && following.scope === "session" && following.text;
+      const suffix = target.text.slice(target.text.indexOf(opening.body) + opening.body.length);
+      s.native = { ...opening, raw: target.text, ...adjacent ? { foldedTail: `${suffix}
+
+${following.text}` } : {} };
+      return result;
+    }
+    const identity = s.sectionIdentity;
+    const slot = identity && result.sections.find((item) => item.id === identity.slot);
+    if (!identity || !slot || identity.slot !== identitySlot(s)) return result;
+    const sections = identity.slot === PRONOUNS ? result.sections.filter((item) => item !== target) : result.sections.map((item) => item === target ? { ...item, text: opening.rest } : item);
     const first = sections.find((item) => item.text !== "")?.text;
     if (first !== void 0) {
       s.proposals.delete(slot.text);
-      s.proposals.set(slot.text, { ...s.sectionIdentity, section: slot.text, opening: first });
+      s.proposals.set(slot.text, { soul: identity.soul, icon: identity.icon, section: slot.text, opening: first });
       if (s.proposals.size > 8) s.proposals.delete(s.proposals.keys().next().value);
     }
     return { ...result, sections };

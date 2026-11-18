@@ -40,6 +40,30 @@ async function session(host: WireHost) {
 }
 
 // Real host only, loopback API only; snapshots remain at their native default.
+test("adjacent pronouns slot restores the exact native wire system on clear", { timeout: 120_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-souls-native-wire-"));
+  const nativePlugin = join(dir, "native-plugin");
+  mkdirSync(join(nativePlugin, ".claude-plugin"), { recursive: true });
+  mkdirSync(join(nativePlugin, "hooks"));
+  writeFileSync(join(nativePlugin, ".claude-plugin/plugin.json"), JSON.stringify({ name: "wire-native", version: "0.0.1" }));
+  writeFileSync(join(nativePlugin, "hooks/hooks.json"), "{}");
+  const options = { home: join(dir, "home"), configDir: join(dir, "config"), cwd: join(dir, "work"), model: "claude-sonnet-5-5" };
+  const wire = (turn: WireTurn) => turn.apiBodies.at(-1)?.system;
+  let host = await createWireHost({ ...options, dir: join(dir, "stock"), pluginDir: nativePlugin });
+  try {
+    const nativeFirst = wire(await host.send("first request"));
+    const nativeSecond = wire(await host.send("second request"));
+    assert.ok(nativeFirst && nativeSecond);
+    await host.stop();
+    host = await createWireHost({ ...options, dir: join(dir, "souls"), souls, args: settings({ timeaware: false }) });
+    const active = wire(await human(host, "first request", A));
+    const opening = "You are an agent working with the user toward their goals, using your own judgment along the way.";
+    assert.equal(JSON.stringify(active), JSON.stringify(nativeFirst.map((block: any) => ({ ...block, text: block.text.replace(opening, A) }))));
+    await command(host, "/soul clear");
+    assert.equal(JSON.stringify(wire(await human(host, "second request", null))), JSON.stringify(nativeSecond));
+  } finally { await host.stop(); }
+});
+
 test("native commands change the next wire prompt, reload fresh content, and never run a model", { timeout: 120_000 }, async () => {
   const host = await createWireHost({ souls, args: settings(), debug: true });
   try {
@@ -85,7 +109,7 @@ test("native commands change the next wire prompt, reload fresh content, and nev
   } finally { await host.stop(); }
 });
 
-test("observe compact-fork clear defect and reset recovery while checking native branch persistence", { timeout: 120_000 }, async () => {
+test("folded opening follows native rewind, resume, compact and fork", { timeout: 120_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-souls-lifecycle-"));
   const options = { dir, souls, args: settings(), debug: true };
   let host = await createWireHost(options);
@@ -118,19 +142,12 @@ test("observe compact-fork clear defect and reset recovery while checking native
     await command(host, "/soul clear");
     await command(host, "/soul");
     assert.equal(clearWarnings(host).length, 0, "clear/status must not warn before a model request proves the mismatch");
-    const frozenTurn = await human(host, "fork clear keeps inherited host snapshot", B);
-    assert.equal(clearWarnings(host).length, 1);
-    assert.match(String(clearWarnings(host)[0].text), /still using @b.*new session.*\/soul reset/);
-    assert.ok(!JSON.stringify(frozenTurn.apiBodies).includes("turning off souls did not take effect"), "warning is human-only");
-    await human(host, "same frozen prompt again", B);
-    assert.equal(clearWarnings(host).length, 1, "the existing warning dedup prevents repeated logs");
-    assert.deepEqual((await session(host)).state.choice, { mode: "disabled" }, "clear receipt is durable even while host snapshot is frozen");
-    const frozen = await command(host, "/soul");
-    assert.match(frozen, /Active: b/);
-    assert.match(frozen, /Configured: none/);
+    await human(host, "fork clear restores native opening", null);
+    assert.equal(clearWarnings(host).length, 0);
+    assert.deepEqual((await session(host)).state.choice, { mode: "disabled" });
+    assert.match(await command(host, "/soul"), /Active: none/);
     await command(host, "/soul reset");
     await human(host, "fork follows defaults", A);
-    assert.equal(clearWarnings(host).length, 1, "reset recovery produces no new mismatch warning");
     await command(host, "/soul @b");
     await human(host, "fork can still select", B);
     const child = await session(host);
