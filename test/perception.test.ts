@@ -420,31 +420,32 @@ test("Pi builtin and directory perceptions share a human moment and fail indepen
     const rendered = renderer(
       { customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder("⌚ 02:14 · Tue, Oct 27\n(1h since *human* was last present)") },
       { expanded: false, outputPad: 1 },
-      { fg: (tone: string, text: string) => `[${tone}:${text}]` },
+      { fg: (_tone: string, text: string) => text },
     );
     assert.deepEqual(rendered.render(80).map((line: string) => line.trimEnd()), [
-      " [borderMuted:│ ][dim:⌚ 02:14 · Tue, Oct 27]",
-      " [borderMuted:│ ][dim:(1h since ][dim:human][dim: was last present)]",
+      "   ⌚ 02:14 · Tue, Oct 27",
+      "   (1h since human was last present)",
     ]);
     const multiLine = wrapReminder("[some other faye]\n\n*pokes screen* `` [too slow] ``\n\"hey copy\"\nline 4");
     const folded = renderer(
       { customType: PERCEPTION_MESSAGE_TYPE, content: multiLine },
       { expanded: false, outputPad: 1 },
-      { fg: (tone: string, text: string) => `[${tone}:${text}]` },
+      { fg: (_tone: string, text: string) => text },
     );
     assert.deepEqual(folded.render(120).map((line: string) => line.trimEnd()), [
-      " [borderMuted:│ ][muted:[some other faye]][dim: ][dim:pokes screen][dim: ][muted:[too slow]]",
-      " [borderMuted:│ ][dim:\"hey copy\"][muted:…]",
+      "   [some other faye]",
+      "   pokes screen [too slow] ⋯",
     ]);
     const unfolded = renderer(
       { customType: PERCEPTION_MESSAGE_TYPE, content: multiLine },
       { expanded: true, outputPad: 1 },
-      { fg: (tone: string, text: string) => `[${tone}:${text}]` },
+      { fg: (_tone: string, text: string) => text },
     );
     assert.deepEqual(unfolded.render(120).map((line: string) => line.trimEnd()), [
-      " [borderMuted:│ ][muted:[some other faye]][dim: ][dim:pokes screen][dim: ][muted:[too slow]]",
-      " [borderMuted:│ ][dim:\"hey copy\"]",
-      " [borderMuted:│ ][dim:line 4]",
+      "   [some other faye]",
+      "   pokes screen [too slow]",
+      "   \"hey copy\"",
+      "   line 4",
     ]);
     assert.equal(unwrapReminder(wrapReminder("hello")), "hello");
 
