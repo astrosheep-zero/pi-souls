@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { SessionManager, createAgentSession, DefaultResourceLoader, ModelRuntime, SettingsManager, type CustomMessageEntry, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage, type TranscriptContext } from "@earendil-works/pi-ai";
 import extension from "../src/index.ts";
@@ -13,102 +13,137 @@ function perceptionText(content: string): string {
   return content.slice("<system-reminder>\n".length, -"\n</system-reminder>".length);
 }
 
-test("Pi SDK persists reminders but anchors linger only in requests of its human run", async () => {
+async function setupSdk(t: TestContext, perception: string) {
   const dir = mkdtempSync(join(tmpdir(), "souls-perception-context-"));
   let dispose: (() => void) | undefined;
-  try {
-    mkdirSync(join(dir, "faye"));
-    writeFileSync(join(dir, "faye/SOUL.md"), "Faye");
-    writeFileSync(join(dir, "input.txt"), "fixture");
-    writeFileSync(join(dir, "faye/perception.ts"), `
-      let lingerCalls = 0;
-      export function perception(moment) {
-        if (moment.kind !== 'human') return { kind: 'linger', text: 'not human' };
-        if (moment.text.startsWith('linger ')) return { kind: 'linger', text: 'linger #' + ++lingerCalls };
-        return { kind: 'remind', text: '  directory: ' + moment.text + '  ' };
-      }
-    `);
-    const settings = SettingsManager.inMemory({ soulsDir: dir, defaultSoul: "faye" } as any);
-    const loader = new DefaultResourceLoader({
-      cwd: dir, agentDir: dir, settingsManager: settings,
-      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      extensionFactories: [extension],
-    });
-    await loader.reload();
-    const modelRuntime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
-    const model = modelRuntime.getModels("openai")[0]!;
-    await modelRuntime.setRuntimeApiKey(model.provider, "test-key-never-sent");
-    const sessionManager = SessionManager.inMemory(dir);
-    const { session } = await createAgentSession({ cwd: dir, agentDir: dir, settingsManager: settings, sessionManager, modelRuntime, model, resourceLoader: loader, tools: ["read"], thinkingLevel: "off" });
-    dispose = () => session.dispose();
-    const requests: TranscriptContext["messages"][] = [];
-    let readNext = false;
-    session.agent.streamFunction = (requestModel, context) => {
-      requests.push(structuredClone(context.messages));
-      const read = readNext;
-      readNext = false;
-      const message: AssistantMessage = {
-        role: "assistant", content: read
-          ? [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: join(dir, "input.txt") } }]
-          : [{ type: "text", text: "Done" }],
-        api: requestModel.api, provider: requestModel.provider, model: requestModel.id,
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        stopReason: read ? "toolUse" : "stop", timestamp: Date.now(),
-      };
-      const stream = createAssistantMessageEventStream();
-      stream.push({ type: "done", reason: read ? "toolUse" : "stop", message });
-      stream.end();
-      return stream;
-    };
-    const errors: string[] = [];
-    await session.bindExtensions({ onError: (event) => errors.push(event.error) });
-    await session.extensionRunner.emit({ type: "session_start", reason: "startup" });
-    await session.prompt("hello");
-    const notes = () => sessionManager.getBranch().filter((entry): entry is CustomMessageEntry => entry.type === "custom_message" && entry.customType === PERCEPTION_MESSAGE_TYPE);
-    assert.equal(notes().length, 1);
-    const note = notes()[0]!;
-    assert.equal(note.display, true);
-    assert.equal(typeof (note.details as { timestamp?: unknown })?.timestamp, "number");
-    assert.ok(typeof note.content === "string");
-    assert.match(perceptionText(note.content), /^⌚ [^\n]+\ndirectory: hello$/);
-    const sent = (i: number) => requests[i]!.map((message) => typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join(""));
-    assert.ok(sent(0).includes(note.content), "first request carries the persisted reminder");
-    await session.prompt("again");
-    assert.equal(notes().length, 2);
-    assert.equal(notes()[1]!.content, wrapReminder("directory: again"));
-    assert.deepEqual(notes()[1]!.details, { moment: "human" });
-    assert.ok(sent(1).includes(wrapReminder("directory: again")));
-
-    readNext = true;
-    await session.steer("queued steering user"); // Already queued by the first request.
-    await session.prompt("linger one");
-    assert.equal(requests.length, 4);
-    assert.ok(requests[3]!.some((message) => message.role === "toolResult"));
-    const firstLinger = wrapReminder("linger #1");
-    for (const index of [2, 3]) {
-      const text = sent(index);
-      assert.ok(text.includes("queued steering user"));
-      assert.equal(text[text.indexOf("linger one") + 1], firstLinger);
-      assert.equal(text.filter((value) => value === firstLinger).length, 1);
-      assert.equal(requests[index]![text.indexOf(firstLinger)]!.role, "user");
-    }
-    await session.sendCustomMessage({ customType: "test", content: "custom turn", display: false }, { triggerTurn: true });
-    assert.ok(sent(4).includes("custom turn"));
-    assert.ok(!sent(4).includes(firstLinger));
-
-    await session.prompt("linger two");
-    assert.equal(sent(5)[sent(5).indexOf("linger two") + 1], wrapReminder("linger #2"));
-    assert.ok(!sent(5).includes(firstLinger));
-    await session.prompt("/soul clear");
-    await session.prompt("linger without a soul");
-    assert.doesNotMatch(JSON.stringify(requests[6]), /linger #/);
-    assert.equal(notes().length, 2);
-    assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /linger #|not human/);
-    assert.deepEqual(errors, []);
-  } finally {
+  t.after(() => {
     dispose?.();
     rmSync(dir, { recursive: true, force: true });
+  });
+  mkdirSync(join(dir, "faye"));
+  writeFileSync(join(dir, "faye/SOUL.md"), "Faye");
+  writeFileSync(join(dir, "input.txt"), "fixture");
+  writeFileSync(join(dir, "faye/perception.ts"), perception);
+  const settings = SettingsManager.inMemory({ soulsDir: dir, defaultSoul: "faye" } as any);
+  const loader = new DefaultResourceLoader({
+    cwd: dir, agentDir: dir, settingsManager: settings,
+    noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    extensionFactories: [extension],
+  });
+  await loader.reload();
+  const modelRuntime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
+  const model = modelRuntime.getModels("openai")[0]!;
+  await modelRuntime.setRuntimeApiKey(model.provider, "test-key-never-sent");
+  const sessionManager = SessionManager.inMemory(dir);
+  const { session } = await createAgentSession({ cwd: dir, agentDir: dir, settingsManager: settings, sessionManager, modelRuntime, model, resourceLoader: loader, tools: ["read"], thinkingLevel: "off" });
+  dispose = () => session.dispose();
+  const requests: TranscriptContext["messages"][] = [];
+  let reads: string[] = [];
+  session.agent.streamFunction = (requestModel, context) => {
+    requests.push(structuredClone(context.messages));
+    const read = reads.length > 0;
+    const message: AssistantMessage = {
+      role: "assistant", content: read
+        ? reads.map((id) => ({ type: "toolCall", id, name: "read", arguments: { path: join(dir, "input.txt") } }))
+        : [{ type: "text", text: "Done" }],
+      api: requestModel.api, provider: requestModel.provider, model: requestModel.id,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: read ? "toolUse" : "stop", timestamp: Date.now(),
+    };
+    reads = [];
+    const stream = createAssistantMessageEventStream();
+    stream.push({ type: "done", reason: read ? "toolUse" : "stop", message });
+    stream.end();
+    return stream;
+  };
+  const errors: string[] = [];
+  await session.bindExtensions({ onError: (event) => errors.push(event.error) });
+  await session.extensionRunner.emit({ type: "session_start", reason: "startup" });
+  return { session, sessionManager, requests, errors, readNext: (...ids: string[]) => { reads = ids; } };
+}
+
+test("Pi SDK persists reminders but anchors linger only in requests of its human run", async (t) => {
+  const { session, sessionManager, requests, errors, readNext } = await setupSdk(t, `
+    let lingerCalls = 0;
+    export function perception(moment) {
+      if (moment.kind !== 'human') return { kind: 'linger', text: 'not human' };
+      if (moment.text.startsWith('linger ')) return { kind: 'linger', text: 'linger #' + ++lingerCalls };
+      return { kind: 'remind', text: '  directory: ' + moment.text + '  ' };
+    }
+  `);
+  await session.prompt("hello");
+  const notes = () => sessionManager.getBranch().filter((entry): entry is CustomMessageEntry => entry.type === "custom_message" && entry.customType === PERCEPTION_MESSAGE_TYPE);
+  assert.equal(notes().length, 1);
+  const note = notes()[0]!;
+  assert.equal(note.display, true);
+  assert.equal(typeof (note.details as { timestamp?: unknown })?.timestamp, "number");
+  assert.ok(typeof note.content === "string");
+  assert.match(perceptionText(note.content), /^⌚ [^\n]+\ndirectory: hello$/);
+  const sent = (i: number) => requests[i]!.map((message) => typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join(""));
+  assert.ok(sent(0).includes(note.content), "first request carries the persisted reminder");
+  await session.prompt("again");
+  assert.equal(notes().length, 2);
+  assert.equal(notes()[1]!.content, wrapReminder("directory: again"));
+  assert.deepEqual(notes()[1]!.details, { moment: "human" });
+  assert.ok(sent(1).includes(wrapReminder("directory: again")));
+
+  readNext("read-1");
+  await session.steer("queued steering user"); // Already queued by the first request.
+  await session.prompt("linger one");
+  assert.equal(requests.length, 4);
+  assert.ok(requests[3]!.some((message) => message.role === "toolResult"));
+  const firstLinger = wrapReminder("linger #1");
+  for (const index of [2, 3]) {
+    const text = sent(index);
+    assert.ok(text.includes("queued steering user"));
+    assert.equal(text[text.indexOf("linger one") + 1], firstLinger);
+    assert.equal(text.filter((value) => value === firstLinger).length, 1);
+    assert.equal(requests[index]![text.indexOf(firstLinger)]!.role, "user");
   }
+  await session.sendCustomMessage({ customType: "test", content: "custom turn", display: false }, { triggerTurn: true });
+  assert.ok(sent(4).includes("custom turn"));
+  assert.ok(!sent(4).includes(firstLinger));
+
+  await session.prompt("linger two");
+  assert.equal(sent(5)[sent(5).indexOf("linger two") + 1], wrapReminder("linger #2"));
+  assert.ok(!sent(5).includes(firstLinger));
+  await session.prompt("/soul clear");
+  await session.prompt("linger without a soul");
+  assert.doesNotMatch(JSON.stringify(requests[6]), /linger #/);
+  assert.equal(notes().length, 2);
+  assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /linger #|not human/);
+  assert.deepEqual(errors, []);
+});
+
+test("Pi SDK carries startup linger through a run and places both tool phases after a serial tool batch", async (t) => {
+  const { session, sessionManager, requests, errors, readNext } = await setupSdk(t, `
+    let toolMoments = 0;
+    export function perception(moment) {
+      if (moment.kind === 'wake' && moment.source === 'startup') return { kind: 'linger', text: 'startup linger' };
+      if (moment.kind === 'tool') return { kind: 'linger', text: 'tool linger ' + ++toolMoments + ' ' + moment.phase };
+    }
+  `);
+  session.agent.toolExecution = "sequential";
+  readNext("read-1", "read-2");
+  await session.prompt("run tools");
+  assert.equal(requests.length, 2);
+  const transcript = (index: number) => requests[index]!.filter((message) => message.role !== "system");
+  for (const i of [0, 1]) {
+    assert.equal(transcript(i)[0]?.role, "user");
+    assert.equal(transcript(i)[0]?.content, wrapReminder("startup linger"));
+  }
+  assert.doesNotMatch(JSON.stringify(requests[0]), /tool linger/);
+  const continuation = transcript(1);
+  const call = continuation.findIndex((message) => message.role === "assistant");
+  assert.ok(call >= 0);
+  assert.deepEqual(continuation.slice(call + 1).map((message) => [message.role, message.role === "toolResult" ? message.toolCallId : message.content]), [
+    ["toolResult", "read-1"], ["toolResult", "read-2"],
+    ...["1 before", "2 after", "3 before", "4 after"].map((label) => ["user", wrapReminder(`tool linger ${label}`)]),
+  ]);
+  await session.prompt("next run");
+  assert.doesNotMatch(JSON.stringify(requests[2]), /startup linger|tool linger/);
+  assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /startup linger|tool linger/);
+  assert.deepEqual(errors, []);
 });
 
 const model = { provider: "provider", id: "model" };
@@ -192,6 +227,28 @@ test("Pi never moves a linger to a later user when compaction drops its anchor",
     });
     h.session.appendCompaction("summary", followId, 100);
     assert.equal(await h.fire("context", { messages: h.session.buildSessionContext().messages }), undefined);
+  } finally {
+    h.restore();
+  }
+});
+
+test("Pi anchors a compaction wake linger to the summary, not the system checkpoint", async () => {
+  const h = setup({
+    "faye/SOUL.md": "Faye",
+    "faye/perception.ts": "export const perception = ({ source }) => source === 'compact' ? { kind: 'linger', text: 'compact wake' } : undefined;",
+  });
+  try {
+    h.session.appendMessage({ role: "system", content: "checkpoint", timestamp: 1 });
+    const kept = { role: "user", content: "kept message", timestamp: 2 } as const;
+    const keptId = h.session.appendMessage(kept);
+    h.session.appendCompaction("summary", keptId, 100);
+    await h.fire("session_compact");
+    const [checkpoint, summary] = h.session.buildSessionContext().messages;
+    assert.equal(checkpoint?.role, "system");
+    assert.equal(summary?.role, "compactionSummary");
+    assert.deepEqual(await h.fire("context", { messages: structuredClone([summary, kept]) }), {
+      messages: [summary, { role: "user", content: wrapReminder("compact wake"), timestamp: summary.timestamp }, kept],
+    });
   } finally {
     h.restore();
   }

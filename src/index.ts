@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { buildSessionProjection, type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext, type ProjectedSessionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { applySoul, replaceForcedPreamble } from "./prompt.ts";
 import { footerText, resolvePresence, resolvePerception, selectionPresence, type Presence } from "./presence.ts";
 import { ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
@@ -29,6 +29,13 @@ function describe(selection: Selection | undefined, model: ExtensionContext["mod
   return `${selection.name} (${selection.source})`;
 }
 
+type Linger = {
+  sessionId: string; soul: string; text: string; at: number; previousLeaf: string | null;
+  anchor: "next-user" | "visible-at-or-before"; anchorId?: string;
+};
+const visibleMessage = (entry: ProjectedSessionEntry) => entry.messages.findLast((message) => message.role !== "system");
+const contentKey = (message: AgentMessage) => JSON.stringify("content" in message ? message.content : undefined);
+
 export default function soulsExtension(pi: ExtensionAPI) {
   registerPresenceUI(pi);
   pi.registerFlag("soulless", { description: "Skip default souls (session /soul still wins)", type: "boolean", default: false });
@@ -40,7 +47,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // Hold live options: handlers after ours can still set customPrompt or forceSystemPrompt.
   let options: BuildSystemPromptOptions | undefined;
   let running = false;
-  let linger: { sessionId: string; soul: string; text: string; previousLeaf: string | null; anchorId?: string } | undefined;
+  let lingers: Linger[] = [];
   // What the projection handler learned for this request, read by the transition handler.
   let projection: { known: boolean; soul: string | null } | undefined;
   let forceReported = false;
@@ -76,7 +83,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
     const now = Date.now();
     const world = worldFor({ now, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, soul: selection.name, absenceMs: absence(branch, now) });
     return {
-      now, sessionId: world.sessionId, soul: selection.name, previousLeaf: branch.at(-1)?.id ?? null,
+      branch, now, sessionId: world.sessionId, soul: selection.name, previousLeaf: branch.at(-1)?.id ?? null,
       clock: (moment: Moment) => {
         readSoul(config.dir, selection.name, soulVariables(ctx));
         return timePerception(lastTimeNoteTimestamp(branch))(moment, world);
@@ -88,17 +95,29 @@ export default function soulsExtension(pi: ExtensionAPI) {
       timeaware: config.timeaware,
     };
   };
+  const addLinger = ({ branch, now: at, sessionId, soul, previousLeaf }: NonNullable<ReturnType<typeof perceptionContext>>, anchor: Linger["anchor"], text: string) => {
+    const linger: Linger = { sessionId, soul, text, at, previousLeaf, anchor };
+    if (anchor === "visible-at-or-before") {
+      // Pin against the triggering branch, before a later projection can remove the anchor.
+      const visible = new Set(buildSessionProjection(branch, previousLeaf).entries.filter(visibleMessage).map(({ sourceEntry }) => sourceEntry.id));
+      linger.anchorId = branch.findLast((entry) => visible.has(entry.id))?.id;
+    }
+    lingers.push(linger);
+  };
   const perceive = async (moment: Exclude<Moment, { kind: "human" }>, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
     try {
-      const said = await perceptionContext(ctx, customPrompt)?.directory(moment);
+      const perception = perceptionContext(ctx, customPrompt);
+      if (!perception) return;
+      const said = await perception.directory(moment);
       if (said?.kind === "remind") sendReminder(pi, { text: said.text, details: { moment: moment.kind } });
+      if (said?.kind === "linger") addLinger(perception, "visible-at-or-before", said.text);
     } catch {
       // A perception is decoration: a broken configuration never breaks the host.
     }
   };
-  const humanReminder = async (text: string, ctx: ExtensionContext, customPrompt: string | undefined) => {
+  const humanReminder = async (text: string, ctx: ExtensionContext, runOptions: BuildSystemPromptOptions) => {
     try {
-      const perception = perceptionContext(ctx, customPrompt);
+      const perception = perceptionContext(ctx, runOptions.customPrompt);
       if (!perception) return;
       const moment = { kind: "human", text } as const;
       const [clock, directory] = await Promise.all([
@@ -106,14 +125,10 @@ export default function soulsExtension(pi: ExtensionAPI) {
         humanPerception(() => perception.directory(moment)),
       ]);
       const content = [clock?.text, directory?.kind === "remind" ? directory.text : undefined].filter(Boolean).join("\n");
-      return {
-        message: content ? {
-          customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(content), display: true,
-          details: { moment: "human", ...(clock ? { timestamp: perception.now } : {}) },
-        } : undefined,
-        linger: directory?.kind === "linger" ? {
-          sessionId: perception.sessionId, soul: perception.soul, previousLeaf: perception.previousLeaf, text: directory.text,
-        } : undefined,
+      if (directory?.kind === "linger" && running && options === runOptions) addLinger(perception, "next-user", directory.text);
+      if (content) return {
+        customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(content), display: true,
+        details: { moment: "human", ...(clock ? { timestamp: perception.now } : {}) },
       };
     } catch {
       // A broken configuration never prevents the prompt from starting.
@@ -152,7 +167,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   };
   pi.on("session_start", (event, ctx) => {
     cwd = ctx.cwd; reported = undefined; forceReported = false;
-    options = undefined; running = false; linger = undefined;
+    options = undefined; running = false; lingers = [];
     projection = undefined; forcedProjection = undefined;
     promptKnown = false; seenPrompt = undefined;
     toolCalls.clear();
@@ -172,17 +187,15 @@ export default function soulsExtension(pi: ExtensionAPI) {
   });
   pi.on("session_tree", (_event, ctx) => refreshFooter(ctx, promptValue()));
   pi.on("before_agent_start", async (event, ctx) => {
-    linger = undefined;
     options = event.systemPromptOptions; running = true; forcedProjection = undefined;
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
     if ("messageType" in event && event.messageType !== "user") return;
-    const result = await humanReminder(event.prompt, ctx, options.customPrompt);
-    if (running && options === event.systemPromptOptions) linger = result?.linger;
-    if (result?.message) return { message: result.message };
+    const message = await humanReminder(event.prompt, ctx, event.systemPromptOptions);
+    if (message) return { message };
   });
   pi.on("agent_settled", () => {
-    running = false; linger = undefined; projection = undefined;
+    running = false; lingers = []; projection = undefined;
   });
   pi.on("tool_call", (event, ctx) => {
     const filePath = toolFilePath(event.input);
@@ -399,41 +412,57 @@ export default function soulsExtension(pi: ExtensionAPI) {
     }
   };
 
+  // undefined means the origin is lost; null is an intentional head anchor.
+  const anchorIdFor = (linger: Linger, branch: readonly SessionEntry[]): string | null | undefined => {
+    if (linger.anchor === "visible-at-or-before") return linger.anchorId ?? null;
+    if (linger.anchorId !== undefined) return linger.anchorId;
+    // Pin the first user entry after the start hook, not queued steering.
+    const previous = branch.findIndex((entry) => entry.id === linger.previousLeaf);
+    if (previous < 0 && linger.previousLeaf !== null) return;
+    return linger.anchorId = branch.slice(previous + 1).find((entry) => entry.type === "message" && entry.message.role === "user")?.id;
+  };
+
   pi.on("context", (event, ctx) => {
-    const active = linger;
-    if (!running || !active) return;
+    if (!lingers.length) return;
     const session = ctx.sessionManager;
     try {
       const { branch, selection } = perceptionSelection(ctx, options?.customPrompt);
-      // Pi has no selection generation; use the live soul and session identity.
-      if (selection?.name !== active.soul || session.getSessionId() !== active.sessionId) {
-        linger = undefined;
+      const sessionId = session.getSessionId();
+      if (lingers.some((linger) => selection?.name !== linger.soul || sessionId !== linger.sessionId)) {
+        lingers = [];
         return;
       }
-      if (!active.anchorId) {
-        // Pin the first user entry added after the start hook, not queued steering.
-        const previous = branch.findIndex((entry) => entry.id === active.previousLeaf);
-        if (previous >= 0 || active.previousLeaf === null) {
-          active.anchorId = branch.slice(previous + 1).find((entry) => entry.type === "message" && entry.message.role === "user")?.id;
-        }
-      }
       const projected = session.buildSessionProjection();
-      const anchor = projected.entries.find(({ sourceEntry }) => sourceEntry.id === active.anchorId)?.messages[0];
-      if (anchor?.role === "user") {
-        // Context has cloned messages without entry ids; never guess on a collision.
-        const content = JSON.stringify(anchor.content);
-        const matches = (message: AgentMessage) => message.role === "user" && message.timestamp === anchor.timestamp && JSON.stringify(message.content) === content;
-        const index = event.messages.findIndex(matches);
-        if (index >= 0 && index === event.messages.findLastIndex(matches) && !projected.messages.some((message) => message !== anchor && matches(message))) {
-          const messages = [...event.messages];
-          messages.splice(index + 1, 0, { role: "user", content: wrapReminder(active.text), timestamp: anchor.timestamp });
-          return { messages };
+      const inserts: { position: number; message: AgentMessage }[] = [];
+      lingers = lingers.filter((linger) => {
+        const id = anchorIdFor(linger, branch);
+        if (id === undefined) return false;
+        let position = 0, timestamp = linger.at;
+        if (id !== null) {
+          const entry = projected.entries.find(({ sourceEntry }) => sourceEntry.id === id);
+          const anchor = entry && visibleMessage(entry);
+          if (!anchor) return false;
+          // Context has cloned messages without entry ids; never guess on a collision.
+          const content = contentKey(anchor);
+          const matches = (message: AgentMessage) => message.role === anchor.role && message.timestamp === anchor.timestamp && contentKey(message) === content;
+          const index = event.messages.findIndex(matches);
+          if (index < 0 || index !== event.messages.findLastIndex(matches) || projected.messages.findIndex(matches) !== projected.messages.findLastIndex(matches)) return false;
+          position = index + 1;
+          while (event.messages[position]?.role === "toolResult") position++;
+          timestamp = anchor.timestamp;
         }
-      }
+        inserts.push({ position, message: { role: "user", content: wrapReminder(linger.text), timestamp } });
+        return true;
+      });
+      if (!inserts.length) return;
+      const messages = [...event.messages];
+      // Work backwards, including within a position, so splicing preserves creation order.
+      for (const { position, message } of inserts.reverse().sort((a, b) => b.position - a.position)) messages.splice(position, 0, message);
+      return { messages };
     } catch {
       // A perception is decoration: never obstruct a request.
+      lingers = [];
     }
-    linger = undefined; // The origin is no longer visible; do not re-anchor.
   });
 
   // First handler owns presence/projection and its existing error path, including the no-UI throw.
