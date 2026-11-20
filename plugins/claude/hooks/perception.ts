@@ -51,6 +51,6 @@ export async function perceptionUtterance($: Engine, options: PluginOptions, run
     if (!path || generation !== runtime.generation || signal?.aborted) return undefined;
     const said = await runPerception($, runtime, { path, moment, world: facts }, signal) as Utterance | undefined;
     if (generation !== runtime.generation || signal?.aborted) return undefined;
-    return said && (said.kind === "remind" || said.kind === "linger") && typeof said.text === "string" && said.text.trim() ? said : undefined;
+    return said && (said.kind === "remind" || said.kind === "ephemeral") && typeof said.text === "string" && said.text.trim() ? said : undefined;
   } catch { return undefined; }
 }

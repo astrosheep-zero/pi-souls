@@ -104,8 +104,8 @@ export function perception() { return {kind: 'remind', text: Label.text + ':' + 
     assert.deepEqual(await call("session-b"), await piB(moment as any, world as any));
 
     const alternate = join(dir, "perception.mjs");
-    writeFileSync(alternate, "export default () => ({ kind: 'linger', text: 'alternate' });");
-    assert.deepEqual(await runtime.call("perceive", { path: alternate, moment, world }), { kind: "linger", text: "alternate" });
+    writeFileSync(alternate, "export default () => ({ kind: 'ephemeral', text: 'alternate' });");
+    assert.deepEqual(await runtime.call("perceive", { path: alternate, moment, world }), { kind: "ephemeral", text: "alternate" });
     assert.deepEqual(await call(), await loadPerception(piPath)(moment as any, world as any));
   } finally { await runtime.stop(); }
 });

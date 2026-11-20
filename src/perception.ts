@@ -59,7 +59,7 @@ export type Moment =
       ok?: boolean;
     };
 
-export type UtteranceKind = "remind" | "linger";
+export type UtteranceKind = "remind" | "ephemeral";
 
 export interface Utterance {
   kind: UtteranceKind;
@@ -208,7 +208,7 @@ function pick(value: unknown): Perception | undefined {
 export function utterance(value: unknown): Utterance | undefined {
   if (!object(value)) return undefined;
   const { kind, text } = value;
-  return (kind === "remind" || kind === "linger") && typeof text === "string" && text.trim() ? { kind, text } : undefined;
+  return (kind === "remind" || kind === "ephemeral") && typeof text === "string" && text.trim() ? { kind, text } : undefined;
 }
 
 /**

@@ -241,7 +241,7 @@ async function perceptionUtterance($, options, runtime, generation, name, moment
     if (!path || generation !== runtime.generation || signal?.aborted) return void 0;
     const said = await runPerception($, runtime, { path, moment, world: facts }, signal);
     if (generation !== runtime.generation || signal?.aborted) return void 0;
-    return said && (said.kind === "remind" || said.kind === "linger") && typeof said.text === "string" && said.text.trim() ? said : void 0;
+    return said && (said.kind === "remind" || said.kind === "ephemeral") && typeof said.text === "string" && said.text.trim() ? said : void 0;
   } catch {
     return void 0;
   }
@@ -397,7 +397,7 @@ async function humanReminders($, s, options, text, signal) {
   const clock = timePerception(s.journal.noteAt);
   const texts = await Promise.all([
     options.timeaware !== false ? boundedText($, world.then(async (facts) => (await clock(moment, facts))?.text)) : void 0,
-    // Claude does not support ephemeral linger delivery.
+    // Claude does not support ephemeral delivery.
     boundedText($, perceptionUtterance($, options, s.runtime, generation, soul, moment, world, signal).then((said) => said?.kind === "remind" ? said.text : void 0))
   ]);
   if (generation !== s.runtime.generation || s.proposals.get(proposal.section)?.soul !== soul || signal?.aborted) return [];

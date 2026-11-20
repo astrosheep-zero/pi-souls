@@ -183,7 +183,7 @@ async function humanReminders($: Engine, s: State, options: PluginOptions, text:
   const clock = timePerception(s.journal.noteAt);
   const texts = await Promise.all([
     options.timeaware !== false ? boundedText($, world.then(async (facts) => (await clock(moment, facts))?.text)) : undefined,
-    // Claude does not support ephemeral linger delivery.
+    // Claude does not support ephemeral delivery.
     boundedText($, perceptionUtterance($, options, s.runtime, generation, soul, moment, world, signal)
       .then((said) => said?.kind === "remind" ? said.text : undefined)),
   ]);

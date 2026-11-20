@@ -103,7 +103,7 @@ const writePerception = (name: string, label: string) => {
     export function perception(moment) { counter.n += Unit.One;
       const row={label:Label.text,n:counter.n,pid:process.pid,kind:moment.kind};
       appendFileSync(${JSON.stringify(trace)},JSON.stringify(row)+'\\n');
-      if (moment.kind === 'human' && moment.text === 'ignore this linger') return {kind:'linger',text:'IGNORED_LINGER'};
+      if (moment.kind === 'human' && moment.text === 'ignore this ephemeral') return {kind:'ephemeral',text:'IGNORED_EPHEMERAL'};
       return {kind:'remind',text:'RUNTIME_CALL:'+Label.text+':'+counter.n}; }`);
 };
 const rows = (): { label: string; n: number; pid: number; kind: string }[] =>
@@ -117,14 +117,14 @@ try {
   assert.equal(new Set(a.map((row) => row.pid)).size, 1);
   const visible = JSON.stringify(live.apiBodies.map((body) => body.messages));
   assert.ok(visible.includes("RUNTIME_CALL:A:"), "perception enters a future actual request");
-  const lingerTurn = await live.send("ignore this linger");
-  assert.equal(lingerTurn.apiBodies.length, 1);
-  assert.equal(rows().at(-1)?.kind, "human", "Claude ran the linger perception");
-  const nextTurn = await live.send("after ignored linger");
-  assert.doesNotMatch(JSON.stringify([...lingerTurn.apiBodies, ...nextTurn.apiBodies]), /IGNORED_LINGER/);
+  const ephemeralTurn = await live.send("ignore this ephemeral");
+  assert.equal(ephemeralTurn.apiBodies.length, 1);
+  assert.equal(rows().at(-1)?.kind, "human", "Claude ran the ephemeral perception");
+  const nextTurn = await live.send("after ignored ephemeral");
+  assert.doesNotMatch(JSON.stringify([...ephemeralTurn.apiBodies, ...nextTurn.apiBodies]), /IGNORED_EPHEMERAL/);
   const transcript = await live.transcript();
   assert.ok(transcript?.length);
-  assert.doesNotMatch(JSON.stringify(transcript), /IGNORED_LINGER/);
+  assert.doesNotMatch(JSON.stringify(transcript), /IGNORED_EPHEMERAL/);
   a = rows().filter((row) => row.label === "A");
   const beforeSwitch = a.at(-1)!.n;
   await live.send("/soul @b"); await live.send("use B"); await live.send("observe B");

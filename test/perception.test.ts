@@ -62,12 +62,12 @@ async function setupSdk(t: TestContext, perception: string) {
   return { session, sessionManager, requests, errors, readNext: (...ids: string[]) => { reads = ids; } };
 }
 
-test("Pi SDK persists reminders but anchors linger only in requests of its human run", async (t) => {
+test("Pi SDK persists reminders but anchors ephemeral only in requests of its human run", async (t) => {
   const { session, sessionManager, requests, errors, readNext } = await setupSdk(t, `
-    let lingerCalls = 0;
+    let ephemeralCalls = 0;
     export function perception(moment) {
-      if (moment.kind !== 'human') return { kind: 'linger', text: 'not human' };
-      if (moment.text.startsWith('linger ')) return { kind: 'linger', text: 'linger #' + ++lingerCalls };
+      if (moment.kind !== 'human') return { kind: 'ephemeral', text: 'not human' };
+      if (moment.text.startsWith('ephemeral ')) return { kind: 'ephemeral', text: 'ephemeral #' + ++ephemeralCalls };
       return { kind: 'remind', text: '  directory: ' + moment.text + '  ' };
     }
   `);
@@ -89,38 +89,38 @@ test("Pi SDK persists reminders but anchors linger only in requests of its human
 
   readNext("read-1");
   await session.steer("queued steering user"); // Already queued by the first request.
-  await session.prompt("linger one");
+  await session.prompt("ephemeral one");
   assert.equal(requests.length, 4);
   assert.ok(requests[3]!.some((message) => message.role === "toolResult"));
-  const firstLinger = wrapReminder("linger #1");
+  const firstEphemeral = wrapReminder("ephemeral #1");
   for (const index of [2, 3]) {
     const text = sent(index);
     assert.ok(text.includes("queued steering user"));
-    assert.equal(text[text.indexOf("linger one") + 1], firstLinger);
-    assert.equal(text.filter((value) => value === firstLinger).length, 1);
-    assert.equal(requests[index]![text.indexOf(firstLinger)]!.role, "user");
+    assert.equal(text[text.indexOf("ephemeral one") + 1], firstEphemeral);
+    assert.equal(text.filter((value) => value === firstEphemeral).length, 1);
+    assert.equal(requests[index]![text.indexOf(firstEphemeral)]!.role, "user");
   }
   await session.sendCustomMessage({ customType: "test", content: "custom turn", display: false }, { triggerTurn: true });
   assert.ok(sent(4).includes("custom turn"));
-  assert.ok(!sent(4).includes(firstLinger));
+  assert.ok(!sent(4).includes(firstEphemeral));
 
-  await session.prompt("linger two");
-  assert.equal(sent(5)[sent(5).indexOf("linger two") + 1], wrapReminder("linger #2"));
-  assert.ok(!sent(5).includes(firstLinger));
+  await session.prompt("ephemeral two");
+  assert.equal(sent(5)[sent(5).indexOf("ephemeral two") + 1], wrapReminder("ephemeral #2"));
+  assert.ok(!sent(5).includes(firstEphemeral));
   await session.prompt("/soul clear");
-  await session.prompt("linger without a soul");
-  assert.doesNotMatch(JSON.stringify(requests[6]), /linger #/);
+  await session.prompt("ephemeral without a soul");
+  assert.doesNotMatch(JSON.stringify(requests[6]), /ephemeral #/);
   assert.equal(notes().length, 2);
-  assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /linger #|not human/);
+  assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /ephemeral #|not human/);
   assert.deepEqual(errors, []);
 });
 
-test("Pi SDK carries startup linger through a run and places both tool phases after a serial tool batch", async (t) => {
+test("Pi SDK carries startup ephemeral through a run and places both tool phases after a serial tool batch", async (t) => {
   const { session, sessionManager, requests, errors, readNext } = await setupSdk(t, `
     let toolMoments = 0;
     export function perception(moment) {
-      if (moment.kind === 'wake' && moment.source === 'startup') return { kind: 'linger', text: 'startup linger' };
-      if (moment.kind === 'tool') return { kind: 'linger', text: 'tool linger ' + ++toolMoments + ' ' + moment.phase };
+      if (moment.kind === 'wake' && moment.source === 'startup') return { kind: 'ephemeral', text: 'startup ephemeral' };
+      if (moment.kind === 'tool') return { kind: 'ephemeral', text: 'tool ephemeral ' + ++toolMoments + ' ' + moment.phase };
     }
   `);
   session.agent.toolExecution = "sequential";
@@ -130,19 +130,19 @@ test("Pi SDK carries startup linger through a run and places both tool phases af
   const transcript = (index: number) => requests[index]!.filter((message) => message.role !== "system");
   for (const i of [0, 1]) {
     assert.equal(transcript(i)[0]?.role, "user");
-    assert.equal(transcript(i)[0]?.content, wrapReminder("startup linger"));
+    assert.equal(transcript(i)[0]?.content, wrapReminder("startup ephemeral"));
   }
-  assert.doesNotMatch(JSON.stringify(requests[0]), /tool linger/);
+  assert.doesNotMatch(JSON.stringify(requests[0]), /tool ephemeral/);
   const continuation = transcript(1);
   const call = continuation.findIndex((message) => message.role === "assistant");
   assert.ok(call >= 0);
   assert.deepEqual(continuation.slice(call + 1).map((message) => [message.role, message.role === "toolResult" ? message.toolCallId : message.content]), [
     ["toolResult", "read-1"], ["toolResult", "read-2"],
-    ...["1 before", "2 after", "3 before", "4 after"].map((label) => ["user", wrapReminder(`tool linger ${label}`)]),
+    ...["1 before", "2 after", "3 before", "4 after"].map((label) => ["user", wrapReminder(`tool ephemeral ${label}`)]),
   ]);
   await session.prompt("next run");
-  assert.doesNotMatch(JSON.stringify(requests[2]), /startup linger|tool linger/);
-  assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /startup linger|tool linger/);
+  assert.doesNotMatch(JSON.stringify(requests[2]), /startup ephemeral|tool ephemeral/);
+  assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /startup ephemeral|tool ephemeral/);
   assert.deepEqual(errors, []);
 });
 
@@ -210,10 +210,10 @@ function setup(files: Record<string, string> = {}, settings: Record<string, unkn
   };
 }
 
-test("Pi never moves a linger to a later user when compaction drops its anchor", async () => {
+test("Pi never moves an ephemeral to a later user when compaction drops its anchor", async () => {
   const h = setup({
     "faye/SOUL.md": "Faye",
-    "faye/perception.ts": "export const perception = () => ({ kind: 'linger', text: 'transient' });",
+    "faye/perception.ts": "export const perception = () => ({ kind: 'ephemeral', text: 'transient' });",
   });
   try {
     const opener = { role: "user", content: "opening prompt", timestamp: 1 } as const;
@@ -232,10 +232,10 @@ test("Pi never moves a linger to a later user when compaction drops its anchor",
   }
 });
 
-test("Pi anchors a compaction wake linger to the summary, not the system checkpoint", async () => {
+test("Pi anchors a compaction wake ephemeral to the summary, not the system checkpoint", async () => {
   const h = setup({
     "faye/SOUL.md": "Faye",
-    "faye/perception.ts": "export const perception = ({ source }) => source === 'compact' ? { kind: 'linger', text: 'compact wake' } : undefined;",
+    "faye/perception.ts": "export const perception = ({ source }) => source === 'compact' ? { kind: 'ephemeral', text: 'compact wake' } : undefined;",
   });
   try {
     h.session.appendMessage({ role: "system", content: "checkpoint", timestamp: 1 });
@@ -329,10 +329,10 @@ test("world carries the soul's own store and omits an unknown absence", () => {
 
 test("utterances require a known kind and nonempty text", () => {
   assert.deepEqual(utterance({ kind: "remind", text: "keep" }), { kind: "remind", text: "keep" });
-  assert.deepEqual(utterance({ kind: "linger", text: "turn" }), { kind: "linger", text: "turn" });
+  assert.deepEqual(utterance({ kind: "ephemeral", text: "turn" }), { kind: "ephemeral", text: "turn" });
   assert.equal(utterance({ text: "legacy" }), undefined);
   assert.equal(utterance({ kind: "other", text: "unknown" }), undefined);
-  assert.equal(utterance({ kind: "linger", text: "  " }), undefined);
+  assert.equal(utterance({ kind: "ephemeral", text: "  " }), undefined);
 });
 
 test("a perception module answers, and every failure stays silent", async () => {
@@ -347,8 +347,8 @@ test("a perception module answers, and every failure stays silent", async () => 
     assert.deepEqual(await loadPerception(join(dir, "speaks.ts"))({ kind: "human", text: "hi" }, world), { kind: "remind", text: "fresh instance" });
     assert.deepEqual(await speaks({ kind: "wake", source: "startup" }, world), { kind: "remind", text: "wake:2" });
 
-    write("default.mjs", "export default () => ({ kind: 'linger', text: 'default export' });");
-    assert.deepEqual(await loadPerception(join(dir, "default.mjs"))({ kind: "human", text: "hi" }, world), { kind: "linger", text: "default export" });
+    write("default.mjs", "export default () => ({ kind: 'ephemeral', text: 'default export' });");
+    assert.deepEqual(await loadPerception(join(dir, "default.mjs"))({ kind: "human", text: "hi" }, world), { kind: "ephemeral", text: "default export" });
 
     write("callable.ts", "module.exports = function perception() { return { kind: 'remind', text: 'callable' }; };");
     assert.deepEqual(await loadPerception(join(dir, "callable.ts"))({ kind: "human", text: "hi" }, world), { kind: "remind", text: "callable" });
@@ -493,7 +493,7 @@ test("/soul reload refreshes CommonJS perceptions without evicting other souls",
   }, files);
 });
 
-test("Pi drops delayed and failed linger without blocking the clock or sending it later", { timeout: 5_000 }, async () => {
+test("Pi drops delayed and failed ephemeral without blocking the clock or sending it later", { timeout: 5_000 }, async () => {
   await withTime(1_700_000_000_000, async (h) => {
     const start = performance.now();
     const message = await h.human("slow answer");
@@ -514,7 +514,7 @@ test("Pi drops delayed and failed linger without blocking the clock or sending i
     "faye/perception.ts": `export const perception = async (moment) => {
       if (moment.text === 'throw') throw new Error('boom');
       await new Promise((r) => setTimeout(r, 2300));
-      return { kind: 'linger', text: 'too late' };
+      return { kind: 'ephemeral', text: 'too late' };
     };`,
   }, { timeaware: true });
 });

@@ -85,7 +85,7 @@ A directory soul may answer lifecycle moments with code. `<soulsDir>/<name>/perc
 
 ```ts
 export function perception(moment, world) {
-  if (moment.kind === "human") return { kind: "linger", text: "……" };
+  if (moment.kind === "human") return { kind: "ephemeral", text: "……" };
   if (moment.kind === "tool" && moment.phase === "after") return { kind: "remind", text: `${moment.toolName} ${moment.ok ? "ok" : "failed"}` };
   return undefined; // silence is always allowed
 }
@@ -98,7 +98,7 @@ Moments: `wake` (`source`: `startup`, `resume`, `fork`, `clear`, `compact`), `hu
 An answer must contain `kind` and nonempty `text`; the old `{ text }` shape is ignored.
 
 - `remind` keeps the existing persistent reminder behavior. Both hosts include human reminders in the first model request without altering the user's text. Pi combines the clock and any directory reminder in one visible `<system-reminder>...</system-reminder>` message; Claude attaches human reminders as prompt context.
-- `linger` works on `wake`, `human`, and `tool` moments in Pi. Pi wraps the answer in `<system-reminder>...</system-reminder>` and injects it only into model requests. A human linger follows the user message that started the run; other lingers follow the latest context-visible message when the moment fired (the summary for a compaction wake), or go first if there was none. Insertion skips any consecutive tool results after the anchor so a tool batch stays together. Pi drops a linger if its anchor disappears or becomes ambiguous. Lingers are never written to the session and are cleared when the run settles or a new session starts; a wake outside a run survives through the next run. This applies to new requests that pass through Pi's `context` hook; idle cache refresh still replays the original request unchanged. Claude ignores `linger`.
+- `ephemeral` works on `wake`, `human`, and `tool` moments in Pi. Pi wraps the answer in `<system-reminder>...</system-reminder>` and injects it only into model requests. A human ephemeral follows the user message that started the run; other ephemerals follow the latest context-visible message when the moment fired (the summary for a compaction wake), or go first if there was none. Insertion skips any consecutive tool results after the anchor so a tool batch stays together. Pi drops an ephemeral if its anchor disappears or becomes ambiguous. Ephemerals are never written to the session and are cleared when the run settles or a new session starts; a wake outside a run survives through the next run. This applies to new requests that pass through Pi's `context` hook; idle cache refresh still replays the original request unchanged. Claude ignores `ephemeral`.
 
 `timeaware` (⌚️) is a builtin `remind` on `human` moments, for file and directory souls alike. Each human perception has two seconds to answer: a failed, empty, or late answer is omitted without holding up submission any further or being sent later. Both hosts retain the loaded entry; `/soul reload` drops the active cached entry so the next moment imports the file again.
 

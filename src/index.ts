@@ -29,7 +29,7 @@ function describe(selection: Selection | undefined, model: ExtensionContext["mod
   return `${selection.name} (${selection.source})`;
 }
 
-type Linger = {
+type Ephemeral = {
   sessionId: string; soul: string; text: string; at: number; previousLeaf: string | null;
   anchor: "next-user" | "visible-at-or-before"; anchorId?: string;
 };
@@ -47,7 +47,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // Hold live options: handlers after ours can still set customPrompt or forceSystemPrompt.
   let options: BuildSystemPromptOptions | undefined;
   let running = false;
-  let lingers: Linger[] = [];
+  let ephemerals: Ephemeral[] = [];
   // What the projection handler learned for this request, read by the transition handler.
   let projection: { known: boolean; soul: string | null } | undefined;
   let forceReported = false;
@@ -95,14 +95,14 @@ export default function soulsExtension(pi: ExtensionAPI) {
       timeaware: config.timeaware,
     };
   };
-  const addLinger = ({ branch, now: at, sessionId, soul, previousLeaf }: NonNullable<ReturnType<typeof perceptionContext>>, anchor: Linger["anchor"], text: string) => {
-    const linger: Linger = { sessionId, soul, text, at, previousLeaf, anchor };
+  const addEphemeral = ({ branch, now: at, sessionId, soul, previousLeaf }: NonNullable<ReturnType<typeof perceptionContext>>, anchor: Ephemeral["anchor"], text: string) => {
+    const ephemeral: Ephemeral = { sessionId, soul, text, at, previousLeaf, anchor };
     if (anchor === "visible-at-or-before") {
       // Pin against the triggering branch, before a later projection can remove the anchor.
       const visible = new Set(buildSessionProjection(branch, previousLeaf).entries.filter(visibleMessage).map(({ sourceEntry }) => sourceEntry.id));
-      linger.anchorId = branch.findLast((entry) => visible.has(entry.id))?.id;
+      ephemeral.anchorId = branch.findLast((entry) => visible.has(entry.id))?.id;
     }
-    lingers.push(linger);
+    ephemerals.push(ephemeral);
   };
   const perceive = async (moment: Exclude<Moment, { kind: "human" }>, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
     try {
@@ -110,7 +110,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
       if (!perception) return;
       const said = await perception.directory(moment);
       if (said?.kind === "remind") sendReminder(pi, { text: said.text, details: { moment: moment.kind } });
-      if (said?.kind === "linger") addLinger(perception, "visible-at-or-before", said.text);
+      if (said?.kind === "ephemeral") addEphemeral(perception, "visible-at-or-before", said.text);
     } catch {
       // A perception is decoration: a broken configuration never breaks the host.
     }
@@ -125,7 +125,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         humanPerception(() => perception.directory(moment)),
       ]);
       const content = [clock?.text, directory?.kind === "remind" ? directory.text : undefined].filter(Boolean).join("\n");
-      if (directory?.kind === "linger" && running && options === runOptions) addLinger(perception, "next-user", directory.text);
+      if (directory?.kind === "ephemeral" && running && options === runOptions) addEphemeral(perception, "next-user", directory.text);
       if (content) return {
         customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(content), display: true,
         details: { moment: "human", ...(clock ? { timestamp: perception.now } : {}) },
@@ -167,7 +167,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   };
   pi.on("session_start", (event, ctx) => {
     cwd = ctx.cwd; reported = undefined; forceReported = false;
-    options = undefined; running = false; lingers = [];
+    options = undefined; running = false; ephemerals = [];
     projection = undefined; forcedProjection = undefined;
     promptKnown = false; seenPrompt = undefined;
     toolCalls.clear();
@@ -195,7 +195,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
     if (message) return { message };
   });
   pi.on("agent_settled", () => {
-    running = false; lingers = []; projection = undefined;
+    running = false; ephemerals = []; projection = undefined;
   });
   pi.on("tool_call", (event, ctx) => {
     const filePath = toolFilePath(event.input);
@@ -413,31 +413,31 @@ export default function soulsExtension(pi: ExtensionAPI) {
   };
 
   // undefined means the origin is lost; null is an intentional head anchor.
-  const anchorIdFor = (linger: Linger, branch: readonly SessionEntry[]): string | null | undefined => {
-    if (linger.anchor === "visible-at-or-before") return linger.anchorId ?? null;
-    if (linger.anchorId !== undefined) return linger.anchorId;
+  const anchorIdFor = (ephemeral: Ephemeral, branch: readonly SessionEntry[]): string | null | undefined => {
+    if (ephemeral.anchor === "visible-at-or-before") return ephemeral.anchorId ?? null;
+    if (ephemeral.anchorId !== undefined) return ephemeral.anchorId;
     // Pin the first user entry after the start hook, not queued steering.
-    const previous = branch.findIndex((entry) => entry.id === linger.previousLeaf);
-    if (previous < 0 && linger.previousLeaf !== null) return;
-    return linger.anchorId = branch.slice(previous + 1).find((entry) => entry.type === "message" && entry.message.role === "user")?.id;
+    const previous = branch.findIndex((entry) => entry.id === ephemeral.previousLeaf);
+    if (previous < 0 && ephemeral.previousLeaf !== null) return;
+    return ephemeral.anchorId = branch.slice(previous + 1).find((entry) => entry.type === "message" && entry.message.role === "user")?.id;
   };
 
   pi.on("context", (event, ctx) => {
-    if (!lingers.length) return;
+    if (!ephemerals.length) return;
     const session = ctx.sessionManager;
     try {
       const { branch, selection } = perceptionSelection(ctx, options?.customPrompt);
       const sessionId = session.getSessionId();
-      if (lingers.some((linger) => selection?.name !== linger.soul || sessionId !== linger.sessionId)) {
-        lingers = [];
+      if (ephemerals.some((ephemeral) => selection?.name !== ephemeral.soul || sessionId !== ephemeral.sessionId)) {
+        ephemerals = [];
         return;
       }
       const projected = session.buildSessionProjection();
       const inserts: { position: number; message: AgentMessage }[] = [];
-      lingers = lingers.filter((linger) => {
-        const id = anchorIdFor(linger, branch);
+      ephemerals = ephemerals.filter((ephemeral) => {
+        const id = anchorIdFor(ephemeral, branch);
         if (id === undefined) return false;
-        let position = 0, timestamp = linger.at;
+        let position = 0, timestamp = ephemeral.at;
         if (id !== null) {
           const entry = projected.entries.find(({ sourceEntry }) => sourceEntry.id === id);
           const anchor = entry && visibleMessage(entry);
@@ -451,7 +451,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
           while (event.messages[position]?.role === "toolResult") position++;
           timestamp = anchor.timestamp;
         }
-        inserts.push({ position, message: { role: "user", content: wrapReminder(linger.text), timestamp } });
+        inserts.push({ position, message: { role: "user", content: wrapReminder(ephemeral.text), timestamp } });
         return true;
       });
       if (!inserts.length) return;
@@ -461,7 +461,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
       return { messages };
     } catch {
       // A perception is decoration: never obstruct a request.
-      lingers = [];
+      ephemerals = [];
     }
   });
 
