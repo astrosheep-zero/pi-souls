@@ -64,6 +64,8 @@ export type UtteranceKind = "remind" | "ephemeral";
 export interface Utterance {
   kind: UtteranceKind;
   text: string;
+  linger?: number;
+  sink?: number;
 }
 
 export interface World {
@@ -186,7 +188,7 @@ export async function humanPerception(run: () => ReturnType<Perception>): Promis
       }),
       Promise.resolve().then(run).then((value) => {
         const said = utterance(value);
-        return said && { kind: said.kind, text: said.text.trim() };
+        return said && { ...said, text: said.text.trim() };
       }),
     ]);
   } catch {
@@ -204,11 +206,16 @@ function pick(value: unknown): Perception | undefined {
   return typeof value === "function" ? value as Perception : undefined;
 }
 
-/** Require a delivery kind and nonempty text. */
+/** Require a known delivery kind, nonempty text, and valid ephemeral controls. */
 export function utterance(value: unknown): Utterance | undefined {
   if (!object(value)) return undefined;
   const { kind, text } = value;
-  return (kind === "remind" || kind === "ephemeral") && typeof text === "string" && text.trim() ? { kind, text } : undefined;
+  if ((kind !== "remind" && kind !== "ephemeral") || typeof text !== "string" || !text.trim()) return undefined;
+  if (kind === "remind") return { kind, text };
+  const { linger, sink } = value;
+  if (linger !== undefined && (typeof linger !== "number" || !Number.isInteger(linger) || linger < 1)) return undefined;
+  if (sink !== undefined && (typeof sink !== "number" || !Number.isInteger(sink) || sink < 0)) return undefined;
+  return { kind, text, ...(linger === undefined ? {} : { linger }), ...(sink === undefined ? {} : { sink }) };
 }
 
 /**

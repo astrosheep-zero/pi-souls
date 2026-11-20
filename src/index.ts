@@ -8,7 +8,7 @@ import { ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserM
 import { timePerception } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, readTransition, sameTransition, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
-import { humanPerception, loadPerception, PERCEPTION_MESSAGE_TYPE, sendReminder, toolCategory, toolFilePath, toolText, worldFor, wrapReminder, type Moment, type Perception } from "./perception.ts";
+import { humanPerception, loadPerception, PERCEPTION_MESSAGE_TYPE, sendReminder, toolCategory, toolFilePath, toolText, worldFor, wrapReminder, type Moment, type Perception, type Utterance } from "./perception.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
@@ -31,9 +31,11 @@ function describe(selection: Selection | undefined, model: ExtensionContext["mod
 
 type Ephemeral = {
   sessionId: string; soul: string; text: string; at: number; previousLeaf: string | null;
-  anchor: "next-user" | "visible-at-or-before"; anchorId?: string;
+  anchor: "next-user" | "visible-at-or-before"; priorVisibleIds: string[]; anchorId?: string | null;
+  linger: number; sink: number;
 };
 const visibleMessage = (entry: ProjectedSessionEntry) => entry.messages.findLast((message) => message.role !== "system");
+const sunkAnchor = (ids: readonly string[], sink: number): string | null => ids[ids.length - 1 - sink] ?? null;
 const contentKey = (message: AgentMessage) => JSON.stringify("content" in message ? message.content : undefined);
 
 export default function soulsExtension(pi: ExtensionAPI) {
@@ -95,13 +97,13 @@ export default function soulsExtension(pi: ExtensionAPI) {
       timeaware: config.timeaware,
     };
   };
-  const addEphemeral = ({ branch, now: at, sessionId, soul, previousLeaf }: NonNullable<ReturnType<typeof perceptionContext>>, anchor: Ephemeral["anchor"], text: string) => {
-    const ephemeral: Ephemeral = { sessionId, soul, text, at, previousLeaf, anchor };
-    if (anchor === "visible-at-or-before") {
-      // Pin against the triggering branch, before a later projection can remove the anchor.
-      const visible = new Set(buildSessionProjection(branch, previousLeaf).entries.filter(visibleMessage).map(({ sourceEntry }) => sourceEntry.id));
-      ephemeral.anchorId = branch.findLast((entry) => visible.has(entry.id))?.id;
-    }
+  const addEphemeral = ({ branch, now: at, sessionId, soul, previousLeaf }: NonNullable<ReturnType<typeof perceptionContext>>, anchor: Ephemeral["anchor"], said: Utterance) => {
+    // Capture visibility at the moment, not after steering or a later compaction.
+    const visible = new Set(buildSessionProjection(branch, previousLeaf).entries.filter(visibleMessage).map(({ sourceEntry }) => sourceEntry.id));
+    const priorVisibleIds = branch.filter((entry) => visible.has(entry.id)).map((entry) => entry.id);
+    const { text, linger = 1, sink = 0 } = said;
+    const ephemeral: Ephemeral = { sessionId, soul, text, at, previousLeaf, anchor, priorVisibleIds, linger, sink };
+    if (anchor === "visible-at-or-before") ephemeral.anchorId = sunkAnchor(priorVisibleIds, sink);
     ephemerals.push(ephemeral);
   };
   const perceive = async (moment: Exclude<Moment, { kind: "human" }>, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
@@ -110,7 +112,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
       if (!perception) return;
       const said = await perception.directory(moment);
       if (said?.kind === "remind") sendReminder(pi, { text: said.text, details: { moment: moment.kind } });
-      if (said?.kind === "ephemeral") addEphemeral(perception, "visible-at-or-before", said.text);
+      if (said?.kind === "ephemeral") addEphemeral(perception, "visible-at-or-before", said);
     } catch {
       // A perception is decoration: a broken configuration never breaks the host.
     }
@@ -125,7 +127,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         humanPerception(() => perception.directory(moment)),
       ]);
       const content = [clock?.text, directory?.kind === "remind" ? directory.text : undefined].filter(Boolean).join("\n");
-      if (directory?.kind === "ephemeral" && running && options === runOptions) addEphemeral(perception, "next-user", directory.text);
+      if (directory?.kind === "ephemeral" && running && options === runOptions) addEphemeral(perception, "next-user", directory);
       if (content) return {
         customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(content), display: true,
         details: { moment: "human", ...(clock ? { timestamp: perception.now } : {}) },
@@ -195,7 +197,9 @@ export default function soulsExtension(pi: ExtensionAPI) {
     if (message) return { message };
   });
   pi.on("agent_settled", () => {
-    running = false; ephemerals = []; projection = undefined;
+    running = false;
+    ephemerals = ephemerals.filter((ephemeral) => --ephemeral.linger > 0);
+    projection = undefined;
   });
   pi.on("tool_call", (event, ctx) => {
     const filePath = toolFilePath(event.input);
@@ -414,12 +418,13 @@ export default function soulsExtension(pi: ExtensionAPI) {
 
   // undefined means the origin is lost; null is an intentional head anchor.
   const anchorIdFor = (ephemeral: Ephemeral, branch: readonly SessionEntry[]): string | null | undefined => {
-    if (ephemeral.anchor === "visible-at-or-before") return ephemeral.anchorId ?? null;
-    if (ephemeral.anchorId !== undefined) return ephemeral.anchorId;
+    if (ephemeral.anchorId !== undefined || ephemeral.anchor === "visible-at-or-before") return ephemeral.anchorId;
     // Pin the first user entry after the start hook, not queued steering.
     const previous = branch.findIndex((entry) => entry.id === ephemeral.previousLeaf);
     if (previous < 0 && ephemeral.previousLeaf !== null) return;
-    return ephemeral.anchorId = branch.slice(previous + 1).find((entry) => entry.type === "message" && entry.message.role === "user")?.id;
+    const nextUser = branch.slice(previous + 1).find((entry) => entry.type === "message" && entry.message.role === "user");
+    if (!nextUser) return;
+    return ephemeral.anchorId = sunkAnchor([...ephemeral.priorVisibleIds, nextUser.id], ephemeral.sink);
   };
 
   pi.on("context", (event, ctx) => {

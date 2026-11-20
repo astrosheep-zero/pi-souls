@@ -13,6 +13,9 @@ function perceptionText(content: string): string {
   return content.slice("<system-reminder>\n".length, -"\n</system-reminder>".length);
 }
 
+const requestText = (messages: TranscriptContext["messages"]) => messages.map(({ content }) =>
+  typeof content === "string" ? content : content.filter((block) => block.type === "text").map((block) => block.text).join(""));
+
 async function setupSdk(t: TestContext, perception: string) {
   const dir = mkdtempSync(join(tmpdir(), "souls-perception-context-"));
   let dispose: (() => void) | undefined;
@@ -44,7 +47,8 @@ async function setupSdk(t: TestContext, perception: string) {
     const read = reads.length > 0;
     const message: AssistantMessage = {
       role: "assistant", content: read
-        ? reads.map((id) => ({ type: "toolCall", id, name: "read", arguments: { path: join(dir, "input.txt") } }))
+        // Distinct outputs prevent two results with the same timestamp from being indistinguishable anchors.
+        ? reads.map((id, index) => ({ type: "toolCall", id, name: "read", arguments: { path: join(dir, index === 0 ? "input.txt" : "faye/SOUL.md") } }))
         : [{ type: "text", text: "Done" }],
       api: requestModel.api, provider: requestModel.provider, model: requestModel.id,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
@@ -79,7 +83,7 @@ test("Pi SDK persists reminders but anchors ephemeral only in requests of its hu
   assert.equal(typeof (note.details as { timestamp?: unknown })?.timestamp, "number");
   assert.ok(typeof note.content === "string");
   assert.match(perceptionText(note.content), /^⌚ [^\n]+\ndirectory: hello$/);
-  const sent = (i: number) => requests[i]!.map((message) => typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join(""));
+  const sent = (i: number) => requestText(requests[i]!);
   assert.ok(sent(0).includes(note.content), "first request carries the persisted reminder");
   await session.prompt("again");
   assert.equal(notes().length, 2);
@@ -143,6 +147,70 @@ test("Pi SDK carries startup ephemeral through a run and places both tool phases
   await session.prompt("next run");
   assert.doesNotMatch(JSON.stringify(requests[2]), /startup ephemeral|tool ephemeral/);
   assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /startup ephemeral|tool ephemeral/);
+  assert.deepEqual(errors, []);
+});
+
+test("Pi SDK pins sunk human ephemerals across tool loops and expires them independently", async (t) => {
+  const { session, sessionManager, requests, errors, readNext } = await setupSdk(t, `
+    export function perception(moment) {
+      if (moment.kind !== 'human') return;
+      if (moment.text === 'plant') return { kind: 'ephemeral', text: '  pinned note  ', linger: 2, sink: 1 };
+      if (moment.text === 'later') return { kind: 'ephemeral', text: 'head note', linger: 2, sink: 100 };
+    }
+  `);
+  const pinned = wrapReminder("pinned note");
+  const head = wrapReminder("head note");
+  await session.prompt("seed");
+  sessionManager.appendCustomEntry("test:invisible", {}); // Not a sink step.
+  for (const prompt of ["plant", "later"]) {
+    const start = requests.length;
+    readNext(`read-${prompt}`);
+    await session.prompt(prompt);
+    const run = requests.slice(start);
+    assert.equal(run.length, 2);
+    assert.ok(run[1]!.some((message) => message.role === "toolResult"));
+    for (const request of run) {
+      const text = requestText(request.filter((message) => message.role !== "system"));
+      const seedReply = text.indexOf("Done");
+      assert.ok(seedReply >= 0);
+      assert.deepEqual(text.slice(seedReply + 1, seedReply + 3), [pinned, "plant"]);
+      assert.equal(text.filter((message) => message === pinned).length, 1);
+      if (prompt === "later") assert.equal(text[0], head);
+    }
+  }
+  await session.prompt("head only");
+  const remaining = requestText(requests.at(-1)!.filter((message) => message.role !== "system"));
+  assert.equal(remaining[0], head);
+  assert.ok(!remaining.includes(pinned));
+  await session.prompt("all expired");
+  const expired = requestText(requests.at(-1)!);
+  assert.ok(!expired.includes(pinned) && !expired.includes(head));
+  assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /pinned note|head note/);
+  assert.deepEqual(errors, []);
+});
+
+test("Pi SDK sinks tool ephemerals without separating a call from its result", async (t) => {
+  const { session, requests, errors, readNext } = await setupSdk(t, `
+    export function perception(moment) {
+      if (moment.kind !== 'tool') return;
+      if (moment.phase === 'before' && moment.filePath.endsWith('/input.txt')) {
+        return { kind: 'ephemeral', text: 'before tool note', sink: 1 };
+      }
+      if (moment.phase === 'after' && moment.filePath.endsWith('/SOUL.md')) {
+        return { kind: 'ephemeral', text: 'after tool note', sink: 1 };
+      }
+    }
+  `);
+  await session.prompt("seed");
+  session.agent.toolExecution = "sequential";
+  readNext("read-1", "read-2");
+  await session.prompt("run tool");
+  const continuation = requests.at(-1)!;
+  const user = requestText(continuation).indexOf("run tool");
+  assert.ok(user >= 0);
+  assert.deepEqual(continuation.slice(user + 1).map(({ role }) => role), ["user", "assistant", "toolResult", "toolResult", "user"]);
+  assert.equal(continuation[user + 1]!.content, wrapReminder("before tool note"));
+  assert.equal(continuation.at(-1)!.content, wrapReminder("after tool note"));
   assert.deepEqual(errors, []);
 });
 
@@ -213,7 +281,7 @@ function setup(files: Record<string, string> = {}, settings: Record<string, unkn
 test("Pi never moves an ephemeral to a later user when compaction drops its anchor", async () => {
   const h = setup({
     "faye/SOUL.md": "Faye",
-    "faye/perception.ts": "export const perception = () => ({ kind: 'ephemeral', text: 'transient' });",
+    "faye/perception.ts": "export const perception = () => ({ kind: 'ephemeral', text: 'transient', linger: 2 });",
   });
   try {
     const opener = { role: "user", content: "opening prompt", timestamp: 1 } as const;
@@ -225,6 +293,7 @@ test("Pi never moves an ephemeral to a later user when compaction drops its anch
     assert.deepEqual(await h.fire("context", { messages }), {
       messages: [opener, { role: "user", content: wrapReminder("transient"), timestamp: opener.timestamp }, follow],
     });
+    await h.fire("agent_settled");
     h.session.appendCompaction("summary", followId, 100);
     assert.equal(await h.fire("context", { messages: h.session.buildSessionContext().messages }), undefined);
   } finally {
@@ -335,6 +404,14 @@ test("utterances require a known kind and nonempty text", () => {
   assert.equal(utterance({ kind: "ephemeral", text: "  " }), undefined);
 });
 
+test("ephemeral controls are optional integers and are ignored on remind", () => {
+  const note = { kind: "ephemeral", text: "note" };
+  assert.deepEqual(utterance({ ...note, linger: 1, sink: 0 }), { ...note, linger: 1, sink: 0 });
+  for (const linger of [0, -1, 1.5, "2"]) assert.equal(utterance({ ...note, linger }), undefined);
+  for (const sink of [-1, 0.5, "0"]) assert.equal(utterance({ ...note, sink }), undefined);
+  assert.deepEqual(utterance({ kind: "remind", text: "note", linger: 0, sink: -1 }), { kind: "remind", text: "note" });
+});
+
 test("a perception module answers, and every failure stays silent", async () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-perception-module-"));
   try {
@@ -347,8 +424,8 @@ test("a perception module answers, and every failure stays silent", async () => 
     assert.deepEqual(await loadPerception(join(dir, "speaks.ts"))({ kind: "human", text: "hi" }, world), { kind: "remind", text: "fresh instance" });
     assert.deepEqual(await speaks({ kind: "wake", source: "startup" }, world), { kind: "remind", text: "wake:2" });
 
-    write("default.mjs", "export default () => ({ kind: 'ephemeral', text: 'default export' });");
-    assert.deepEqual(await loadPerception(join(dir, "default.mjs"))({ kind: "human", text: "hi" }, world), { kind: "ephemeral", text: "default export" });
+    write("default.mjs", "export default () => ({ kind: 'ephemeral', text: 'default export', linger: 2, sink: 1 });");
+    assert.deepEqual(await loadPerception(join(dir, "default.mjs"))({ kind: "human", text: "hi" }, world), { kind: "ephemeral", text: "default export", linger: 2, sink: 1 });
 
     write("callable.ts", "module.exports = function perception() { return { kind: 'remind', text: 'callable' }; };");
     assert.deepEqual(await loadPerception(join(dir, "callable.ts"))({ kind: "human", text: "hi" }, world), { kind: "remind", text: "callable" });
