@@ -85,8 +85,8 @@ A directory soul may answer lifecycle moments with code. `<soulsDir>/<name>/perc
 
 ```ts
 export function perception(moment, world) {
-  if (moment.kind === "human") return { text: "……" };
-  if (moment.kind === "tool" && moment.phase === "after") return { text: `${moment.toolName} ${moment.ok ? "ok" : "failed"}` };
+  if (moment.kind === "human") return { kind: "linger", text: "……" };
+  if (moment.kind === "tool" && moment.phase === "after") return { kind: "remind", text: `${moment.toolName} ${moment.ok ? "ok" : "failed"}` };
   return undefined; // silence is always allowed
 }
 ```
@@ -95,7 +95,12 @@ Moments: `wake` (`source`: `startup`, `resume`, `fork`, `clear`, `compact`), `hu
 
 `world` is `{ now, sessionId, cwd, absenceMs?, storeDir, facts }`. `facts` carries `hour`, `morning`, `afternoon`, `evening`, `night`, `weekday` (0 is Sunday) and `weekend`. `absenceMs` is the time since the human's previous message when that is known; `storeDir` defaults to `~/.local/share/pi-souls/<name>`.
 
-`timeaware` (⌚️) is a builtin perception on `"human"` moments, for file and directory souls alike. Both hosts include human reminders in the first model request for that prompt without altering the user's text. Pi combines the clock and soul's text in one visible `<system-reminder>...</system-reminder>` message; Claude attaches them as prompt context. Each human perception has two seconds to answer: a failed, empty, or late answer is omitted without holding up submission any further or being sent later. Both hosts retain the loaded entry; `/soul reload` drops the active cached entry so the next moment imports the file again.
+An answer must contain `kind` and nonempty `text`; the old `{ text }` shape is ignored.
+
+- `remind` keeps the existing persistent reminder behavior. Both hosts include human reminders in the first model request without altering the user's text. Pi combines the clock and any directory reminder in one visible `<system-reminder>...</system-reminder>` message; Claude attaches human reminders as prompt context.
+- `linger` only works on `human` moments in Pi. Pi wraps the answer in `<system-reminder>...</system-reminder>` and inserts it just after the opening user message on every request of that run, including tool continuations. If the opening message is removed from context, Pi drops the linger rather than moving it. It is never written to the session and does not carry over to the next run. Claude currently ignores `linger`.
+
+`timeaware` (⌚️) is a builtin `remind` on `human` moments, for file and directory souls alike. Each human perception has two seconds to answer: a failed, empty, or late answer is omitted without holding up submission any further or being sent later. Both hosts retain the loaded entry; `/soul reload` drops the active cached entry so the next moment imports the file again.
 
 Pi imports the entry module in-process. Claude uses a persistent, isolated Node child reached over a private Unix socket; content loading remains a separate short-lived helper. Both use the shared `loadPerception` implementation, including Jiti's full TypeScript support and the loader's normal dependency caching. The installed Claude runtime bundles official `jiti/static`; no local dependencies or erase-only TypeScript restriction are needed. Node 22.18 or later must be on the mod's `PATH`.
 

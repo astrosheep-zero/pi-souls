@@ -6,20 +6,28 @@ import { test } from "node:test";
 import { SessionManager, createAgentSession, DefaultResourceLoader, ModelRuntime, SettingsManager, type CustomMessageEntry, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage, type TranscriptContext } from "@earendil-works/pi-ai";
 import extension from "../src/index.ts";
-import { factsFor, loadPerception, PERCEPTION_MESSAGE_TYPE, storeDirFor, toolCategory, toolFilePath, toolText, unwrapReminder, worldFor, wrapReminder } from "../src/perception.ts";
+import { factsFor, loadPerception, PERCEPTION_MESSAGE_TYPE, storeDirFor, toolCategory, toolFilePath, toolText, unwrapReminder, utterance, worldFor, wrapReminder } from "../src/perception.ts";
 
 function perceptionText(content: string): string {
   assert.match(content, /^<system-reminder>\n[\s\S]*\n<\/system-reminder>$/);
   return content.slice("<system-reminder>\n".length, -"\n</system-reminder>".length);
 }
 
-test("Pi SDK persists wrapped builtin and directory utterances and sends them as model context", async () => {
+test("Pi SDK persists reminders but anchors linger only in requests of its human run", async () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-perception-context-"));
   let dispose: (() => void) | undefined;
   try {
     mkdirSync(join(dir, "faye"));
     writeFileSync(join(dir, "faye/SOUL.md"), "Faye");
-    writeFileSync(join(dir, "faye/perception.ts"), "export const perception = (moment) => moment.kind === 'human' ? { text: '  directory: ' + moment.text + '  ' } : undefined;");
+    writeFileSync(join(dir, "input.txt"), "fixture");
+    writeFileSync(join(dir, "faye/perception.ts"), `
+      let lingerCalls = 0;
+      export function perception(moment) {
+        if (moment.kind !== 'human') return { kind: 'linger', text: 'not human' };
+        if (moment.text.startsWith('linger ')) return { kind: 'linger', text: 'linger #' + ++lingerCalls };
+        return { kind: 'remind', text: '  directory: ' + moment.text + '  ' };
+      }
+    `);
     const settings = SettingsManager.inMemory({ soulsDir: dir, defaultSoul: "faye" } as any);
     const loader = new DefaultResourceLoader({
       cwd: dir, agentDir: dir, settingsManager: settings,
@@ -31,19 +39,24 @@ test("Pi SDK persists wrapped builtin and directory utterances and sends them as
     const model = modelRuntime.getModels("openai")[0]!;
     await modelRuntime.setRuntimeApiKey(model.provider, "test-key-never-sent");
     const sessionManager = SessionManager.inMemory(dir);
-    const { session } = await createAgentSession({ cwd: dir, agentDir: dir, settingsManager: settings, sessionManager, modelRuntime, model, resourceLoader: loader, noTools: "all" });
+    const { session } = await createAgentSession({ cwd: dir, agentDir: dir, settingsManager: settings, sessionManager, modelRuntime, model, resourceLoader: loader, tools: ["read"], thinkingLevel: "off" });
     dispose = () => session.dispose();
     const requests: TranscriptContext["messages"][] = [];
+    let readNext = false;
     session.agent.streamFunction = (requestModel, context) => {
       requests.push(structuredClone(context.messages));
+      const read = readNext;
+      readNext = false;
       const message: AssistantMessage = {
-        role: "assistant", content: [{ type: "text", text: "Done" }],
+        role: "assistant", content: read
+          ? [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: join(dir, "input.txt") } }]
+          : [{ type: "text", text: "Done" }],
         api: requestModel.api, provider: requestModel.provider, model: requestModel.id,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        stopReason: "stop", timestamp: Date.now(),
+        stopReason: read ? "toolUse" : "stop", timestamp: Date.now(),
       };
       const stream = createAssistantMessageEventStream();
-      stream.push({ type: "done", reason: "stop", message });
+      stream.push({ type: "done", reason: read ? "toolUse" : "stop", message });
       stream.end();
       return stream;
     };
@@ -65,6 +78,32 @@ test("Pi SDK persists wrapped builtin and directory utterances and sends them as
     assert.equal(notes()[1]!.content, wrapReminder("directory: again"));
     assert.deepEqual(notes()[1]!.details, { moment: "human" });
     assert.ok(sent(1).includes(wrapReminder("directory: again")));
+
+    readNext = true;
+    await session.steer("queued steering user"); // Already queued by the first request.
+    await session.prompt("linger one");
+    assert.equal(requests.length, 4);
+    assert.ok(requests[3]!.some((message) => message.role === "toolResult"));
+    const firstLinger = wrapReminder("linger #1");
+    for (const index of [2, 3]) {
+      const text = sent(index);
+      assert.ok(text.includes("queued steering user"));
+      assert.equal(text[text.indexOf("linger one") + 1], firstLinger);
+      assert.equal(text.filter((value) => value === firstLinger).length, 1);
+      assert.equal(requests[index]![text.indexOf(firstLinger)]!.role, "user");
+    }
+    await session.sendCustomMessage({ customType: "test", content: "custom turn", display: false }, { triggerTurn: true });
+    assert.ok(sent(4).includes("custom turn"));
+    assert.ok(!sent(4).includes(firstLinger));
+
+    await session.prompt("linger two");
+    assert.equal(sent(5)[sent(5).indexOf("linger two") + 1], wrapReminder("linger #2"));
+    assert.ok(!sent(5).includes(firstLinger));
+    await session.prompt("/soul clear");
+    await session.prompt("linger without a soul");
+    assert.doesNotMatch(JSON.stringify(requests[6]), /linger #/);
+    assert.equal(notes().length, 2);
+    assert.doesNotMatch(JSON.stringify(sessionManager.getBranch()), /linger #|not human/);
     assert.deepEqual(errors, []);
   } finally {
     dispose?.();
@@ -135,6 +174,28 @@ function setup(files: Record<string, string> = {}, settings: Record<string, unkn
     },
   };
 }
+
+test("Pi never moves a linger to a later user when compaction drops its anchor", async () => {
+  const h = setup({
+    "faye/SOUL.md": "Faye",
+    "faye/perception.ts": "export const perception = () => ({ kind: 'linger', text: 'transient' });",
+  });
+  try {
+    const opener = { role: "user", content: "opening prompt", timestamp: 1 } as const;
+    const follow = { role: "user", content: "later user", timestamp: 2 } as const;
+    await h.human(opener.content);
+    h.session.appendMessage(opener);
+    const followId = h.session.appendMessage(follow);
+    const messages = [opener, follow];
+    assert.deepEqual(await h.fire("context", { messages }), {
+      messages: [opener, { role: "user", content: wrapReminder("transient"), timestamp: opener.timestamp }, follow],
+    });
+    h.session.appendCompaction("summary", followId, 100);
+    assert.equal(await h.fire("context", { messages: h.session.buildSessionContext().messages }), undefined);
+  } finally {
+    h.restore();
+  }
+});
 
 const realNow = Date.now;
 
@@ -209,25 +270,33 @@ test("world carries the soul's own store and omits an unknown absence", () => {
   assert.equal("absenceMs" in worldFor({ now: 1, sessionId: "", cwd: "", soul: "x", absenceMs: -1 }), false);
 });
 
+test("utterances require a known kind and nonempty text", () => {
+  assert.deepEqual(utterance({ kind: "remind", text: "keep" }), { kind: "remind", text: "keep" });
+  assert.deepEqual(utterance({ kind: "linger", text: "turn" }), { kind: "linger", text: "turn" });
+  assert.equal(utterance({ text: "legacy" }), undefined);
+  assert.equal(utterance({ kind: "other", text: "unknown" }), undefined);
+  assert.equal(utterance({ kind: "linger", text: "  " }), undefined);
+});
+
 test("a perception module answers, and every failure stays silent", async () => {
   const dir = mkdtempSync(join(tmpdir(), "souls-perception-module-"));
   try {
     const write = (name: string, text: string) => writeFileSync(join(dir, name), text);
-    write("speaks.ts", "export function perception(moment, world) { return { text: `${moment.kind}:${world.facts.hour}`, extra: 1 }; }");
+    write("speaks.ts", "export function perception(moment, world) { return { kind: 'remind', text: `${moment.kind}:${world.facts.hour}`, extra: 1 }; }");
     const speaks = loadPerception(join(dir, "speaks.ts"));
     const world = worldFor({ now: new Date(2026, 9, 27, 2, 14, 0).getTime(), sessionId: "s", cwd: "/", soul: "faye" });
-    assert.deepEqual(await speaks({ kind: "wake", source: "startup" }, world), { text: "wake:2" });
-    write("speaks.ts", "export function perception() { return { text: 'fresh instance' }; }");
-    assert.deepEqual(await loadPerception(join(dir, "speaks.ts"))({ kind: "human", text: "hi" }, world), { text: "fresh instance" });
-    assert.deepEqual(await speaks({ kind: "wake", source: "startup" }, world), { text: "wake:2" });
+    assert.deepEqual(await speaks({ kind: "wake", source: "startup" }, world), { kind: "remind", text: "wake:2" });
+    write("speaks.ts", "export function perception() { return { kind: 'remind', text: 'fresh instance' }; }");
+    assert.deepEqual(await loadPerception(join(dir, "speaks.ts"))({ kind: "human", text: "hi" }, world), { kind: "remind", text: "fresh instance" });
+    assert.deepEqual(await speaks({ kind: "wake", source: "startup" }, world), { kind: "remind", text: "wake:2" });
 
-    write("default.mjs", "export default () => ({ text: 'default export' });");
-    assert.deepEqual(await loadPerception(join(dir, "default.mjs"))({ kind: "human", text: "hi" }, world), { text: "default export" });
+    write("default.mjs", "export default () => ({ kind: 'linger', text: 'default export' });");
+    assert.deepEqual(await loadPerception(join(dir, "default.mjs"))({ kind: "human", text: "hi" }, world), { kind: "linger", text: "default export" });
 
-    write("callable.ts", "module.exports = function perception() { return { text: 'callable' }; };");
-    assert.deepEqual(await loadPerception(join(dir, "callable.ts"))({ kind: "human", text: "hi" }, world), { text: "callable" });
+    write("callable.ts", "module.exports = function perception() { return { kind: 'remind', text: 'callable' }; };");
+    assert.deepEqual(await loadPerception(join(dir, "callable.ts"))({ kind: "human", text: "hi" }, world), { kind: "remind", text: "callable" });
 
-    write("blank.ts", "export const perception = () => ({ text: '   ' });");
+    write("blank.ts", "export const perception = () => ({ kind: 'remind', text: '   ' });");
     assert.equal(await loadPerception(join(dir, "blank.ts"))({ kind: "human", text: "hi" }, world), undefined);
 
     write("nothing.ts", "export const perception = () => undefined;");
@@ -247,7 +316,7 @@ test("a perception module answers, and every failure stays silent", async () => 
 
 const wakePerception = "export function perception(moment, world) {\n"
   + "  const base = { now: world.now, sessionId: world.sessionId, cwd: world.cwd, storeDir: world.storeDir, facts: world.facts, absence: world.absenceMs ?? null };\n"
-  + "  return { text: JSON.stringify({ moment, base }) };\n"
+  + "  return { kind: 'remind', text: JSON.stringify({ moment, base }) };\n"
   + "}\n";
 
 test("Pi wakes the soul through its perception and hands it accurate world facts", async () => {
@@ -289,7 +358,7 @@ test("/soul reload revalidates the SOUL and its fragments, then reimports the pe
   const files = {
     "faye/SOUL.md": "---\nicon: 🦈\n---\nSoul v1 {% render 'parts/shared' %}",
     "parts/shared.md": "original",
-    "faye/perception.ts": `export function perception(moment) { return { text: "r1:" + moment.source }; }`,
+    "faye/perception.ts": `export function perception(moment) { return { kind: 'remind', text: "r1:" + moment.source }; }`,
   };
   await withTime(1_700_000_000_000, async (h) => {
     const before = h.session.getBranch().length;
@@ -305,7 +374,7 @@ test("/soul reload revalidates the SOUL and its fragments, then reimports the pe
 
     // Neither a broken SOUL nor a broken fragment may evict the working module.
     h.write("faye/SOUL.md", " ");
-    h.write("faye/perception.ts", `export function perception(moment) { return { text: "r2:" + moment.source }; }`);
+    h.write("faye/perception.ts", `export function perception(moment) { return { kind: 'remind', text: "r2:" + moment.source }; }`);
     await h.command.handler("reload", h.ctx);
     assert.match(h.notices.at(-1)!, /Soul "faye" is empty/);
     await h.fire("session_compact", { type: "session_compact" });
@@ -331,7 +400,7 @@ test("/soul reload revalidates the SOUL and its fragments, then reimports the pe
 });
 
 test("/soul reload refreshes CommonJS perceptions without evicting other souls", async () => {
-  const code = (text: string) => `exports.perception = () => ({ text: '${text}' });`;
+  const code = (text: string) => `exports.perception = () => ({ kind: 'remind', text: '${text}' });`;
   const files = {
     "package.json": '{"type":"commonjs"}',
     "faye/SOUL.md": "Faye", "faye/perception.js": code("f1"),
@@ -367,19 +436,29 @@ test("/soul reload refreshes CommonJS perceptions without evicting other souls",
   }, files);
 });
 
-test("Pi drops a delayed human perception after two seconds without a late send", { timeout: 5_000 }, async () => {
+test("Pi drops delayed and failed linger without blocking the clock or sending it later", { timeout: 5_000 }, async () => {
   await withTime(1_700_000_000_000, async (h) => {
     const start = performance.now();
     const message = await h.human("slow answer");
     const elapsed = performance.now() - start;
     assert.ok(elapsed >= 1900 && elapsed < 3000, `took ${elapsed} ms`);
     assert.match(perceptionText(message!.content), /^⌚ [^\n]+$/);
+    const user = { role: "user", content: "slow answer", timestamp: Date.now() } as const;
+    h.session.appendMessage(user);
+    assert.equal(await h.fire("context", { messages: [user] }), undefined);
     // Let the soul finish after the host has gone ahead with the clock alone.
     await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(await h.fire("context", { messages: [user] }), undefined);
+    assert.match(perceptionText((await h.human("throw"))!.content), /^⌚ [^\n]+$/);
+    assert.equal(await h.fire("context", { messages: [user] }), undefined);
     assert.deepEqual(h.sent, []);
   }, {
     "faye/SOUL.md": "Directory faye",
-    "faye/perception.ts": "export const perception = async () => { await new Promise((r) => setTimeout(r, 2300)); return { text: 'too late' }; };",
+    "faye/perception.ts": `export const perception = async (moment) => {
+      if (moment.text === 'throw') throw new Error('boom');
+      await new Promise((r) => setTimeout(r, 2300));
+      return { kind: 'linger', text: 'too late' };
+    };`,
   }, { timeaware: true });
 });
 

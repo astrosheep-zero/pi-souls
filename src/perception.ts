@@ -59,7 +59,10 @@ export type Moment =
       ok?: boolean;
     };
 
+export type UtteranceKind = "remind" | "linger";
+
 export interface Utterance {
+  kind: UtteranceKind;
   text: string;
 }
 
@@ -173,7 +176,7 @@ export function worldFor(input: { now: number; sessionId: string; cwd: string; s
 }
 
 /** A human perception gets a short deadline and may never send a late answer. */
-export async function humanPerceptionText(run: () => ReturnType<Perception>): Promise<string | undefined> {
+export async function humanPerception(run: () => ReturnType<Perception>): Promise<Utterance | undefined> {
   let cancel: (() => void) | undefined;
   try {
     return await Promise.race([
@@ -181,7 +184,10 @@ export async function humanPerceptionText(run: () => ReturnType<Perception>): Pr
         const timer = setTimeout(resolve, 2000);
         cancel = () => clearTimeout(timer);
       }),
-      Promise.resolve().then(run).then((said) => utterance(said)?.text.trim()),
+      Promise.resolve().then(run).then((value) => {
+        const said = utterance(value);
+        return said && { kind: said.kind, text: said.text.trim() };
+      }),
     ]);
   } catch {
     return undefined;
@@ -198,11 +204,11 @@ function pick(value: unknown): Perception | undefined {
   return typeof value === "function" ? value as Perception : undefined;
 }
 
-/** Only nonempty text is an utterance. */
+/** Require a delivery kind and nonempty text. */
 export function utterance(value: unknown): Utterance | undefined {
   if (!object(value)) return undefined;
-  const { text } = value;
-  return typeof text === "string" && text.trim() ? { text } : undefined;
+  const { kind, text } = value;
+  return (kind === "remind" || kind === "linger") && typeof text === "string" && text.trim() ? { kind, text } : undefined;
 }
 
 /**

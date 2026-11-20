@@ -33,6 +33,6 @@ export function timePerception(lastNoteAt?: number): Perception {
     const away = world.absenceMs !== undefined && Number.isFinite(world.absenceMs) && world.absenceMs >= HOUR_MS
       ? formatElapsed(world.absenceMs)
       : undefined;
-    return { text: away ? `${clock}\n(${away} since *human* was last present)` : clock };
+    return { kind: "remind", text: away ? `${clock}\n(${away} since *human* was last present)` : clock };
   };
 }

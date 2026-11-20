@@ -43,13 +43,14 @@ export async function worldFor($: Engine, name: string, previousHumanAt?: number
 }
 
 /** Discover fresh, then reuse the shared loader's cached closure in the session child. */
-export async function perceptionText($: Engine, options: PluginOptions, runtime: PerceptionRuntime, generation: number, name: string, moment: Moment, world: World | Promise<World>, signal?: AbortSignal): Promise<string | undefined> {
+export async function perceptionUtterance($: Engine, options: PluginOptions, runtime: PerceptionRuntime, generation: number, name: string, moment: Moment, world: World | Promise<World>, signal?: AbortSignal): Promise<Utterance | undefined> {
   try {
     const facts = await world;
     if (generation !== runtime.generation || signal?.aborted) return undefined;
     const { path } = await files<{ path?: string }>($, options, { op: "perception", name });
     if (!path || generation !== runtime.generation || signal?.aborted) return undefined;
     const said = await runPerception($, runtime, { path, moment, world: facts }, signal) as Utterance | undefined;
-    return said && generation === runtime.generation && !signal?.aborted && typeof said.text === "string" && said.text.trim() ? said.text : undefined;
+    if (generation !== runtime.generation || signal?.aborted) return undefined;
+    return said && (said.kind === "remind" || said.kind === "linger") && typeof said.text === "string" && said.text.trim() ? said : undefined;
   } catch { return undefined; }
 }

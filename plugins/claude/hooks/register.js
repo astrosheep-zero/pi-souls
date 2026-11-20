@@ -40,7 +40,7 @@ function timePerception(lastNoteAt) {
     if (lastNoteAt !== void 0 && Number.isFinite(lastNoteAt) && world.now - lastNoteAt < HOUR_MS) return void 0;
     const clock = `\u231A ${formatClock(new Date(world.now))}`;
     const away = world.absenceMs !== void 0 && Number.isFinite(world.absenceMs) && world.absenceMs >= HOUR_MS ? formatElapsed(world.absenceMs) : void 0;
-    return { text: away ? `${clock}
+    return { kind: "remind", text: away ? `${clock}
 (${away} since *human* was last present)` : clock };
   };
 }
@@ -233,14 +233,15 @@ async function worldFor($, name, previousHumanAt) {
     ...absenceMs !== void 0 && Number.isFinite(absenceMs) && absenceMs >= 0 ? { absenceMs } : {}
   };
 }
-async function perceptionText($, options, runtime, generation, name, moment, world, signal) {
+async function perceptionUtterance($, options, runtime, generation, name, moment, world, signal) {
   try {
     const facts = await world;
     if (generation !== runtime.generation || signal?.aborted) return void 0;
     const { path } = await files($, options, { op: "perception", name });
     if (!path || generation !== runtime.generation || signal?.aborted) return void 0;
     const said = await runPerception($, runtime, { path, moment, world: facts }, signal);
-    return said && generation === runtime.generation && !signal?.aborted && typeof said.text === "string" && said.text.trim() ? said.text : void 0;
+    if (generation !== runtime.generation || signal?.aborted) return void 0;
+    return said && (said.kind === "remind" || said.kind === "linger") && typeof said.text === "string" && said.text.trim() ? said : void 0;
   } catch {
     return void 0;
   }
@@ -362,10 +363,10 @@ async function perceiveActive($, s, options, moment, signal) {
   try {
     const world = await worldFor($, name, s.journal.lastHumanAt);
     if (generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
-    const text = await perceptionText($, options, s.runtime, generation, name, moment, world, signal);
-    if (!text || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
-    if (moment.kind === "tool") s.toolNotes.push({ text, generation });
-    else await reminder($, s, text);
+    const said = await perceptionUtterance($, options, s.runtime, generation, name, moment, world, signal);
+    if (said?.kind !== "remind" || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
+    if (moment.kind === "tool") s.toolNotes.push({ text: said.text, generation });
+    else await reminder($, s, said.text);
   } catch {
   }
 }
@@ -396,7 +397,8 @@ async function humanReminders($, s, options, text, signal) {
   const clock = timePerception(s.journal.noteAt);
   const texts = await Promise.all([
     options.timeaware !== false ? boundedText($, world.then(async (facts) => (await clock(moment, facts))?.text)) : void 0,
-    boundedText($, perceptionText($, options, s.runtime, generation, soul, moment, world, signal))
+    // Claude does not support ephemeral linger delivery.
+    boundedText($, perceptionUtterance($, options, s.runtime, generation, soul, moment, world, signal).then((said) => said?.kind === "remind" ? said.text : void 0))
   ]);
   if (generation !== s.runtime.generation || s.proposals.get(proposal.section)?.soul !== soul || signal?.aborted) return [];
   return texts.flatMap((text2) => text2 ? [wrapReminder(text2)] : []);

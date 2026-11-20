@@ -25,7 +25,7 @@ writeFileSync(path, `import {writeFileSync} from 'node:fs'; let count=0;
 export function perception(moment) {
   writeFileSync(${JSON.stringify(pidFile)},JSON.stringify({pid:process.pid}));
   if(moment.text==='cpu timeout') while(true){}
-  return {text:'counter:'+ ++count};
+  return {kind:'remind',text:'counter:'+ ++count};
 }`);
 const source = `
 import {createPerceptionRuntime,runPerception,stopRuntime} from './plugins/claude/hooks/perception-runtime.ts';
@@ -62,7 +62,7 @@ try {
   await host.send("normal");
   await host.send("normal again");
   records = JSON.parse(readFileSync(receipt, "utf8"));
-  assert.deepEqual(records.slice(1).map((record) => record.said), [{ text: "counter:1" }, { text: "counter:2" }]);
+  assert.deepEqual(records.slice(1).map((record) => record.said), [{ kind: "remind", text: "counter:1" }, { kind: "remind", text: "counter:2" }]);
   assert.notEqual(records[0]!.pid, records[1]!.pid);
   assert.equal(records[1]!.pid, records[2]!.pid);
   await host.stop();
@@ -103,7 +103,8 @@ const writePerception = (name: string, label: string) => {
     export function perception(moment) { counter.n += Unit.One;
       const row={label:Label.text,n:counter.n,pid:process.pid,kind:moment.kind};
       appendFileSync(${JSON.stringify(trace)},JSON.stringify(row)+'\\n');
-      return {text:'RUNTIME_CALL:'+Label.text+':'+counter.n}; }`);
+      if (moment.kind === 'human' && moment.text === 'ignore this linger') return {kind:'linger',text:'IGNORED_LINGER'};
+      return {kind:'remind',text:'RUNTIME_CALL:'+Label.text+':'+counter.n}; }`);
 };
 const rows = (): { label: string; n: number; pid: number; kind: string }[] =>
   existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
@@ -116,6 +117,15 @@ try {
   assert.equal(new Set(a.map((row) => row.pid)).size, 1);
   const visible = JSON.stringify(live.apiBodies.map((body) => body.messages));
   assert.ok(visible.includes("RUNTIME_CALL:A:"), "perception enters a future actual request");
+  const lingerTurn = await live.send("ignore this linger");
+  assert.equal(lingerTurn.apiBodies.length, 1);
+  assert.equal(rows().at(-1)?.kind, "human", "Claude ran the linger perception");
+  const nextTurn = await live.send("after ignored linger");
+  assert.doesNotMatch(JSON.stringify([...lingerTurn.apiBodies, ...nextTurn.apiBodies]), /IGNORED_LINGER/);
+  const transcript = await live.transcript();
+  assert.ok(transcript?.length);
+  assert.doesNotMatch(JSON.stringify(transcript), /IGNORED_LINGER/);
+  a = rows().filter((row) => row.label === "A");
   const beforeSwitch = a.at(-1)!.n;
   await live.send("/soul @b"); await live.send("use B"); await live.send("observe B");
   assert.equal(rows().find((row) => row.label === "B")?.n, 1);

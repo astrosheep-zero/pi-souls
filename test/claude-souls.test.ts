@@ -128,7 +128,7 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string;
         return { exitCode: 1, stdout: JSON.stringify({ error: "unsupported test task" }), isStdoutTruncated: false };
       },
     },
-    http: { fetch: async () => ({ ok: true, text: JSON.stringify({ text: "perception utterance" }) }) },
+    http: { fetch: async () => ({ ok: true, text: JSON.stringify({ kind: "remind", text: "perception utterance" }) }) },
     prompt: { compose: async () => compose() },
     command: { register: async (spec: any) => { commands.push(spec); return { name: spec.name }; } },
   };

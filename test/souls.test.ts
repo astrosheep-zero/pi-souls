@@ -458,22 +458,22 @@ test("customPrompt keeps settings souls off, leaves the session choice and statu
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("builtin time perception returns bare text only for due human moments", async () => {
+test("builtin time perception returns reminders only for due human moments", async () => {
   const t0 = new Date(2026, 9, 27, 2, 14, 0).getTime();
   const human: Moment = { kind: "human", text: "hi" };
   const say = (now: number, lastNoteAt?: number, absenceMs?: number, moment: Moment = human) =>
     timePerception(lastNoteAt)(moment, { ...worldFor({ now, sessionId: "s", cwd: "/", soul: "faye" }), absenceMs });
-  assert.deepEqual(await say(t0), { text: "⌚ 02:14 · Tue, Oct 27" });
+  assert.deepEqual(await say(t0), { kind: "remind", text: "⌚ 02:14 · Tue, Oct 27" });
   assert.equal(await say(t0 + HOUR_MS - 1, t0, 3 * HOUR_MS), undefined);
-  assert.deepEqual(await say(t0 + HOUR_MS, t0, 20 * 60_000), { text: "⌚ 03:14 · Tue, Oct 27" });
+  assert.deepEqual(await say(t0 + HOUR_MS, t0, 20 * 60_000), { kind: "remind", text: "⌚ 03:14 · Tue, Oct 27" });
   for (const [absenceMs, elapsed] of [[HOUR_MS, "1h"], [6 * HOUR_MS + 20 * 60_000, "6h 20m"], [74 * HOUR_MS, "3d 2h"]] as const) {
-    assert.deepEqual(await say(t0, undefined, absenceMs), { text: `⌚ 02:14 · Tue, Oct 27\n(${elapsed} since *human* was last present)` });
+    assert.deepEqual(await say(t0, undefined, absenceMs), { kind: "remind", text: `⌚ 02:14 · Tue, Oct 27\n(${elapsed} since *human* was last present)` });
   }
   assert.equal(await say(t0, undefined, undefined, { kind: "wake", source: "resume" }), undefined);
   assert.equal(await say(t0, undefined, undefined, { kind: "tool", phase: "before", category: "reading", toolName: "read" }), undefined);
   for (const invalid of [NaN, Infinity, -Infinity]) {
     assert.equal(await say(invalid), undefined);
-    assert.deepEqual(await say(t0, invalid, invalid), { text: "⌚ 02:14 · Tue, Oct 27" });
+    assert.deepEqual(await say(t0, invalid, invalid), { kind: "remind", text: "⌚ 02:14 · Tue, Oct 27" });
   }
   assert.equal(await say(t0, t0 + HOUR_MS), undefined);
 });

@@ -3,7 +3,7 @@ import { isSoulName, matchingModelKey } from "../../../src/soul-selection.ts";
 import { encodeChoice, type ClaudeSession, type SoulChoice } from "../../../src/claude-session.ts";
 import { timePerception } from "../../../src/time.ts";
 import { files, load, type Engine } from "./files.ts";
-import { perceptionText, toolMoment, worldFor, type Moment } from "./perception.ts";
+import { perceptionUtterance, toolMoment, worldFor, type Moment } from "./perception.ts";
 import { createPerceptionRuntime, invalidateRuntime, reloadRuntime, stopRuntime, type PerceptionRuntime } from "./perception-runtime.ts";
 
 const DEFAULTS: SoulChoice = { mode: "defaults" };
@@ -148,11 +148,11 @@ async function perceiveActive($: Engine, s: State, options: PluginOptions, momen
   try {
     const world = await worldFor($, name, s.journal.lastHumanAt);
     if (generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
-    const text = await perceptionText($, options, s.runtime, generation, name, moment, world, signal);
-    if (!text || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
+    const said = await perceptionUtterance($, options, s.runtime, generation, name, moment, world, signal);
+    if (said?.kind !== "remind" || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
     // Tool context waits until the whole batch's results are kept; never split tool pairs.
-    if (moment.kind === "tool") s.toolNotes.push({ text, generation });
-    else await reminder($, s, text);
+    if (moment.kind === "tool") s.toolNotes.push({ text: said.text, generation });
+    else await reminder($, s, said.text);
   } catch {
     // Discovery, world facts and executable perceptions fail independently of the host.
   }
@@ -183,7 +183,9 @@ async function humanReminders($: Engine, s: State, options: PluginOptions, text:
   const clock = timePerception(s.journal.noteAt);
   const texts = await Promise.all([
     options.timeaware !== false ? boundedText($, world.then(async (facts) => (await clock(moment, facts))?.text)) : undefined,
-    boundedText($, perceptionText($, options, s.runtime, generation, soul, moment, world, signal)),
+    // Claude does not support ephemeral linger delivery.
+    boundedText($, perceptionUtterance($, options, s.runtime, generation, soul, moment, world, signal)
+      .then((said) => said?.kind === "remind" ? said.text : undefined)),
   ]);
   if (generation !== s.runtime.generation || s.proposals.get(proposal.section)?.soul !== soul || signal?.aborted) return [];
   return texts.flatMap((text) => text ? [wrapReminder(text)] : []);

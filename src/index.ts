@@ -8,7 +8,7 @@ import { ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserM
 import { timePerception } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, readTransition, sameTransition, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
-import { humanPerceptionText, loadPerception, PERCEPTION_MESSAGE_TYPE, sendReminder, toolCategory, toolFilePath, toolText, worldFor, wrapReminder, type Moment, type Perception } from "./perception.ts";
+import { humanPerception, loadPerception, PERCEPTION_MESSAGE_TYPE, sendReminder, toolCategory, toolFilePath, toolText, worldFor, wrapReminder, type Moment, type Perception } from "./perception.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
@@ -40,6 +40,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   // Hold live options: handlers after ours can still set customPrompt or forceSystemPrompt.
   let options: BuildSystemPromptOptions | undefined;
   let running = false;
+  let linger: { sessionId: string; soul: string; text: string; previousLeaf: string | null; anchorId?: string } | undefined;
   // What the projection handler learned for this request, read by the transition handler.
   let projection: { known: boolean; soul: string | null } | undefined;
   let forceReported = false;
@@ -63,15 +64,19 @@ export default function soulsExtension(pi: ExtensionAPI) {
     const last = lastUserMessageTimestamp(branch);
     return last === undefined ? undefined : Math.max(0, now - last);
   };
-  const perceptionContext = (ctx: ExtensionContext, customPrompt: string | undefined) => {
+  const perceptionSelection = (ctx: ExtensionContext, customPrompt: string | undefined) => {
     const config = readConfig(pi.getSettings(), ctx.cwd);
     const branch = ctx.sessionManager.getBranch();
     const selection = effectiveSoul(resolveSoul(config, sessionSoul(branch), ctx.model, soulless()), customPrompt);
+    return { config, branch, selection };
+  };
+  const perceptionContext = (ctx: ExtensionContext, customPrompt: string | undefined) => {
+    const { config, branch, selection } = perceptionSelection(ctx, customPrompt);
     if (!selection) return;
     const now = Date.now();
     const world = worldFor({ now, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, soul: selection.name, absenceMs: absence(branch, now) });
     return {
-      now,
+      now, sessionId: world.sessionId, soul: selection.name, previousLeaf: branch.at(-1)?.id ?? null,
       clock: (moment: Moment) => {
         readSoul(config.dir, selection.name, soulVariables(ctx));
         return timePerception(lastTimeNoteTimestamp(branch))(moment, world);
@@ -86,7 +91,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   const perceive = async (moment: Exclude<Moment, { kind: "human" }>, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
     try {
       const said = await perceptionContext(ctx, customPrompt)?.directory(moment);
-      if (said) sendReminder(pi, { text: said.text, details: { moment: moment.kind } });
+      if (said?.kind === "remind") sendReminder(pi, { text: said.text, details: { moment: moment.kind } });
     } catch {
       // A perception is decoration: a broken configuration never breaks the host.
     }
@@ -97,13 +102,18 @@ export default function soulsExtension(pi: ExtensionAPI) {
       if (!perception) return;
       const moment = { kind: "human", text } as const;
       const [clock, directory] = await Promise.all([
-        perception.timeaware ? humanPerceptionText(() => perception.clock(moment)) : undefined,
-        humanPerceptionText(() => perception.directory(moment)),
+        perception.timeaware ? humanPerception(() => perception.clock(moment)) : undefined,
+        humanPerception(() => perception.directory(moment)),
       ]);
-      const content = [clock, directory].filter(Boolean).join("\n");
-      if (content) return {
-        customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(content), display: true,
-        details: { moment: "human", ...(clock ? { timestamp: perception.now } : {}) },
+      const content = [clock?.text, directory?.kind === "remind" ? directory.text : undefined].filter(Boolean).join("\n");
+      return {
+        message: content ? {
+          customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(content), display: true,
+          details: { moment: "human", ...(clock ? { timestamp: perception.now } : {}) },
+        } : undefined,
+        linger: directory?.kind === "linger" ? {
+          sessionId: perception.sessionId, soul: perception.soul, previousLeaf: perception.previousLeaf, text: directory.text,
+        } : undefined,
       };
     } catch {
       // A broken configuration never prevents the prompt from starting.
@@ -142,7 +152,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   };
   pi.on("session_start", (event, ctx) => {
     cwd = ctx.cwd; reported = undefined; forceReported = false;
-    options = undefined; running = false;
+    options = undefined; running = false; linger = undefined;
     projection = undefined; forcedProjection = undefined;
     promptKnown = false; seenPrompt = undefined;
     toolCalls.clear();
@@ -162,15 +172,17 @@ export default function soulsExtension(pi: ExtensionAPI) {
   });
   pi.on("session_tree", (_event, ctx) => refreshFooter(ctx, promptValue()));
   pi.on("before_agent_start", async (event, ctx) => {
+    linger = undefined;
     options = event.systemPromptOptions; running = true; forcedProjection = undefined;
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
     if ("messageType" in event && event.messageType !== "user") return;
-    const message = await humanReminder(event.prompt, ctx, options.customPrompt);
-    if (message) return { message };
+    const result = await humanReminder(event.prompt, ctx, options.customPrompt);
+    if (running && options === event.systemPromptOptions) linger = result?.linger;
+    if (result?.message) return { message: result.message };
   });
   pi.on("agent_settled", () => {
-    running = false; projection = undefined;
+    running = false; linger = undefined; projection = undefined;
   });
   pi.on("tool_call", (event, ctx) => {
     const filePath = toolFilePath(event.input);
@@ -386,6 +398,43 @@ export default function soulsExtension(pi: ExtensionAPI) {
       });
     }
   };
+
+  pi.on("context", (event, ctx) => {
+    const active = linger;
+    if (!running || !active) return;
+    const session = ctx.sessionManager;
+    try {
+      const { branch, selection } = perceptionSelection(ctx, options?.customPrompt);
+      // Pi has no selection generation; use the live soul and session identity.
+      if (selection?.name !== active.soul || session.getSessionId() !== active.sessionId) {
+        linger = undefined;
+        return;
+      }
+      if (!active.anchorId) {
+        // Pin the first user entry added after the start hook, not queued steering.
+        const previous = branch.findIndex((entry) => entry.id === active.previousLeaf);
+        if (previous >= 0 || active.previousLeaf === null) {
+          active.anchorId = branch.slice(previous + 1).find((entry) => entry.type === "message" && entry.message.role === "user")?.id;
+        }
+      }
+      const projected = session.buildSessionProjection();
+      const anchor = projected.entries.find(({ sourceEntry }) => sourceEntry.id === active.anchorId)?.messages[0];
+      if (anchor?.role === "user") {
+        // Context has cloned messages without entry ids; never guess on a collision.
+        const content = JSON.stringify(anchor.content);
+        const matches = (message: AgentMessage) => message.role === "user" && message.timestamp === anchor.timestamp && JSON.stringify(message.content) === content;
+        const index = event.messages.findIndex(matches);
+        if (index >= 0 && index === event.messages.findLastIndex(matches) && !projected.messages.some((message) => message !== anchor && matches(message))) {
+          const messages = [...event.messages];
+          messages.splice(index + 1, 0, { role: "user", content: wrapReminder(active.text), timestamp: anchor.timestamp });
+          return { messages };
+        }
+      }
+    } catch {
+      // A perception is decoration: never obstruct a request.
+    }
+    linger = undefined; // The origin is no longer visible; do not re-anchor.
+  });
 
   // First handler owns presence/projection and its existing error path, including the no-UI throw.
   pi.on("context_with_system", (event, ctx) => {

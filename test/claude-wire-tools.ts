@@ -32,13 +32,13 @@ function soul(soulsDir: string): void {
   writeFileSync(join(soulsDir, "a", "perception.ts"), [
     "type Moment = { kind: string; text?: string; phase?: string; toolName?: string };",
     "export default async function perception(moment: Moment) {",
-    "  if (moment.kind === 'human' && moment.text === 'read both fixture files') return { text: 'HUMAN_PERCEPTION' };",
+    "  if (moment.kind === 'human' && moment.text === 'read both fixture files') return { kind: 'remind', text: 'HUMAN_PERCEPTION' };",
     "  if (moment.kind === 'human' && moment.text === 'after the tools') {",
     "    await new Promise((r) => setTimeout(r, 3500));",
-    "    return { text: 'LATE_HUMAN_PERCEPTION' };",
+    "    return { kind: 'remind', text: 'LATE_HUMAN_PERCEPTION' };",
     "  }",
     "  if (moment.kind !== \"tool\") return undefined;",
-    "  return { text: `PERCEPTION ${moment.phase} ${moment.toolName}` };",
+    "  return { kind: 'remind', text: `PERCEPTION ${moment.phase} ${moment.toolName}` };",
     "}",
   ].join("\n"));
 }
