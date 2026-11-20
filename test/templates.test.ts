@@ -88,7 +88,7 @@ test("commands validate templates before persisting; requests and forced prompts
     assert.match(notices.at(-1)!, /template:.*undefined variable/);
     await command.handler("@faye", ctx);
     assert.equal(sessionSoul(session.getBranch()), "faye");
-    assert.equal(handlers.get("before_agent_start")![0]({ messageType: "user", systemPromptOptions: options }, ctx), undefined);
+    await handlers.get("before_agent_start")![0]({ messageType: "user", prompt: "hi", systemPromptOptions: options }, ctx);
     const expected = `Faye gpt-test in ${variables.cwd}`;
     assert.deepEqual(request()!.messages[0], { ...input[0], sections: { preamble: expected, rules: "Keep" } });
     assert.equal(options.forceSystemPrompt, `${expected}\nKeep these rules`);

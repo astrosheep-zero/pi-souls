@@ -11,7 +11,7 @@ const CATEGORIES: Record<string, "reading" | "running" | "writing"> = {
   edit: "writing", Edit: "writing", MultiEdit: "writing", write: "writing", Write: "writing",
 };
 
-export function toolMoment(toolName: string, phase: "before" | "after", input: unknown, output?: unknown, ok?: boolean): Moment {
+export function toolMoment(toolName: string, phase: "before" | "after", input: unknown, output?: unknown, ok?: boolean): Extract<Moment, { kind: "tool" }> {
   const args = input && typeof input === "object" ? input as Record<string, unknown> : {};
   const path = args.file_path ?? args.path;
   const text = (value: unknown) => {
@@ -30,8 +30,9 @@ export function toolMoment(toolName: string, phase: "before" | "after", input: u
   };
 }
 
-export async function worldFor($: Engine, name: string, absenceMs?: number, now?: number): Promise<World> {
-  now ??= await $.clock.now();
+export async function worldFor($: Engine, name: string, previousHumanAt?: number): Promise<World> {
+  const now = await $.clock.now();
+  const absenceMs = previousHumanAt === undefined ? undefined : Math.max(0, now - previousHumanAt);
   const home = await $.env.get("HOME") ?? await $.env.get("USERPROFILE") ?? "";
   const date = new Date(now), hour = date.getHours(), weekday = date.getDay();
   return {
@@ -42,11 +43,13 @@ export async function worldFor($: Engine, name: string, absenceMs?: number, now?
 }
 
 /** Discover fresh, then reuse the shared loader's cached closure in the session child. */
-export async function perceive($: Engine, options: PluginOptions, runtime: PerceptionRuntime, generation: number, name: string, moment: Moment, world: World, signal?: AbortSignal): Promise<Utterance | undefined> {
+export async function perceptionText($: Engine, options: PluginOptions, runtime: PerceptionRuntime, generation: number, name: string, moment: Moment, world: World | Promise<World>, signal?: AbortSignal): Promise<string | undefined> {
   try {
+    const facts = await world;
+    if (generation !== runtime.generation || signal?.aborted) return undefined;
     const { path } = await files<{ path?: string }>($, options, { op: "perception", name });
     if (!path || generation !== runtime.generation || signal?.aborted) return undefined;
-    const said = await runPerception($, runtime, { path, moment, world }, signal) as Utterance | undefined;
-    return said && generation === runtime.generation && !signal?.aborted && typeof said.text === "string" && said.text.trim() ? { text: said.text } : undefined;
+    const said = await runPerception($, runtime, { path, moment, world: facts }, signal) as Utterance | undefined;
+    return said && generation === runtime.generation && !signal?.aborted && typeof said.text === "string" && said.text.trim() ? said.text : undefined;
   } catch { return undefined; }
 }

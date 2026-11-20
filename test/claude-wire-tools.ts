@@ -30,8 +30,13 @@ function soul(soulsDir: string): void {
     "You are soul A. Read only the fixture files.",
   ].join("\n"));
   writeFileSync(join(soulsDir, "a", "perception.ts"), [
-    "type Moment = { kind: string; phase?: string; toolName?: string };",
-    "export default function perception(moment: Moment) {",
+    "type Moment = { kind: string; text?: string; phase?: string; toolName?: string };",
+    "export default async function perception(moment: Moment) {",
+    "  if (moment.kind === 'human' && moment.text === 'read both fixture files') return { text: 'HUMAN_PERCEPTION' };",
+    "  if (moment.kind === 'human' && moment.text === 'after the tools') {",
+    "    await new Promise((r) => setTimeout(r, 3500));",
+    "    return { text: 'LATE_HUMAN_PERCEPTION' };",
+    "  }",
     "  if (moment.kind !== \"tool\") return undefined;",
     "  return { text: `PERCEPTION ${moment.phase} ${moment.toolName}` };",
     "}",
@@ -80,6 +85,8 @@ test("parallel Read results stay contiguous before future-only soul reminders", 
     const [first, second] = toolTurn.apiBodies;
     assert.ok(first && second);
 
+    assert.match(JSON.stringify(first.messages), /HUMAN_PERCEPTION/, "directory soul perceives the human before the first request");
+
     // The first request cannot know what the tools will say; the tool continuation is
     // already shaped without the reminders too.
     assert.doesNotMatch(JSON.stringify(first.messages), /PERCEPTION /);
@@ -90,6 +97,7 @@ test("parallel Read results stay contiguous before future-only soul reminders", 
     const nextTurn = await host.send("after the tools");
     assert.equal(nextTurn.apiBodies.length, 1);
     const third = nextTurn.apiBodies[0]!;
+    assert.doesNotMatch(JSON.stringify(third.messages), /LATE_HUMAN_PERCEPTION/, "a slow human perception misses the submit deadline");
     assert.match(JSON.stringify(third.messages), /PERCEPTION before Read/);
     assert.match(JSON.stringify(third.messages), /PERCEPTION after Read/);
     const semantic = (messages: any[]) => messages.map((message: any) => ({
@@ -130,6 +138,7 @@ test("parallel Read results stay contiguous before future-only soul reminders", 
     const resultRows = rows.flatMap((row, index) => row.type === "user" && blocks(row.message).some((block) => block.type === "tool_result") ? [index] : []);
     assert.equal(resultRows.length, 2);
     assert.equal(resultRows[1]! - resultRows[0]!, 1, "both kept tool-result rows are adjacent");
+    assert.ok(!rows.some((row) => row.type === "user" && row.isMeta && JSON.stringify(row.message).includes("HUMAN_PERCEPTION")), "no late human perception meta user row");
     const firstReminder = rows.findIndex((row) => JSON.stringify(row).includes("PERCEPTION "));
     assert.ok(firstReminder > resultRows[1]!, "no reminder splits or precedes the tool-result pair");
   } finally {

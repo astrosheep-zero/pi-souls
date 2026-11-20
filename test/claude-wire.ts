@@ -11,6 +11,9 @@ const souls = { a: A, b: B };
 const settings = (options: Record<string, unknown> = {}) => ["--settings", JSON.stringify({ pluginConfigs: { "pi-souls@inline": { options: { defaultSoul: "a", ...options } } } })];
 const system = (turn: WireTurn) => turn.apiBodies.at(-1)?.system.map((block: any) => block.text).join("\n\n") ?? "";
 const text = (row: any): string => typeof row.message?.content === "string" ? row.message.content : (row.message?.content ?? []).map((b: any) => b.text ?? "").join("\n");
+const clockAttachments = (rows: any[]) => rows.filter((row) => row.type === "attachment"
+  && row.attachment?.type === "hook_additional_context" && row.attachment.hookName === "prompt.submit"
+  && row.attachment.content.some((part: string) => part.includes("⌚ ")));
 const clearWarnings = (host: WireHost) => host.events.filter((event) => event.type === "system" && event.subtype === "ui_log" && String(event.text).includes("turning off souls did not take effect"));
 const wait = () => new Promise((resolve) => setTimeout(resolve, 400));
 async function command(host: WireHost, input: string) {
@@ -101,7 +104,7 @@ test("native commands change the next wire prompt, reload fresh content, and nev
     await human(host, "configured default again", A);
     const { rows, state } = await session(host);
     assert.deepEqual(state.choice, { mode: "defaults" });
-    assert.equal(rows.filter((r) => r.isMeta && text(r).includes("⌚")).length, 1, "delivered clock baseline is not duplicated");
+    assert.equal(clockAttachments(rows).length, 1, "delivered clock baseline is not duplicated");
     assert.ok(!host.apiBodies.some((body) => body.messages.some((message: any) => {
       const content = typeof message.content === "string" ? [message.content] : message.content.map((block: any) => block.type === "text" ? block.text : "");
       return content.some((part: string) => /^Soul choice: (?:@\S+|disabled|defaults)$/.test(part));
@@ -114,7 +117,11 @@ test("folded opening follows native rewind, resume, compact and fork", { timeout
   const options = { dir, souls, args: settings(), debug: true };
   let host = await createWireHost(options);
   try {
-    await human(host, "first default", A);
+    const first = await human(host, "first default", A);
+    const seen = first.apiBodies[0]!.messages.flatMap((m: any) => m.role === "user"
+      ? typeof m.content === "string" ? [m.content] : m.content.map((b: any) => b.text) : []);
+    assert.ok(seen.includes("first default"), "user text reaches Claude unchanged");
+    assert.ok(seen.some((part: unknown) => typeof part === "string" && part.includes("⌚ ")), "clock is in the first main request");
     await command(host, "/soul @b");
     await human(host, "branch B", B);
     await command(host, "/soul @a");
@@ -126,16 +133,23 @@ test("folded opening follows native rewind, resume, compact and fork", { timeout
     assert.equal(rewind.response.response.rewound, true, "the business rewind result, not only transport success");
     await human(host, "FIRST wire after rewind", B);
     const old = await session(host);
-    const clock = old.rows.find((r) => r.isMeta && text(r).includes("⌚"));
-    assert.ok(clock);
+    const clocksBefore = clockAttachments(old.rows);
+    assert.equal(clocksBefore.length, 1, "within-hour submits do not attach a second clock");
+    const clock = clocksBefore[0]!;
+    assert.equal(old.state.noteAt, Date.parse(clock.timestamp));
+    assert.ok(old.rows.some((r) => r.type === "user" && !r.isMeta && text(r) === "first default"));
+    assert.ok(!old.rows.some((r) => r.type === "user" && r.isMeta && text(r).includes("⌚ ")), "no late clock meta user row");
     const compact = await host.send("/compact");
     assert.equal(compact.result.is_error, false);
     await human(host, "after compaction", B);
+    assert.equal((await session(host)).state.noteAt, Date.parse(clock.timestamp), "compaction keeps the original clock baseline");
     const parent = host.sessionId;
     await host.stop();
     host = await createWireHost({ ...options, resume: parent });
     await human(host, "resumed parent", B);
-    assert.deepEqual((await session(host)).state.choice, { mode: "named", name: "b" });
+    const resumed = await session(host);
+    assert.deepEqual(resumed.state.choice, { mode: "named", name: "b" });
+    assert.equal(resumed.state.noteAt, Date.parse(clock.timestamp), "resume does not refresh the clock early");
     await host.stop();
     host = await createWireHost({ ...options, resume: parent, forkSession: true });
     await human(host, "inherited compact fork", B);
@@ -152,7 +166,7 @@ test("folded opening follows native rewind, resume, compact and fork", { timeout
     await human(host, "fork can still select", B);
     const child = await session(host);
     assert.deepEqual(child.state.choice, { mode: "named", name: "b" });
-    const clocks = child.rows.filter((r) => r.isMeta && text(r).includes("⌚"));
+    const clocks = clockAttachments(child.rows);
     assert.equal(clocks.length, 1);
     assert.equal(clocks[0].timestamp, clock.timestamp, "native carrier keeps original timestamp, never backdates a duplicate");
   } finally { await host.stop(); }
@@ -168,7 +182,10 @@ test("explicit custom and legacy snapshots suppress unproven identity; compact m
     assert.ok(system(turn).includes("WIRE_CUSTOM_NATIVE"));
     assert.ok(!system(turn).includes(B));
     assert.match(await command(host, "/soul"), /Active: unconfirmed/);
-    assert.equal((await session(host)).rows.filter((r) => r.isMeta && /new soul:|⌚/.test(text(r))).length, 0);
+    // Detached preview may still propose a soul. That permits submit context,
+    // not a proven identity or a late meta reminder.
+    const { rows } = await session(host);
+    assert.equal(rows.filter((r) => r.isMeta && /new soul:|⌚/.test(text(r))).length, 0);
   } finally { await host.stop(); }
 
   const dir = mkdtempSync(join(tmpdir(), "pi-souls-legacy-")), legacy = join(dir, "legacy-plugin");

@@ -13,20 +13,6 @@ function matchingModelKey(model, keys) {
   });
 }
 
-// src/claude-session.ts
-var CHOICE_PREFIX = "Soul choice:";
-function encodeChoice(choice) {
-  switch (choice.mode) {
-    case "named":
-      if (!isSoulName(choice.name)) throw new Error(`Invalid soul name: ${JSON.stringify(choice.name)}`);
-      return `${CHOICE_PREFIX} @${choice.name}`;
-    case "disabled":
-      return `${CHOICE_PREFIX} disabled`;
-    case "defaults":
-      return `${CHOICE_PREFIX} defaults`;
-  }
-}
-
 // src/time.ts
 var DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -58,6 +44,21 @@ function timePerception(lastNoteAt) {
 (${away} since *human* was last present)` : clock };
   };
 }
+
+// src/claude-session.ts
+var CHOICE_PREFIX = "Soul choice:";
+function encodeChoice(choice) {
+  switch (choice.mode) {
+    case "named":
+      if (!isSoulName(choice.name)) throw new Error(`Invalid soul name: ${JSON.stringify(choice.name)}`);
+      return `${CHOICE_PREFIX} @${choice.name}`;
+    case "disabled":
+      return `${CHOICE_PREFIX} disabled`;
+    case "defaults":
+      return `${CHOICE_PREFIX} defaults`;
+  }
+}
+var CLOCK_LINE = new RegExp(`^\u231A (?:[01]\\d|2[0-3]):[0-5]\\d \xB7 (?:${DAYS.join("|")}), (?:${MONTHS.join("|")}) (?:[1-9]|[12]\\d|3[01])$`, "u");
 
 // plugins/claude/hooks/files.ts
 var RUNNER = `${import.meta.dir}/souls-runner.cjs`;
@@ -218,8 +219,9 @@ function toolMoment(toolName, phase, input, output, ok) {
     ...ok === void 0 ? {} : { ok }
   };
 }
-async function worldFor($, name, absenceMs, now) {
-  now ??= await $.clock.now();
+async function worldFor($, name, previousHumanAt) {
+  const now = await $.clock.now();
+  const absenceMs = previousHumanAt === void 0 ? void 0 : Math.max(0, now - previousHumanAt);
   const home = await $.env.get("HOME") ?? await $.env.get("USERPROFILE") ?? "";
   const date = new Date(now), hour = date.getHours(), weekday = date.getDay();
   return {
@@ -231,12 +233,14 @@ async function worldFor($, name, absenceMs, now) {
     ...absenceMs !== void 0 && Number.isFinite(absenceMs) && absenceMs >= 0 ? { absenceMs } : {}
   };
 }
-async function perceive($, options, runtime, generation, name, moment, world, signal) {
+async function perceptionText($, options, runtime, generation, name, moment, world, signal) {
   try {
+    const facts = await world;
+    if (generation !== runtime.generation || signal?.aborted) return void 0;
     const { path } = await files($, options, { op: "perception", name });
     if (!path || generation !== runtime.generation || signal?.aborted) return void 0;
-    const said = await runPerception($, runtime, { path, moment, world }, signal);
-    return said && generation === runtime.generation && !signal?.aborted && typeof said.text === "string" && said.text.trim() ? { text: said.text } : void 0;
+    const said = await runPerception($, runtime, { path, moment, world: facts }, signal);
+    return said && generation === runtime.generation && !signal?.aborted && typeof said.text === "string" && said.text.trim() ? said.text : void 0;
   } catch {
     return void 0;
   }
@@ -281,7 +285,6 @@ async function hydrate($, s, options, handles, rewind = false) {
       s.head = result.headUuid ?? void 0;
       s.pendingChoice = void 0;
       s.pendingBrain = void 0;
-      s.human = void 0;
       s.toolNotes = [];
       s.compactedOpening = void 0;
       s.observed = void 0;
@@ -322,10 +325,13 @@ async function append($, s, type, text) {
   s.journalHead = void 0;
   return true;
 }
-function reminder($, s, text) {
-  return append($, s, "user", `<system-reminder>
+function wrapReminder(text) {
+  return `<system-reminder>
 ${text}
-</system-reminder>`);
+</system-reminder>`;
+}
+function reminder($, s, text) {
+  return append($, s, "user", wrapReminder(text));
 }
 function invalidate($) {
   $.ui.invalidate("prompt.section");
@@ -333,9 +339,12 @@ function invalidate($) {
 function status($, s) {
   $.ui.status(s.applied?.soul ? s.applied.icon ?? s.applied.soul : void 0);
 }
+function matchingProposal(s, parts) {
+  return [...s.proposals.values()].find((p) => parts[0] === p.opening && parts.includes(p.section));
+}
 function prove($, s) {
   const parts = s.journal.snapshot?.systemPrompt;
-  const proposal = parts && [...s.proposals.values()].find((p) => parts[0] === p.opening && parts.includes(p.section));
+  const proposal = parts && matchingProposal(s, parts);
   if (s.applied?.soul !== proposal?.soul) invalidateRuntime(s.runtime);
   s.applied = proposal;
   s.suppression = proposal ? "" : s.journal.snapshot ? "Claude is using a custom or older system prompt. For an older session, run /compact or start a new session to enable soul switching." : "send a message to see the active soul";
@@ -344,22 +353,53 @@ function prove($, s) {
 }
 async function preview($, model) {
   invalidate($);
-  await $.prompt.compose(model ? { model } : {});
+  return $.prompt.compose(model ? { model } : {});
 }
-async function perceiveActive($, s, options, moment, absenceMs, now, signal) {
+async function perceiveActive($, s, options, moment, signal) {
   const name = s.applied?.soul;
   const generation = s.runtime.generation;
   if (!name) return;
   try {
-    const world = await worldFor($, name, absenceMs, now);
-    if (world.absenceMs === void 0 && s.journal.lastHumanAt !== void 0) world.absenceMs = Math.max(0, world.now - s.journal.lastHumanAt);
+    const world = await worldFor($, name, s.journal.lastHumanAt);
     if (generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
-    const said = await perceive($, options, s.runtime, generation, name, moment, world, signal);
-    if (!said || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
-    if (moment.kind === "tool") s.toolNotes.push({ text: said.text, generation });
-    else await reminder($, s, said.text);
+    const text = await perceptionText($, options, s.runtime, generation, name, moment, world, signal);
+    if (!text || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
+    if (moment.kind === "tool") s.toolNotes.push({ text, generation });
+    else await reminder($, s, text);
   } catch {
   }
+}
+async function boundedText($, pending) {
+  let timer;
+  try {
+    return (await Promise.race([
+      pending,
+      new Promise((resolve) => {
+        timer = $.clock.after(2e3, () => resolve(void 0));
+      })
+    ]))?.trim();
+  } catch {
+    return void 0;
+  } finally {
+    timer?.cancel();
+  }
+}
+async function humanReminders($, s, options, text, signal) {
+  const model = await $.session.model().catch(() => void 0);
+  const { sections } = await preview($, model);
+  const proposal = matchingProposal(s, sections.flatMap((section) => section.text === "" ? [] : [section.text]));
+  const soul = proposal?.soul;
+  if (!soul || signal?.aborted) return [];
+  const generation = s.runtime.generation;
+  const moment = { kind: "human", text };
+  const world = worldFor($, soul, s.journal.lastHumanAt);
+  const clock = timePerception(s.journal.noteAt);
+  const texts = await Promise.all([
+    options.timeaware !== false ? boundedText($, world.then(async (facts) => (await clock(moment, facts))?.text)) : void 0,
+    boundedText($, perceptionText($, options, s.runtime, generation, soul, moment, world, signal))
+  ]);
+  if (generation !== s.runtime.generation || s.proposals.get(proposal.section)?.soul !== soul || signal?.aborted) return [];
+  return texts.flatMap((text2) => text2 ? [wrapReminder(text2)] : []);
 }
 function retainedMessages(before, after, handles) {
   const wanted = /* @__PURE__ */ new Set([...handles, ...after.flatMap((message) => message.handle ? [message.handle] : [])]);
@@ -423,7 +463,6 @@ function register(on, options = {}) {
       s.native = void 0;
       s.compactedOpening = void 0;
       s.sectionIdentity = void 0;
-      s.human = void 0;
       s.pendingBrain = void 0;
       s.pendingChoice = void 0;
       s.toolNotes = [];
@@ -606,10 +645,12 @@ ${following.text}` } : {} };
     } catch (error) {
       warn($, s, error);
     }
-    const pending = { text: e.text, now: await $.clock.now(), previousHumanAt: s.journal.lastHumanAt };
-    const result = await next(e);
-    if (result.drop === void 0) s.human = pending;
-    return result;
+    let extra = [];
+    try {
+      extra = await humanReminders($, s, options, e.text, next.signal);
+    } catch {
+    }
+    return next(extra.length ? { ...e, context: [...e.context ?? [], ...extra] } : e);
   });
   on("classic.PostModelSwitch", async ($, e, next) => {
     const result = await next(e);
@@ -642,26 +683,10 @@ ${following.text}` } : {} };
           delivered = await append($, s, "system", actual.soul ? `\u2500\u2500 soul: ${actual.soul} \u2500\u2500` : "\u2500\u2500 soulless \u2500\u2500");
         }
         if (delivered) s.observed = actual.soul;
-        if (actual.soul) {
-          if (s.wake) {
-            const moment = s.wake;
-            s.wake = void 0;
-            await perceiveActive($, s, options, moment, void 0, void 0, next.signal);
-          }
-          if (e.index === 0 && s.human && generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) {
-            const pending = s.human;
-            s.human = void 0;
-            const previousAt = pending.previousHumanAt ?? (s.journal.lastHumanAt !== void 0 && s.journal.lastHumanAt < pending.now ? s.journal.lastHumanAt : s.journal.previousHumanAt);
-            const absenceMs = previousAt === void 0 ? void 0 : Math.max(0, pending.now - previousAt);
-            const world = await worldFor($, actual.soul, absenceMs, pending.now);
-            if (options.timeaware !== false) {
-              const said = await timePerception(s.journal.noteAt)({ kind: "human", text: pending.text }, world);
-              if (said && generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) await reminder($, s, said.text);
-            }
-            if (generation === s.runtime.generation && s.applied?.soul === actual.soul && !next.signal.aborted) {
-              await perceiveActive($, s, options, { kind: "human", text: pending.text }, absenceMs, pending.now, next.signal);
-            }
-          }
+        if (actual.soul && s.wake) {
+          const moment = s.wake;
+          s.wake = void 0;
+          await perceiveActive($, s, options, moment, next.signal);
         }
       }
     } catch (error) {
@@ -678,18 +703,18 @@ ${following.text}` } : {} };
     const result = await next(e);
     if (e.agent_id === void 0) {
       const args = Object.fromEntries(Object.entries(e).filter(([key]) => !ENVELOPE.has(key)));
-      await perceiveActive($, s, options, toolMoment(e.tool, "before", args), void 0, void 0, next.signal);
+      await perceiveActive($, s, options, toolMoment(e.tool, "before", args), next.signal);
     }
     return result;
   });
   on("classic.PostToolUse", async ($, e, next) => {
     const result = await next(e);
-    if (e.agent_id === void 0) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.tool_response, true), void 0, void 0, next.signal);
+    if (e.agent_id === void 0) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.tool_response, true), next.signal);
     return result;
   });
   on("classic.PostToolUseFailure", async ($, e, next) => {
     const result = await next(e);
-    if (e.agent_id === void 0) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.error, false), void 0, void 0, next.signal);
+    if (e.agent_id === void 0) await perceiveActive($, s, options, toolMoment(e.tool_name, "after", e.tool_input, e.error, false), next.signal);
     return result;
   });
   on("session.compact", async ($, e, next) => {

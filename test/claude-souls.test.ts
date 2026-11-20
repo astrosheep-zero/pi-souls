@@ -185,7 +185,7 @@ function host(options: { souls?: Record<string, SoulFile>; defaultSoul?: string;
       const next = Object.assign(async function* () { return {}; }, { signal: new AbortController().signal });
       for await (const _chunk of hook($, { model: "claude-opus-5-5", index }, next)) {}
     },
-    async submit() { await invoke("prompt.submit", { text: "human prompt" }, async (e) => ({ text: e.text })); },
+    async submit() { return invoke("prompt.submit", { text: "human prompt", context: ["other context"] }, async (e) => e); },
     async end() { await invoke("session.end", {}, async () => ({})); },
     deny(value: string | undefined) { denyNote = value; },
     choice(): SoulChoice | undefined { return lastUuid ? readClaudeSession(jsonl(), lastUuid).choice : undefined; },
@@ -368,25 +368,21 @@ test("tool utterances wait for the safe boundary and a kept switch/reload drops 
   }
 });
 
-test("clear during a wake await suppresses the old turn's clock and human perception", async () => {
+test("clear during submit discards both reminders for the old soul", async () => {
   const h = host({ timeaware: true });
   await h.start();
   await h.command("@A"); await h.echo("@A");
-  h.snapshot((await h.compose()).sections.filter((section) => section.text !== "").map((section) => section.text));
-  await h.prompt(); await h.command("");
-  await h.submit(); await h.prompt("human prompt");
   let entered!: () => void, release!: () => void;
   const waiting = new Promise<void>((resolve) => { entered = resolve; });
   const blocked = new Promise<void>((resolve) => { release = resolve; });
   h.pauseDiscovery(async () => { entered(); await blocked; });
-  const pending = h.step(0);
+  const pending = h.submit();
   await waiting;
   await h.command("clear"); await h.echo("clear");
   release();
-  await pending;
+  assert.deepEqual(await pending, { text: "human prompt", context: ["other context"] });
   assert.equal(h.spawns(), 0);
-  assert.equal(h.discoveries(), 1, "the pending human event is not redispatched after the switch");
-  assert.ok(!h.transcript.some((row) => row.message?.content?.some((block: any) => /⌚|perception utterance/.test(block.text ?? ""))));
+  assert.equal(h.discoveries(), 1);
   await h.end();
 });
 

@@ -506,20 +506,18 @@ test("Pi time awareness sends visible perceptions, throttles hourly and follows 
       registerFlag: () => {}, getFlag: () => soullessFlag,
       getSettings: () => ({ soulsDir: dir, defaultSoul: "faye", timeaware }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
-      sendMessage: (message: typeof sent[number]) => {
-        sent.push(message);
-        session.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
-      },
+      sendMessage: (message: typeof sent[number]) => sent.push(message),
       registerEntryRenderer: () => {}, registerCommand: () => {},
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const ctx = { cwd: dir, model, sessionManager: session, hasUI: true, ui: { notify: () => {}, setStatus: () => {} } };
     const start = async (extra: Record<string, unknown> = {}) => {
-      const count = sent.length;
-      assert.equal(handlers.get("before_agent_start")!({ messageType: "user", prompt: "hi", systemPromptOptions: { cwd: dir }, ...extra }, ctx), undefined);
-      await Promise.resolve();
-      return sent.length > count ? sent.at(-1) : undefined;
+      const result = await handlers.get("before_agent_start")!({ messageType: "user", prompt: "hi", systemPromptOptions: { cwd: dir }, ...extra }, ctx) as { message: typeof sent[number] } | undefined;
+      const message = result?.message;
+      assert.equal(sent.length, 0, "human reminders are returned, not sent separately");
+      if (message) session.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+      return message;
     };
     let now = t0;
     Date.now = () => now;

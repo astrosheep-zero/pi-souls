@@ -1,5 +1,6 @@
 /** Pure reader for the active ancestry of a Claude transcript. No host APIs. */
 import { isSoulName } from "./soul-selection.ts";
+import { DAYS, MONTHS } from "./time.ts";
 
 export type SoulChoice =
   | { mode: "named"; name: string }
@@ -162,6 +163,16 @@ function reminderText(text: string): string {
   return (match ? match[1]! : text).trim();
 }
 
+const CLOCK_LINE = new RegExp(`^⌚ (?:[01]\\d|2[0-3]):[0-5]\\d · (?:${DAYS.join("|")}), (?:${MONTHS.join("|")}) (?:[1-9]|[12]\\d|3[01])$`, "u");
+
+function hasSubmitClock(row: Row): boolean {
+  // Claude stores the submit hook name but no plugin origin on these attachments.
+  const attachment = row.type === "attachment" && record(row.attachment) ? row.attachment : undefined;
+  return attachment?.type === "hook_additional_context" && attachment.hookName === "prompt.submit"
+    && Array.isArray(attachment.content) && attachment.content.some((part) =>
+      typeof part === "string" && reminderText(part).split(/\r?\n/).some((line) => CLOCK_LINE.test(line)));
+}
+
 /** Selection and divider records are owned informational system notices. */
 function ownedNotice(row: Row): string | undefined {
   if (!mainRow(row) || row.type !== "system" || row.subtype !== "informational") return undefined;
@@ -225,9 +236,9 @@ function inspect(row: Row, reading: Reading): Used {
     }
   }
 
-  if (isReminderRow(row)) {
-    const text = reminderText(rowText(row));
-    for (const line of text.split(/\r?\n/)) {
+  const reminder = isReminderRow(row) ? reminderText(rowText(row)) : undefined;
+  if (reminder !== undefined) {
+    for (const line of reminder.split(/\r?\n/)) {
       if (!reading.soulReminder) {
         const soul = decodeNewSoul(line);
         if (soul !== undefined) {
@@ -244,10 +255,10 @@ function inspect(row: Row, reading: Reading): Used {
         }
       }
     }
-    if (result.noteAt === undefined && text.startsWith("⌚") && at !== undefined) {
-      result.noteAt = at;
-      used.clock = true;
-    }
+  }
+  if (result.noteAt === undefined && at !== undefined && (reminder?.startsWith("⌚") || hasSubmitClock(row))) {
+    result.noteAt = at;
+    used.clock = true;
   }
 
   if (isHuman(row) && at !== undefined) {

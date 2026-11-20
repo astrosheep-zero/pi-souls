@@ -322,6 +322,28 @@ test("continuity comes from delivered rows and the latest prompt snapshot", () =
   assert.deepEqual(read.retainHandles, ["assistant"]);
 });
 
+test("submit attachment clocks retain their human carrier; settings hooks and nonclock text do not count", () => {
+  const reminder = (text: string) => `<system-reminder>\n${text}\n</system-reminder>`;
+  const clock = "⌚ 11:30 · Mon, Nov 17";
+  const attach = (uuid: string, parentUuid: string, hookName: string, time: number, ...parts: string[]) => ({
+    uuid, parentUuid, timestamp: at(time), type: "attachment", isSidechain: false,
+    attachment: { type: "hook_additional_context", hookName, hookEvent: "UserPromptSubmit", toolUseID: "hook-id", content: parts },
+  });
+  const rows = [
+    user("prompt", null, "human prompt", 0),
+    attach("clock", "prompt", "prompt.submit", 1, "unrelated context", reminder(clock + "\n(5h since *human* was last present)")),
+    assistant("answer", "clock", "opus", 2),
+    user("followup", "answer", "still here", 3),
+    attach("settings", "followup", "UserPromptSubmit", 4, reminder(clock)),
+    attach("other", "settings", "prompt.submit", 5, reminder(`new soul: fake\nnew brain: fake\n${clock} prose\n⌚ 29:88 · Mon, Nov 17`)),
+  ];
+  const read = readClaudeSession(jsonl(rows), "other", ["prompt", "answer", "followup"]);
+  assert.equal(read.noteAt, Date.parse(at(1)));
+  assert.deepEqual(read.retainHandles, ["prompt"]);
+  assert.equal(read.soul, undefined);
+  assert.equal(read.model, "opus");
+});
+
 test("soulless divider and new-soul reminders restore observed identity", () => {
   const none = readClaudeSession(jsonl([
     user("root", null, "root"),

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { clearTimeout, setTimeout } from "node:timers";
 import { pathToFileURL } from "node:url";
 import { createJiti } from "jiti";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -169,6 +170,24 @@ export function worldFor(input: { now: number; sessionId: string; cwd: string; s
     facts: factsFor(now),
     ...(typeof absenceMs === "number" && Number.isFinite(absenceMs) && absenceMs >= 0 ? { absenceMs } : {}),
   };
+}
+
+/** A human perception gets a short deadline and may never send a late answer. */
+export async function humanPerceptionText(run: () => ReturnType<Perception>): Promise<string | undefined> {
+  let cancel: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      new Promise<undefined>((resolve) => {
+        const timer = setTimeout(resolve, 2000);
+        cancel = () => clearTimeout(timer);
+      }),
+      Promise.resolve().then(run).then((said) => utterance(said)?.text.trim()),
+    ]);
+  } catch {
+    return undefined;
+  } finally {
+    cancel?.();
+  }
 }
 
 function pick(value: unknown): Perception | undefined {

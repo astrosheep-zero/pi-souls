@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { SessionManager, createAgentSession, DefaultResourceLoader, ModelRuntime, SettingsManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, createAgentSession, DefaultResourceLoader, ModelRuntime, SettingsManager, type CustomMessageEntry, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage, type TranscriptContext } from "@earendil-works/pi-ai";
 import extension from "../src/index.ts";
 import { factsFor, loadPerception, PERCEPTION_MESSAGE_TYPE, storeDirFor, toolCategory, toolFilePath, toolText, unwrapReminder, worldFor, wrapReminder } from "../src/perception.ts";
@@ -19,7 +19,7 @@ test("Pi SDK persists wrapped builtin and directory utterances and sends them as
   try {
     mkdirSync(join(dir, "faye"));
     writeFileSync(join(dir, "faye/SOUL.md"), "Faye");
-    writeFileSync(join(dir, "faye/perception.ts"), "export const perception = (moment) => moment.kind === 'human' ? { text: 'directory note' } : undefined;");
+    writeFileSync(join(dir, "faye/perception.ts"), "export const perception = (moment) => moment.kind === 'human' ? { text: '  directory: ' + moment.text + '  ' } : undefined;");
     const settings = SettingsManager.inMemory({ soulsDir: dir, defaultSoul: "faye" } as any);
     const loader = new DefaultResourceLoader({
       cwd: dir, agentDir: dir, settingsManager: settings,
@@ -51,18 +51,20 @@ test("Pi SDK persists wrapped builtin and directory utterances and sends them as
     await session.bindExtensions({ onError: (event) => errors.push(event.error) });
     await session.extensionRunner.emit({ type: "session_start", reason: "startup" });
     await session.prompt("hello");
-    const notes = sessionManager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === PERCEPTION_MESSAGE_TYPE);
-    assert.equal(notes.length, 2);
-    assert.ok(notes.every((entry) => entry.type === "custom_message" && entry.display === true));
-    const contents = notes.map((entry) => {
-      assert.equal(entry.type, "custom_message");
-      assert.equal(typeof entry.content, "string");
-      return entry.content as string;
-    });
-    assert.match(perceptionText(contents[0]!), /^⌚ /);
-    assert.equal(contents[1], wrapReminder("directory note"));
-    const sent = requests[0]!.map((message) => typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join(""));
-    for (const content of contents) assert.ok(sent.includes(content));
+    const notes = () => sessionManager.getBranch().filter((entry): entry is CustomMessageEntry => entry.type === "custom_message" && entry.customType === PERCEPTION_MESSAGE_TYPE);
+    assert.equal(notes().length, 1);
+    const note = notes()[0]!;
+    assert.equal(note.display, true);
+    assert.equal(typeof (note.details as { timestamp?: unknown })?.timestamp, "number");
+    assert.ok(typeof note.content === "string");
+    assert.match(perceptionText(note.content), /^⌚ [^\n]+\ndirectory: hello$/);
+    const sent = (i: number) => requests[i]!.map((message) => typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join(""));
+    assert.ok(sent(0).includes(note.content), "first request carries the persisted reminder");
+    await session.prompt("again");
+    assert.equal(notes().length, 2);
+    assert.equal(notes()[1]!.content, wrapReminder("directory: again"));
+    assert.deepEqual(notes()[1]!.details, { moment: "human" });
+    assert.ok(sent(1).includes(wrapReminder("directory: again")));
     assert.deepEqual(errors, []);
   } finally {
     dispose?.();
@@ -113,11 +115,12 @@ function setup(files: Record<string, string> = {}, settings: Record<string, unkn
     for (const handler of handlers.get(name) ?? []) result = await handler(event, ctx);
     return result;
   };
-  const settle = async (check: () => boolean) => {
-    for (let i = 0; i < 400 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  const human = async (prompt: string, customPrompt?: string) => {
+    const result = await fire("before_agent_start", { messageType: "user", prompt, systemPromptOptions: { cwd: dir, customPrompt } }) as { message: typeof sent[number] } | undefined;
+    return result?.message;
   };
   return {
-    dir, dirs: dir, session, sent, messageRenderers, notices, ctx, fire, settle, command,
+    dir, dirs: dir, session, sent, messageRenderers, notices, ctx, fire, human, command,
     footer: () => footer,
     write: (path: string, text: string) => {
       const target = join(dir, path);
@@ -364,17 +367,20 @@ test("/soul reload refreshes CommonJS perceptions without evicting other souls",
   }, files);
 });
 
-test("Pi speaks on the human's prompt without blocking the request", async () => {
+test("Pi drops a delayed human perception after two seconds without a late send", { timeout: 5_000 }, async () => {
   await withTime(1_700_000_000_000, async (h) => {
-    const options: Record<string, unknown> = { cwd: h.dir };
-    const result = await h.fire("before_agent_start", { type: "before_agent_start", prompt: "hello there", systemPromptOptions: options });
-    assert.equal(result, undefined); // the handler never waits on a perception module
-    await h.settle(() => h.sent.length > 0);
-    assert.equal(h.notices.length, 0);
-    assert.equal(h.sent[0]!.display, true);
-    const said = JSON.parse(perceptionText(h.sent[0]!.content));
-    assert.deepEqual(said.moment, { kind: "human", text: "hello there" });
-  }, { "faye/SOUL.md": "Directory faye", "faye/perception.ts": wakePerception });
+    const start = performance.now();
+    const message = await h.human("slow answer");
+    const elapsed = performance.now() - start;
+    assert.ok(elapsed >= 1900 && elapsed < 3000, `took ${elapsed} ms`);
+    assert.match(perceptionText(message!.content), /^⌚ [^\n]+$/);
+    // Let the soul finish after the host has gone ahead with the clock alone.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.deepEqual(h.sent, []);
+  }, {
+    "faye/SOUL.md": "Directory faye",
+    "faye/perception.ts": "export const perception = async () => { await new Promise((r) => setTimeout(r, 2300)); return { text: 'too late' }; };",
+  }, { timeaware: true });
 });
 
 test("Pi answers tool calls before and after, carrying category, path and result", async () => {
@@ -407,15 +413,15 @@ test("Pi answers tool calls before and after, carrying category, path and result
 test("Pi builtin and directory perceptions share a human moment and fail independently", async () => {
   const now = new Date(2026, 9, 27, 2, 14, 0).getTime();
   await withTime(now, async (h) => {
-    await h.fire("before_agent_start", { prompt: "hi", systemPromptOptions: { cwd: h.dir } });
-    await h.settle(() => h.sent.length === 2);
-    assert.equal(h.sent[0]!.content, wrapReminder("⌚ 02:14 · Tue, Oct 27"));
-    assert.deepEqual(h.sent[0]!.details, { moment: "human", timestamp: now });
-    assert.deepEqual(h.sent[1]!.details, { moment: "human" });
-    const said = JSON.parse(perceptionText(h.sent[1]!.content));
+    const note = await h.human("hi");
+    assert.ok(note?.display);
+    const [clock, directory] = perceptionText(note.content).split("\n");
+    assert.match(clock!, /^⌚ /);
+    assert.deepEqual(note.details, { moment: "human", timestamp: now });
+    const said = JSON.parse(directory!);
     assert.deepEqual(said.moment, { kind: "human", text: "hi" });
     assert.equal(said.base.now, now);
-    assert.ok(h.sent.every((message) => message.display === true));
+    assert.deepEqual(h.sent, []);
     const renderer = h.messageRenderers.get(PERCEPTION_MESSAGE_TYPE)!;
     const rendered = renderer(
       { customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder("⌚ 02:14 · Tue, Oct 27\n(1h since *human* was last present)") },
@@ -451,19 +457,12 @@ test("Pi builtin and directory perceptions share a human moment and fail indepen
 
     // A failed soul render suppresses the clock, while its independent module can still answer.
     h.write("faye/SOUL.md", "{{ missing }}");
-    h.sent.length = 0;
-    await h.fire("before_agent_start", { prompt: "again", systemPromptOptions: { cwd: h.dir } });
-    await h.settle(() => h.sent.length === 1);
-    assert.deepEqual(h.sent[0]!.details, { moment: "human" });
+    assert.deepEqual((await h.human("again"))?.details, { moment: "human" });
   }, { "faye/SOUL.md": "Faye", "faye/perception.ts": wakePerception }, { timeaware: true });
 
   await withTime(now, async (h) => {
-    await h.fire("before_agent_start", { prompt: "hi", systemPromptOptions: { cwd: h.dir } });
-    await h.settle(() => h.sent.length > 0);
-    assert.equal(h.sent[0]!.content, wrapReminder("⌚ 02:14 · Tue, Oct 27"));
-    // Await the same broken module through an event handler to finish the pending human perception.
-    await h.fire("session_compact");
-    assert.equal(h.sent.length, 1);
+    assert.match(perceptionText((await h.human("hi"))!.content), /^⌚ [^\n]+$/);
+    assert.deepEqual(h.sent, []);
   }, { "faye/SOUL.md": "Faye", "faye/perception.ts": "export const perception = () => { throw new Error('boom'); };" }, { timeaware: true });
 });
 
@@ -483,8 +482,7 @@ test("Pi stays quiet with no perception, soulless, a suppressed soul, or a broke
   }, withPerception);
 
   await withTime(1_700_000_000_000, async (h) => {
-    await h.fire("before_agent_start", { type: "before_agent_start", prompt: "hi", systemPromptOptions: { cwd: h.dir, customPrompt: "My own prompt" } });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(await h.human("hi", "My own prompt"), undefined);
     assert.equal(h.notices.length, 0);
   }, { "faye/SOUL.md": "Directory faye", "faye/perception.ts": wakePerception }, { defaultSoul: "faye" });
 

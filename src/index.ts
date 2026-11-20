@@ -8,7 +8,7 @@ import { ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserM
 import { timePerception } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, readTransition, sameTransition, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
-import { loadPerception, sendReminder, toolCategory, toolFilePath, toolText, worldFor, type Moment, type Perception } from "./perception.ts";
+import { humanPerceptionText, loadPerception, PERCEPTION_MESSAGE_TYPE, sendReminder, toolCategory, toolFilePath, toolText, worldFor, wrapReminder, type Moment, type Perception } from "./perception.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
@@ -63,39 +63,50 @@ export default function soulsExtension(pi: ExtensionAPI) {
     const last = lastUserMessageTimestamp(branch);
     return last === undefined ? undefined : Math.max(0, now - last);
   };
-  /** Builtin and directory perceptions answer independently; failures never break the host. */
-  const perceive = async (moment: Moment, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
+  const perceptionContext = (ctx: ExtensionContext, customPrompt: string | undefined) => {
+    const config = readConfig(pi.getSettings(), ctx.cwd);
+    const branch = ctx.sessionManager.getBranch();
+    const selection = effectiveSoul(resolveSoul(config, sessionSoul(branch), ctx.model, soulless()), customPrompt);
+    if (!selection) return;
+    const now = Date.now();
+    const world = worldFor({ now, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, soul: selection.name, absenceMs: absence(branch, now) });
+    return {
+      now,
+      clock: (moment: Moment) => {
+        readSoul(config.dir, selection.name, soulVariables(ctx));
+        return timePerception(lastTimeNoteTimestamp(branch))(moment, world);
+      },
+      directory: (moment: Moment) => {
+        const target = resolvePerception(config, selection);
+        return target ? perceptionFor(target.path)(moment, world) : undefined;
+      },
+      timeaware: config.timeaware,
+    };
+  };
+  const perceive = async (moment: Exclude<Moment, { kind: "human" }>, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
     try {
-      const config = readConfig(pi.getSettings(), ctx.cwd);
-      const branch = ctx.sessionManager.getBranch();
-      const selection = effectiveSoul(resolveSoul(config, sessionSoul(branch), ctx.model, soulless()), customPrompt);
-      if (!selection) return;
-      const now = Date.now();
-      const world = worldFor({ now, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, soul: selection.name, absenceMs: absence(branch, now) });
-      if (config.timeaware && moment.kind === "human") {
-        try {
-          readSoul(config.dir, selection.name, soulVariables(ctx));
-          const said = await timePerception(lastTimeNoteTimestamp(branch))(moment, world);
-          if (said && typeof said.text === "string" && said.text.trim()) {
-            sendReminder(pi, { text: said.text, details: { moment: moment.kind, timestamp: now } });
-          }
-        } catch {
-          // A missing or unreadable soul has no builtin time perception.
-        }
-      }
-      const target = resolvePerception(config, selection);
-      if (target) {
-        try {
-          const said = await perceptionFor(target.path)(moment, world);
-          if (said && typeof said.text === "string" && said.text.trim()) {
-            sendReminder(pi, { text: said.text, details: { moment: moment.kind } });
-          }
-        } catch {
-          // A directory perception is independent of the builtin time perception.
-        }
-      }
+      const said = await perceptionContext(ctx, customPrompt)?.directory(moment);
+      if (said) sendReminder(pi, { text: said.text, details: { moment: moment.kind } });
     } catch {
       // A perception is decoration: a broken configuration never breaks the host.
+    }
+  };
+  const humanReminder = async (text: string, ctx: ExtensionContext, customPrompt: string | undefined) => {
+    try {
+      const perception = perceptionContext(ctx, customPrompt);
+      if (!perception) return;
+      const moment = { kind: "human", text } as const;
+      const [clock, directory] = await Promise.all([
+        perception.timeaware ? humanPerceptionText(() => perception.clock(moment)) : undefined,
+        humanPerceptionText(() => perception.directory(moment)),
+      ]);
+      const content = [clock, directory].filter(Boolean).join("\n");
+      if (content) return {
+        customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(content), display: true,
+        details: { moment: "human", ...(clock ? { timestamp: perception.now } : {}) },
+      };
+    } catch {
+      // A broken configuration never prevents the prompt from starting.
     }
   };
   // Retain the original text so tool-loop requests and soul edits do not patch our own output.
@@ -150,13 +161,13 @@ export default function soulsExtension(pi: ExtensionAPI) {
     });
   });
   pi.on("session_tree", (_event, ctx) => refreshFooter(ctx, promptValue()));
-  pi.on("before_agent_start", (event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     options = event.systemPromptOptions; running = true; forcedProjection = undefined;
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
     if ("messageType" in event && event.messageType !== "user") return;
-    // The handler stays synchronous: a pending perception answer arrives when it arrives.
-    void perceive({ kind: "human", text: event.prompt }, ctx, options.customPrompt);
+    const message = await humanReminder(event.prompt, ctx, options.customPrompt);
+    if (message) return { message };
   });
   pi.on("agent_settled", () => {
     running = false; projection = undefined;
