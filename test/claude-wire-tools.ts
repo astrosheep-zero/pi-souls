@@ -3,17 +3,22 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { createWireHost } from "./claude-wire-host.ts";
+import { blocks, createWireHost, ownPluginNote, wireNoteLines, type WireMessage } from "./claude-wire-host.ts";
+import { unwrapReminder, wrapReminder } from "../src/utterance.ts";
 
 const roots: string[] = [];
 after(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
 
-type Block = { type?: string; tool_use_id?: string; text?: string; [key: string]: unknown };
-type ToolResultPosition = { index: number; id: string };
-
-function blocks(message: any): Block[] {
-  return Array.isArray(message?.content) ? message.content : [];
-}
+const humanNotes = ["HUMAN_PERCEPTION", "HUMAN_BARE_NOTE"];
+const toolNotes = ["PERCEPTION before Read", "PERCEPTION after Read"];
+const prohibitedNotes = ["IGNORED_HUMAN_ASSISTANT", "IGNORED_HUMAN_EPHEMERAL", "LATE_HUMAN_PERCEPTION"];
+const knownNotes = new Set([...humanNotes, ...toolNotes, ...prohibitedNotes]);
+const notesOnWire = (messages: WireMessage[]) => messages.flatMap((message) => wireNoteLines(message)
+  .filter((line) => knownNotes.has(line)).map((line) => [message.role, line]));
+const userNotes = (lines: string[]) => lines.map((line) => ["user", line]);
+const withoutCache = ({ cache_control: _cache, ...block }: ReturnType<typeof blocks>[number]) => block;
+const frames = (messages: WireMessage[]) => messages.flatMap((message) =>
+  blocks(message).map((block) => ({ role: message.role, block: withoutCache(block) })));
 
 function soulsDirFor(dir: string): string {
   return join(dir, "home", ".agents", "souls");
@@ -32,13 +37,18 @@ function soul(soulsDir: string): void {
   writeFileSync(join(soulsDir, "a", "perception.ts"), [
     "type Moment = { kind: string; text?: string; phase?: string; toolName?: string };",
     "export default async function perception(moment: Moment) {",
-    "  if (moment.kind === 'human' && moment.text === 'read both fixture files') return { kind: 'remind', text: 'HUMAN_PERCEPTION' };",
+    "  if (moment.kind === 'human' && moment.text === 'read both fixture files') return [",
+    "    { kind: 'reminder', text: 'HUMAN_PERCEPTION' },",
+    "    { kind: 'assistant', text: 'IGNORED_HUMAN_ASSISTANT' },",
+    "    { kind: 'user', text: 'HUMAN_BARE_NOTE' },",
+    "    { kind: 'user', text: 'IGNORED_HUMAN_EPHEMERAL', ephemeral: true },",
+    "  ];",
     "  if (moment.kind === 'human' && moment.text === 'after the tools') {",
     "    await new Promise((r) => setTimeout(r, 3500));",
-    "    return { kind: 'remind', text: 'LATE_HUMAN_PERCEPTION' };",
+    "    return [{ kind: 'reminder', text: 'LATE_HUMAN_PERCEPTION' }];",
     "  }",
-    "  if (moment.kind !== \"tool\") return undefined;",
-    "  return { kind: 'remind', text: `PERCEPTION ${moment.phase} ${moment.toolName}` };",
+    "  if (moment.kind !== \"tool\") return [];",
+    "  return [{ kind: 'reminder', text: `PERCEPTION ${moment.phase} ${moment.toolName}` }];",
     "}",
   ].join("\n"));
 }
@@ -66,7 +76,7 @@ test("parallel Read results stay contiguous before future-only soul reminders", 
     tools: ["Read"],
     args: ["--settings", settings],
     response: (body) => {
-      const seenResult = body.messages.some((message: any) => blocks(message).some((block) => block.type === "tool_result"));
+      const seenResult = frames(body.messages).some(({ role, block }) => role === "user" && block.type === "tool_result");
       if (seenResult) return { content: [{ type: "text", text: "both files read" }], stop_reason: "end_turn" };
       return {
         content: [
@@ -85,62 +95,52 @@ test("parallel Read results stay contiguous before future-only soul reminders", 
     const [first, second] = toolTurn.apiBodies;
     assert.ok(first && second);
 
-    assert.match(JSON.stringify(first.messages), /HUMAN_PERCEPTION/, "directory soul perceives the human before the first request");
-
-    // The first request cannot know what the tools will say; the tool continuation is
-    // already shaped without the reminders too.
-    assert.doesNotMatch(JSON.stringify(first.messages), /PERCEPTION /);
-    assert.doesNotMatch(JSON.stringify(second.messages), /PERCEPTION /);
-
-    // A later prompt is the first request that may carry them, with every prior
-    // message still byte-for-byte in place.
+    // Human notes are present in order, but tool, skipped and late notes are absent.
+    assert.deepEqual(notesOnWire(first.messages), userNotes(humanNotes));
+    assert.deepEqual(notesOnWire(second.messages), userNotes(humanNotes));
     const nextTurn = await host.send("after the tools");
     assert.equal(nextTurn.apiBodies.length, 1);
     const third = nextTurn.apiBodies[0]!;
-    assert.doesNotMatch(JSON.stringify(third.messages), /LATE_HUMAN_PERCEPTION/, "a slow human perception misses the submit deadline");
-    assert.match(JSON.stringify(third.messages), /PERCEPTION before Read/);
-    assert.match(JSON.stringify(third.messages), /PERCEPTION after Read/);
-    const semantic = (messages: any[]) => messages.map((message: any) => ({
-      role: message.role,
-      text: typeof message.content === "string"
-        ? message.content
-        : blocks(message).map((block) => typeof block.text === "string" ? block.text : JSON.stringify(block)).join("\n"),
+
+    // Native cache breakpoints may move; keep the message roles and typed blocks intact.
+    const traffic = (messages: WireMessage[]) => messages.map((message) => ({ role: message.role,
+      blocks: blocks(message).map(withoutCache),
     }));
-    assert.deepEqual(semantic(second.messages).slice(0, first.messages.length), semantic(first.messages));
-    // The last second-request message is the tool-result carrier: it may grow
-    // reminders after its kept blocks, but everything before it is unchanged.
-    assert.deepEqual(semantic(third.messages).slice(0, second.messages.length - 1), semantic(second.messages.slice(0, -1)));
-    const oldCarrier = blocks(second.messages.at(-1));
-    const newCarrier = blocks(third.messages[second.messages.length - 1]);
-    const oldResults = oldCarrier.filter((block) => block.type === "tool_result");
-    const newResults = newCarrier.filter((block) => block.type === "tool_result");
-    assert.deepEqual(newResults.map((block) => [block.tool_use_id, block.content]), oldResults.map((block) => [block.tool_use_id, block.content]));
-
-    const results: ToolResultPosition[] = third.messages.flatMap((message: any, index: number) =>
-      blocks(message).flatMap((block): ToolResultPosition[] => block.type === "tool_result"
-        ? [{ index, id: typeof block.tool_use_id === "string" ? block.tool_use_id : "" }]
-        : []));
-    assert.deepEqual(results.map((item) => item.id).sort(), ["toolu_one", "toolu_two"]);
-    const resultIndexes: number[] = [...new Set(results.map((item) => item.index))];
-    assert.equal(resultIndexes.at(-1)! - resultIndexes[0]!, resultIndexes.length - 1, "results form one contiguous message block");
-
-    const flat: Block[] = third.messages.flatMap((message: any): Block[] => blocks(message));
-    const resultPositions: number[] = flat.flatMap((block, index): number[] => block.type === "tool_result" ? [index] : []);
-    const reminderPositions: number[] = flat.flatMap((block, index): number[] => block.type === "text" && String(block.text).includes("PERCEPTION ") ? [index] : []);
-    assert.equal(resultPositions.length, 2);
-    assert.equal(resultPositions[1]! - resultPositions[0]!, 1, "both tool_result blocks stay adjacent");
-    assert.ok(reminderPositions[0]! > resultPositions[1]!, "reminders follow the kept result pair");
-    const newPrompt = third.messages.at(-1);
-    assert.equal(typeof newPrompt?.content === "string" ? newPrompt.content : blocks(newPrompt)[0]?.text, "after the tools");
+    assert.deepEqual(traffic(second.messages.slice(0, first.messages.length)), traffic(first.messages));
+    assert.deepEqual(traffic(third.messages.slice(0, second.messages.length - 1)), traffic(second.messages.slice(0, -1)));
+    const secondFrames = frames(second.messages);
+    const ids = ["toolu_one", "toolu_two"];
+    assert.deepEqual(secondFrames.filter(({ block }) => block.type === "tool_use").map(({ role, block }) => [role, block.id]),
+      ids.map((id) => ["assistant", id]));
+    const oldResults = secondFrames.filter(({ block }) => block.type === "tool_result");
+    assert.deepEqual(oldResults.map(({ role, block }) => [role, block.tool_use_id]).sort(), ids.map((id) => ["user", id]));
+    const flat = frames(third.messages);
+    const firstResult = flat.findIndex(({ block }) => block.type === "tool_result");
+    const newResults = flat.filter(({ block }) => block.type === "tool_result");
+    assert.deepEqual(newResults, oldResults);
+    assert.deepEqual(flat.slice(firstResult, firstResult + ids.length), newResults, "tool-result blocks stay adjacent and in order");
+    assert.equal(flat.filter(({ role, block }) => role === "user" && block.type === "text" && block.text === "after the tools").length, 1);
+    const earlierWire = flat.slice(0, firstResult + ids.length).map(({ role, block }) => ({ role, content: [block] }));
+    assert.deepEqual(notesOnWire(earlierWire), userNotes(humanNotes), "tool notes never precede or split results");
 
     const rows = await host.transcript();
     assert.ok(rows);
-    const resultRows = rows.flatMap((row, index) => row.type === "user" && blocks(row.message).some((block) => block.type === "tool_result") ? [index] : []);
-    assert.equal(resultRows.length, 2);
-    assert.equal(resultRows[1]! - resultRows[0]!, 1, "both kept tool-result rows are adjacent");
-    assert.ok(!rows.some((row) => row.type === "user" && row.isMeta && JSON.stringify(row.message).includes("HUMAN_PERCEPTION")), "no late human perception meta user row");
-    const firstReminder = rows.findIndex((row) => JSON.stringify(row).includes("PERCEPTION "));
-    assert.ok(firstReminder > resultRows[1]!, "no reminder splits or precedes the tool-result pair");
+    const resultRows = rows.flatMap((row, index) => row.type === "user" && row.message?.role === "user"
+      ? blocks(row.message).filter((block) => block.type === "tool_result").map((block) => ({ index, id: block.tool_use_id })) : []);
+    assert.deepEqual(resultRows.map(({ id }) => id), newResults.map(({ block }) => block.tool_use_id));
+    assert.equal(resultRows[1]!.index - resultRows[0]!.index, 1, "both transcript result rows stay adjacent");
+    const delivered = rows.flatMap((row) => ownPluginNote(row)?.delivered ?? []);
+    assert.deepEqual(delivered.filter((text) => humanNotes.includes(unwrapReminder(text))), ["<system-reminder>\nHUMAN_PERCEPTION\n</system-reminder>", "HUMAN_BARE_NOTE"]);
+    const deliveredTools = delivered.filter((text) => toolNotes.includes(unwrapReminder(text)));
+    assert.deepEqual([...deliveredTools].sort(), toolNotes.flatMap((text) => [wrapReminder(text), wrapReminder(text)]).sort());
+    assert.deepEqual(notesOnWire(third.messages), userNotes([...humanNotes, ...deliveredTools.map(unwrapReminder)]));
+    for (const [index, row] of rows.entries()) {
+      const note = ownPluginNote(row);
+      const payloads = [...(note?.held ?? []), ...(note?.delivered ?? [])].map(unwrapReminder);
+      const uttered = (row.type === "user" || row.type === "assistant") && row.message?.role === row.type ? wireNoteLines(row.message) : [];
+      assert.deepEqual([...payloads, ...uttered].filter((text) => prohibitedNotes.includes(text)), []);
+      if (payloads.some((text) => toolNotes.includes(text))) assert.ok(index > resultRows[1]!.index, "no tool note precedes or splits kept results");
+    }
   } finally {
     await host.stop();
   }

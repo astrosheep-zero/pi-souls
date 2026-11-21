@@ -13,8 +13,30 @@ import { join } from "node:path";
 export type WireEvent = { type: string; [key: string]: any };
 export type WireRequest = { url: string; headers: IncomingHttpHeaders; body: any; at: number };
 
-/** One Anthropic content block in a mock reply. */
+/** One Anthropic content block on the wire. */
 export type WireContentBlock = { type: string; [key: string]: any };
+export type WireMessage = { role: string; content: string | WireContentBlock[] };
+
+export function blocks(message: WireMessage | undefined): WireContentBlock[] {
+  const content = message?.content;
+  return typeof content === "string" ? [{ type: "text", text: content }] : Array.isArray(content) ? content : [];
+}
+
+/** Note payloads in these fixtures are single lines. Claude may add unattributed or attributed framing. */
+export function wireNoteLines(message: WireMessage): string[] {
+  return blocks(message).flatMap((block) => block.type === "text" && typeof block.text === "string" ? block.text.split("\n") : []);
+}
+
+export function ownPluginNote(row: WireEvent): { delivered: string[]; held: string[] } | undefined {
+  const strings = (value: unknown) => Array.isArray(value) ? value.filter((part): part is string => typeof part === "string") : [];
+  if (row.type === "attachment" && row.attachment?.type === "plugin_note" && row.attachment.plugin === "pi-souls") {
+    return { delivered: strings(row.attachment.content), held: strings(row.attachment.heldContent) };
+  }
+  if (row.type === "user" && row.isMeta === true && row.message?.role === "user"
+    && row.origin?.kind === "plugin" && row.origin.name === "pi-souls") {
+    return { delivered: blocks(row.message).filter((block) => block.type === "text").flatMap((block) => typeof block.text === "string" ? [block.text] : []), held: [] };
+  }
+}
 export type WireMockResponse = {
   content: WireContentBlock[];
   stop_reason?: string;

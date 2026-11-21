@@ -2,8 +2,9 @@ import type { On, PluginOptions, PromptComposeSection, SessionMessage, Timer } f
 import { isSoulName, matchingModelKey } from "../../../src/soul-selection.ts";
 import { encodeChoice, type ClaudeSession, type SoulChoice } from "../../../src/claude-session.ts";
 import { timePerception } from "../../../src/time.ts";
+import { wrapReminder } from "../../../src/utterance.ts";
 import { files, load, type Engine } from "./files.ts";
-import { perceptionUtterance, toolMoment, worldFor, type Moment } from "./perception.ts";
+import { perceptionUtterances, toolMoment, worldFor, type Moment, type Utterance } from "./perception.ts";
 import { createPerceptionRuntime, invalidateRuntime, reloadRuntime, stopRuntime, type PerceptionRuntime } from "./perception-runtime.ts";
 
 const DEFAULTS: SoulChoice = { mode: "defaults" };
@@ -119,9 +120,12 @@ async function append($: Engine, s: State, type: "user" | "system", text: string
   s.head = result.uuid; s.journalHead = undefined;
   return true;
 }
-function wrapReminder(text: string): string { return `<system-reminder>\n${text}\n</system-reminder>`; }
 function reminder($: Engine, s: State, text: string): Promise<boolean> {
   return append($, s, "user", wrapReminder(text));
+}
+function noteText(item: Utterance): string | undefined {
+  if (item.ephemeral || item.kind === "assistant") return;
+  return item.kind === "reminder" ? wrapReminder(item.text) : item.text;
 }
 function invalidate($: Engine): void { $.ui.invalidate("prompt.section"); }
 function status($: Engine, s: State): void { $.ui.status(s.applied?.soul ? s.applied.icon ?? s.applied.soul : undefined); }
@@ -148,30 +152,34 @@ async function perceiveActive($: Engine, s: State, options: PluginOptions, momen
   try {
     const world = await worldFor($, name, s.journal.lastHumanAt);
     if (generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
-    const said = await perceptionUtterance($, options, s.runtime, generation, name, moment, world, signal);
-    if (said?.kind !== "remind" || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
-    // Tool context waits until the whole batch's results are kept; never split tool pairs.
-    if (moment.kind === "tool") s.toolNotes.push({ text: said.text, generation });
-    else await reminder($, s, said.text);
+    const batch = await perceptionUtterances($, options, s.runtime, generation, name, moment, world, signal);
+    for (const item of batch) {
+      if (generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) break;
+      const text = noteText(item);
+      if (text === undefined) continue;
+      // Tool context waits until the whole batch's results are kept; never split tool pairs.
+      if (moment.kind === "tool") s.toolNotes.push({ text, generation });
+      else await append($, s, "user", text);
+    }
   } catch {
     // Discovery, world facts and executable perceptions fail independently of the host.
   }
 }
 
-async function boundedText($: Engine, pending: Promise<string | undefined>): Promise<string | undefined> {
+async function boundedBatch($: Engine, pending: Promise<readonly Utterance[]>): Promise<readonly Utterance[]> {
   let timer: Timer | undefined;
   try {
-    return (await Promise.race([
+    return await Promise.race([
       pending,
-      new Promise<undefined>((resolve) => { timer = $.clock.after(2000, () => resolve(undefined)); }),
-    ]))?.trim();
+      new Promise<readonly Utterance[]>((resolve) => { timer = $.clock.after(2000, () => resolve([])); }),
+    ]);
   } catch {
-    return undefined;
+    return [];
   } finally {
     timer?.cancel();
   }
 }
-async function humanReminders($: Engine, s: State, options: PluginOptions, text: string, signal?: AbortSignal): Promise<string[]> {
+async function perceiveHuman($: Engine, s: State, options: PluginOptions, text: string, signal?: AbortSignal): Promise<string[]> {
   const model = await $.session.model().catch(() => undefined);
   const { sections } = await preview($, model);
   const proposal = matchingProposal(s, sections.flatMap((section) => section.text === "" ? [] : [section.text]));
@@ -181,14 +189,17 @@ async function humanReminders($: Engine, s: State, options: PluginOptions, text:
   const moment = { kind: "human", text } as const;
   const world = worldFor($, soul, s.journal.lastHumanAt);
   const clock = timePerception(s.journal.noteAt);
-  const texts = await Promise.all([
-    options.timeaware !== false ? boundedText($, world.then(async (facts) => (await clock(moment, facts))?.text)) : undefined,
-    // Claude does not support ephemeral delivery.
-    boundedText($, perceptionUtterance($, options, s.runtime, generation, soul, moment, world, signal)
-      .then((said) => said?.kind === "remind" ? said.text : undefined)),
+  const [time, batch] = await Promise.all([
+    options.timeaware !== false ? boundedBatch($, world.then((facts) => clock(moment, facts))) : [],
+    boundedBatch($, perceptionUtterances($, options, s.runtime, generation, soul, moment, world, signal)),
   ]);
-  if (generation !== s.runtime.generation || s.proposals.get(proposal.section)?.soul !== soul || signal?.aborted) return [];
-  return texts.flatMap((text) => text ? [wrapReminder(text)] : []);
+  const active = () => generation === s.runtime.generation && s.proposals.get(proposal.section)?.soul === soul && !signal?.aborted;
+  for (const item of batch) {
+    if (!active()) break;
+    const text = noteText(item);
+    if (text !== undefined) await append($, s, "user", text);
+  }
+  return active() ? time.map((item) => wrapReminder(item.text)) : [];
 }
 
 export function retainedMessages(before: readonly SessionMessage[], after: readonly SessionMessage[], handles: readonly string[]): readonly SessionMessage[] {
@@ -382,7 +393,7 @@ export function register(on: On, options: PluginOptions = {}) {
     s.pendingChoice = undefined;
     try { await hydrate($, s, options); } catch (error) { warn($, s, error); }
     let extra: string[] = [];
-    try { extra = await humanReminders($, s, options, e.text, next.signal); } catch { /* Decoration cannot refuse a prompt. */ }
+    try { extra = await perceiveHuman($, s, options, e.text, next.signal); } catch { /* Decoration cannot refuse a prompt. */ }
     return next(extra.length ? { ...e, context: [...(e.context ?? []), ...extra] } : e);
   });
   on("classic.PostModelSwitch", async ($, e, next) => {
@@ -403,7 +414,7 @@ export function register(on: On, options: PluginOptions = {}) {
         warn($, s, `Claude is still using @${actual.soul}; turning off souls did not take effect. Start a new session, or use /soul reset if its default is a different soul.`);
       }
       for (const note of s.toolNotes.splice(0)) {
-        if (note.generation === s.runtime.generation && !next.signal?.aborted) await reminder($, s, note.text);
+        if (note.generation === s.runtime.generation && !next.signal?.aborted) await append($, s, "user", note.text);
       }
       if (s.pendingBrain && s.journal.model !== s.pendingBrain) {
         if (await reminder($, s, `new brain: ${s.pendingBrain}`)) s.pendingBrain = undefined;

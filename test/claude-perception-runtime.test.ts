@@ -77,7 +77,7 @@ enum Count { Start = 10 }
 namespace Label { export const text = ${JSON.stringify(label)}; }
 class State { constructor(public n: number) {} }
 let calls = 0;
-export function perception() { return {kind: 'remind', text: Label.text + ':' + new State(Count.Start).n + ':' + (++calls) + ':' + suffix}; }
+export function perception() { return [{kind: 'reminder', text: Label.text + ':' + new State(Count.Start).n + ':' + (++calls) + ':' + suffix}]; }
 `;
   for (const folder of [dir, piDir]) {
     writeFileSync(join(folder, "perception.ts"), source("first"));
@@ -91,7 +91,7 @@ export function perception() { return {kind: 'remind', text: Label.text + ':' + 
     assert.equal(statSync(runtime.socketPath).mode & 0o777, 0o600);
     const call = (sessionId = world.sessionId) => runtime.call("perceive", { path, moment, world: { ...world, sessionId } });
     assert.deepEqual(await call(), await pi(moment as any, world as any));
-    assert.deepEqual(await call(), { kind: "remind", text: "first:10:2:dependency-one" });
+    assert.deepEqual(await call(), [{ kind: "reminder", text: "first:10:2:dependency-one" }]);
     await pi(moment as any, world as any);
     assert.deepEqual(await call("session-b"), await piB(moment as any, world as any));
     for (const folder of [dir, piDir]) {
@@ -104,8 +104,8 @@ export function perception() { return {kind: 'remind', text: Label.text + ':' + 
     assert.deepEqual(await call("session-b"), await piB(moment as any, world as any));
 
     const alternate = join(dir, "perception.mjs");
-    writeFileSync(alternate, "export default () => ({ kind: 'ephemeral', text: 'alternate' });");
-    assert.deepEqual(await runtime.call("perceive", { path: alternate, moment, world }), { kind: "ephemeral", text: "alternate" });
+    writeFileSync(alternate, "export default () => [{ kind: 'assistant', ephemeral: true, text: 'alternate' }];");
+    assert.deepEqual(await runtime.call("perceive", { path: alternate, moment, world }), [{ kind: "assistant", ephemeral: true, text: "alternate" }]);
     assert.deepEqual(await call(), await loadPerception(piPath)(moment as any, world as any));
   } finally { await runtime.stop(); }
 });
@@ -120,19 +120,19 @@ test("standalone runtime keeps native JS/CJS, normal silence and independent sou
       writeFileSync(path, source);
       return path;
     };
-    const a = write("commonjs-a", "let count=0; module.exports = () => ({kind:'remind',text:'a:'+ ++count});");
-    const b = write("commonjs-b", "module.exports = {perception: () => ({kind:'remind',text:'b'})};");
+    const a = write("commonjs-a", "let count=0; module.exports = () => [{kind:'reminder',text:'a:'+ ++count}];");
+    const b = write("commonjs-b", "module.exports = {perception: () => [{kind:'user',text:'b'}]};");
     const broken = write("broken", "throw new Error('broken import');");
     const throws = write("throws", "exports.perception = () => { throw new Error('broken call'); };");
-    const invalid = write("invalid", "exports.perception = () => ({kind:'remind',text:' '});");
+    const invalid = write("invalid", "exports.perception = () => [{kind:'user',text:'must not appear'}, {kind:'reminder',text:' '}];");
     const call = (path: string) => runtime.call("perceive", { path, moment, world });
-    assert.deepEqual(await call(a), { kind: "remind", text: "a:1" });
-    assert.deepEqual(await call(b), { kind: "remind", text: "b" });
-    assert.deepEqual(await call(a), { kind: "remind", text: "a:2" });
-    assert.deepEqual(await call(broken), {});
-    assert.deepEqual(await call(throws), {});
-    assert.deepEqual(await call(invalid), {});
-    assert.deepEqual(await call(a), { kind: "remind", text: "a:3" });
+    assert.deepEqual(await call(a), [{ kind: "reminder", text: "a:1" }]);
+    assert.deepEqual(await call(b), [{ kind: "user", text: "b" }]);
+    assert.deepEqual(await call(a), [{ kind: "reminder", text: "a:2" }]);
+    assert.deepEqual(await call(broken), []);
+    assert.deepEqual(await call(throws), []);
+    assert.deepEqual(await call(invalid), []);
+    assert.deepEqual(await call(a), [{ kind: "reminder", text: "a:3" }]);
   } finally { await runtime.stop(); }
 });
 
@@ -222,20 +222,20 @@ test("retained bridge drops late switch/reload answers while preserving the chil
   const path = join(dir, "perception.mjs");
   writeFileSync(path, `import {writeFileSync} from 'node:fs'; let count=0; export async function perception(moment) {
     const n=++count; if(moment.text==='late') { writeFileSync(${JSON.stringify(marker)},''); await new Promise(r=>setTimeout(r,100)); }
-    return {kind:'remind',text:'call:'+n}; }`);
+    return [{kind:'reminder',text:'call:'+n}]; }`);
   const call = (text = "normal") => runPerception(h.$, runtime, { path, world, moment: { kind: "human", text } });
   try {
     const switched = call("late");
     await waitFor(marker);
     invalidateRuntime(runtime);
     assert.equal(await switched, undefined);
-    assert.deepEqual(await call(), { kind: "remind", text: "call:2" });
+    assert.deepEqual(await call(), [{ kind: "reminder", text: "call:2" }]);
     rmSync(marker);
     const reloaded = call("late");
     await waitFor(marker);
     await reloadRuntime(h.$, runtime, world.sessionId, dir);
     assert.equal(await reloaded, undefined);
-    assert.deepEqual(await call(), { kind: "remind", text: "call:1" });
+    assert.deepEqual(await call(), [{ kind: "reminder", text: "call:1" }]);
     assert.equal(h.children.length, 1);
     rmSync(marker);
     const ended = call("late");
@@ -254,7 +254,7 @@ test("bridge abort and request timeout stop children, unlink sockets and allow a
   const path = join(dir, "perception.mjs");
   const marker = join(dir, "entered");
   writeFileSync(path, `import {writeFileSync} from 'node:fs'; export async function perception(moment) {
-    if(moment.text==='hang') { writeFileSync(${JSON.stringify(marker)},''); await new Promise(()=>{}); } return {kind:'remind',text:'recovered'}; }`);
+    if(moment.text==='hang') { writeFileSync(${JSON.stringify(marker)},''); await new Promise(()=>{}); } return [{kind:'reminder',text:'recovered'}]; }`);
   const task = (text: string) => ({ path, world, moment: { kind: "human", text } });
   try {
     const controller = new AbortController();
@@ -263,10 +263,10 @@ test("bridge abort and request timeout stop children, unlink sockets and allow a
     controller.abort();
     assert.equal(await aborted, undefined);
     for (const socket of h.sockets) assert.equal(existsSync(dirname(socket)), false);
-    assert.deepEqual(await runPerception(h.$, runtime, task("normal")), { kind: "remind", text: "recovered" });
+    assert.deepEqual(await runPerception(h.$, runtime, task("normal")), [{ kind: "reminder", text: "recovered" }]);
     assert.equal(await runPerception(h.$, runtime, task("hang")), undefined);
     for (const socket of h.sockets) assert.equal(existsSync(dirname(socket)), false);
-    assert.deepEqual(await runPerception(h.$, runtime, task("normal")), { kind: "remind", text: "recovered" });
+    assert.deepEqual(await runPerception(h.$, runtime, task("normal")), [{ kind: "reminder", text: "recovered" }]);
     assert.equal(h.children.length, 3);
   } finally { await stopRuntime(h.$, runtime); }
   for (const child of h.children) assert.ok(child.exitCode !== null || child.signalCode !== null);

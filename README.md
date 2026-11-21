@@ -85,9 +85,14 @@ A directory soul may answer lifecycle moments with code. `<soulsDir>/<name>/perc
 
 ```ts
 export function perception(moment, world) {
-  if (moment.kind === "human") return { kind: "ephemeral", text: "……" };
-  if (moment.kind === "tool" && moment.phase === "after") return { kind: "remind", text: `${moment.toolName} ${moment.ok ? "ok" : "failed"}` };
-  return undefined; // silence is always allowed
+  if (moment.kind === "human") return [
+    { kind: "assistant", text: "I checked the notes.", ephemeral: true },
+    { kind: "user", text: "What did you find?", ephemeral: true },
+  ];
+  if (moment.kind === "tool" && moment.phase === "after") return [
+    { kind: "reminder", text: `${moment.toolName} ${moment.ok ? "ok" : "failed"}` },
+  ];
+  return [];
 }
 ```
 
@@ -95,16 +100,21 @@ Moments: `wake` (`source`: `startup`, `resume`, `fork`, `clear`, `compact`), `hu
 
 `world` is `{ now, sessionId, cwd, absenceMs?, storeDir, facts }`. `facts` carries `hour`, `morning`, `afternoon`, `evening`, `night`, `weekday` (0 is Sunday) and `weekend`. `absenceMs` is the time since the human's previous message when that is known; `storeDir` defaults to `~/.local/share/pi-souls/<name>`.
 
-An answer must contain `kind` and nonempty `text`; the old `{ text }` shape is ignored.
+Return an array (or a promise of one), and return `[]` for silence. Every item needs a supported `kind` and nonblank `text`. `reminder` wraps the text in `<system-reminder>`; `user` sends plain user text; `assistant` sends a synthetic text-only reply. An invalid item, including one with a `raw` field, rejects the entire array. Single objects and `undefined` are not valid returns.
 
-- `remind` keeps the existing persistent reminder behavior. Both hosts include human reminders in the first model request without altering the user's text. Pi combines the clock and any directory reminder in one visible `<system-reminder>...</system-reminder>` message; Claude attaches human reminders as prompt context.
-- `ephemeral` works on `wake`, `human`, and `tool` moments in Pi. Pi wraps the answer in `<system-reminder>...</system-reminder>` and injects it only into model requests, never into the session transcript. The default anchor is the user message that started the run for `human`, or the latest context-visible message at the moment for `wake` and `tool` (the summary for a compaction wake). Insertion follows the anchor and any consecutive tool results, keeping tool batches together.
-  - `sink` (non-negative integer, default `0`) steps back that many context-visible messages from the default anchor when it is first bound. If there is no anchor or the step goes past the first visible message, the reminder goes at the head of context.
-  - `linger` (positive integer, default `1`) counts runs, not requests. The reminder stays at its original anchor through tool loops and later runs, and expires when the last counted run settles. A wake outside a run starts counting with the next run. A new session, a soul mismatch, or a missing or ambiguous anchor can drop it sooner.
+On **Pi**, all three kinds work at every moment:
 
-Invalid `linger` or `sink` values reject the entire ephemeral answer; `remind` ignores both fields. These controls apply to new requests through Pi's `context` hook; idle cache refresh still replays the original request unchanged. Claude ignores `ephemeral`.
+- Omit `ephemeral` or set it to `false` to persist. Pi stores a human batch in one custom message after the native prompt, so a failed prompt preparation cannot deliver it on a later turn. Wake and tool items use individual custom messages; tool items wait until the tool batch is kept. Pi maps each item to its requested role for model requests, but its default compaction reads the stored custom messages as user content.
+- Set `ephemeral: true` to inject only into model requests. On `human` the default anchor is the user message that starts the run; on `wake` and `tool` it is the latest context-visible message at that moment. An insertion inside a tool batch goes after that batch’s results, or is skipped if the batch is incomplete. Items sharing an insertion point keep array order.
+  - `sink` (non-negative integer, default `0`) steps back that many context-visible messages. Stepping past the start, or having no anchor, puts the item at the head of context.
+  - `linger` (positive integer, default `1`) counts settled runs, not requests. The item keeps its anchor across tool steps and subsequent runs until it expires. Session changes, soul mismatch, or a missing or ambiguous anchor can drop it sooner.
+  - `sink` and `linger` are invalid without `ephemeral: true`. Changes apply to new requests; idle cache refresh still replays the previous request unchanged.
 
-`timeaware` (⌚️) is a builtin `remind` on `human` moments, for file and directory souls alike. Each human perception has two seconds to answer: a failed, empty, or late answer is omitted without holding up submission any further or being sent later. Both hosts retain the loaded entry; `/soul reload` drops the active cached entry so the next moment imports the file again.
+Pi forwards a trailing `assistant` without adding a user message or delaying it. Some providers reject an assistant tail or treat it as prefill. If you need a user tail, return your own `[assistant, user]` pair, as above. Editing or expiring historical context can also affect later provider-managed reasoning and caching.
+
+On **Claude**, persistent `reminder` and `user` become ordered plugin notes, not human-authored turns. The plugin supplies `user` text without its own wrapper, but Claude may still add a `<system-reminder>` attribution on the wire (observed on 2.1.329). Legal ephemeral items and persistent `assistant` items are skipped without affecting their supported siblings. A malformed item still invalidates the whole batch.
+
+`timeaware` (⌚️) is a builtin persistent `reminder` for due human moments, for file and directory souls alike. Each human perception has two seconds to answer; failed or late answers aren't delivered. Both hosts retain the loaded entry; `/soul reload` drops the active cached entry so the next moment imports it again.
 
 Pi imports the entry module in-process. Claude uses a persistent, isolated Node child reached over a private Unix socket; content loading remains a separate short-lived helper. Both use the shared `loadPerception` implementation, including Jiti's full TypeScript support and the loader's normal dependency caching. The installed Claude runtime bundles official `jiti/static`; no local dependencies or erase-only TypeScript restriction are needed. Node 22.18 or later must be on the mod's `PATH`.
 
@@ -175,7 +185,7 @@ With default snapshots on, new sessions can switch souls or reload edits on the 
 
 Choices are concise human-only system notices (`Soul choice: @name`, `disabled`, or `defaults`). Effective identity changes get `── soul: name ──` or `── soulless ──`; no-op commands do not add receipts or dividers. These records never enter model context. Selection and clock/transition baselines are reconstructed from native branch ancestry, including rewind and compaction, rather than a global “latest session” setting. Compaction retains only the original native message carriers needed for these records, plus paired tool calls/results; it does not recreate old reminders or timestamps. Before a resumed branch has an authoritative head, status withholds active claims.
 
-Time awareness (`timeaware`) is on by default. The clock first appears when a soul is active, then at most once an hour; the parenthetical requires an hour between human prompts. Human perceptions use the soul proposed by the prompt preview and are attached before the first request. Wake and tool perceptions still use the proven identity and append for future requests. Tool perceptions queue until the whole tool batch is kept, preserving contiguous tool results. Delivered clock and identity reminders supply continuity after resume/fork; `absenceMs` uses native human-message timestamps on the current branch.
+Time awareness (`timeaware`) is on by default. The clock first appears when a soul is active, then at most once an hour; the parenthetical requires an hour between human prompts. Human perceptions use the soul proposed by the prompt preview and append supported notes before submitting the prompt; the clock is attached as prompt context. Wake and tool perceptions use the proven identity and append for future requests. Tool perceptions queue until the whole tool batch is kept, preserving contiguous tool results. Delivered clock and identity reminders supply continuity after resume/fork; `absenceMs` uses native human-message timestamps on the current branch.
 
 Limitations:
 - Claude's separate official CLI/Agent SDK identity remains; this mod replaces only the movable opening paragraph.

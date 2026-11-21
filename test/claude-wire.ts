@@ -3,8 +3,9 @@ import { test } from "node:test";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createWireHost, type WireHost, type WireTurn } from "./claude-wire-host.ts";
+import { createWireHost, ownPluginNote, wireNoteLines, type WireHost, type WireMessage, type WireTurn } from "./claude-wire-host.ts";
 import { readClaudeSession } from "../src/claude-session.ts";
+import { unwrapReminder, wrapReminder } from "../src/utterance.ts";
 
 const A = "WIRE_SOUL_A", B = "WIRE_SOUL_B", EDIT = "WIRE_SOUL_B_EDIT";
 const souls = { a: A, b: B };
@@ -61,9 +62,9 @@ test("adjacent pronouns slot restores the exact native wire system on clear", { 
     host = await createWireHost({ ...options, dir: join(dir, "souls"), souls, args: settings({ timeaware: false }) });
     const active = wire(await human(host, "first request", A));
     const opening = "You are an agent working with the user toward their goals, using your own judgment along the way.";
-    assert.equal(JSON.stringify(active), JSON.stringify(nativeFirst.map((block: any) => ({ ...block, text: block.text.replace(opening, A) }))));
+    assert.deepEqual(active, nativeFirst.map((block: any) => ({ ...block, text: block.text.replace(opening, A) })));
     await command(host, "/soul clear");
-    assert.equal(JSON.stringify(wire(await human(host, "second request", null))), JSON.stringify(nativeSecond));
+    assert.deepEqual(wire(await human(host, "second request", null)), nativeSecond);
   } finally { await host.stop(); }
 });
 
@@ -76,10 +77,10 @@ test("native commands change the next wire prompt, reload fresh content, and nev
     assert.equal(clearWarnings(host).length, 0, "normal clear and status do not warn from old snapshots");
     await command(host, "/soul @a");
     const first = await human(host, "select A", A);
-    const prefix = JSON.stringify(first.apiBodies[0]);
-    assert.ok(!JSON.stringify(first.apiBodies[0].messages).includes("new soul: a"), "turn.step notes are future-only");
+    const firstBody = structuredClone(first.apiBodies[0]);
+    assert.ok(!(firstBody.messages as WireMessage[]).some((message) => wireNoteLines(message).includes("new soul: a")), "turn.step notes are future-only");
     await human(host, "observe delivered cue", A);
-    assert.equal(JSON.stringify(first.apiBodies[0]), prefix, "sent requests are never rewritten");
+    assert.deepEqual(first.apiBodies[0], firstBody, "sent requests are never rewritten");
     let before = await session(host);
     await command(host, "/soul @a");
     await human(host, "no-op", A);
@@ -185,7 +186,8 @@ test("explicit custom and legacy snapshots suppress unproven identity; compact m
     // Detached preview may still propose a soul. That permits submit context,
     // not a proven identity or a late meta reminder.
     const { rows } = await session(host);
-    assert.equal(rows.filter((r) => r.isMeta && /new soul:|⌚/.test(text(r))).length, 0);
+    const delivered = rows.flatMap((row) => ownPluginNote(row)?.delivered ?? []).map(unwrapReminder);
+    assert.ok(!delivered.some((part) => part.startsWith("new soul: ") || part.startsWith("⌚ ")));
   } finally { await host.stop(); }
 
   const dir = mkdtempSync(join(tmpdir(), "pi-souls-legacy-")), legacy = join(dir, "legacy-plugin");
@@ -266,17 +268,23 @@ test("explicit session choice beats SOULLESS; resolved model switches drive mapp
     let switched = await host.control({ subtype: "set_model", model: "claude-sonnet-5-5" });
     // A result event may precede the host's idle transition. Retry only its
     // explicit turn-running refusal; never treat a refused switch as success.
-    for (let retry = 0; switched.response.subtype === "error" && /turn.running|running turn|while.*running|in progress/i.test(JSON.stringify(switched.response)) && retry < 5; retry++) {
+    for (let retry = 0; switched.response.subtype === "error" && typeof switched.response.error === "string"
+      && /turn.running|running turn|while.*running|in progress/i.test(switched.response.error) && retry < 5; retry++) {
       await wait();
       switched = await host.control({ subtype: "set_model", model: "claude-sonnet-5-5" });
     }
-    assert.equal(switched.response.subtype, "success", JSON.stringify(switched.response));
+    assert.equal(switched.response.subtype, "success", switched.response.error);
     await human(host, "mapped resolved model", B);
-    await human(host, "brain cue arrives later", B);
-    await human(host, "backend alias cannot retrigger it", B);
+    const cue = "new brain: claude-sonnet-5-5";
+    const isBrain = (part: string) => part.startsWith("new brain: ");
+    for (const input of ["brain cue arrives later", "backend alias cannot retrigger it"]) {
+      const turn = await human(host, input, B);
+      const messages: WireMessage[] = turn.apiBodies.at(-1)!.messages;
+      const visible = messages.flatMap((message) => wireNoteLines(message).filter(isBrain).map((line) => [message.role, line]));
+      assert.deepEqual(visible, [["user", cue]]);
+    }
     const { rows } = await session(host);
-    const brains = rows.filter((r) => r.isMeta && text(r).includes("new brain:"));
-    assert.equal(brains.length, 1);
-    assert.ok(text(brains[0]).includes("new brain: claude-sonnet-5-5"));
+    const brains = rows.flatMap((row) => ownPluginNote(row)?.delivered ?? []).filter((part) => isBrain(unwrapReminder(part)));
+    assert.deepEqual(brains, [wrapReminder(cue)]);
   } finally { await host.stop(); }
 });

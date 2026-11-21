@@ -4,7 +4,8 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { build } from "esbuild";
-import { createWireHost } from "./claude-wire-host.ts";
+import { createWireHost, ownPluginNote, wireNoteLines, type WireMessage } from "./claude-wire-host.ts";
+import { unwrapReminder } from "../src/utterance.ts";
 
 // Actual Claude parser + process.spawn/http APIs, with loopback model responses.
 // In particular, a CPU-bound module must not survive the bounded request timeout.
@@ -25,7 +26,7 @@ writeFileSync(path, `import {writeFileSync} from 'node:fs'; let count=0;
 export function perception(moment) {
   writeFileSync(${JSON.stringify(pidFile)},JSON.stringify({pid:process.pid}));
   if(moment.text==='cpu timeout') while(true){}
-  return {kind:'remind',text:'counter:'+ ++count};
+  return [{kind:'reminder',text:'counter:'+ ++count}];
 }`);
 const source = `
 import {createPerceptionRuntime,runPerception,stopRuntime} from './plugins/claude/hooks/perception-runtime.ts';
@@ -62,7 +63,7 @@ try {
   await host.send("normal");
   await host.send("normal again");
   records = JSON.parse(readFileSync(receipt, "utf8"));
-  assert.deepEqual(records.slice(1).map((record) => record.said), [{ kind: "remind", text: "counter:1" }, { kind: "remind", text: "counter:2" }]);
+  assert.deepEqual(records.slice(1).map((record) => record.said), [[{ kind: "reminder", text: "counter:1" }], [{ kind: "reminder", text: "counter:2" }]]);
   assert.notEqual(records[0]!.pid, records[1]!.pid);
   assert.equal(records[1]!.pid, records[2]!.pid);
   await host.stop();
@@ -103,8 +104,8 @@ const writePerception = (name: string, label: string) => {
     export function perception(moment) { counter.n += Unit.One;
       const row={label:Label.text,n:counter.n,pid:process.pid,kind:moment.kind};
       appendFileSync(${JSON.stringify(trace)},JSON.stringify(row)+'\\n');
-      if (moment.kind === 'human' && moment.text === 'ignore this ephemeral') return {kind:'ephemeral',text:'IGNORED_EPHEMERAL'};
-      return {kind:'remind',text:'RUNTIME_CALL:'+Label.text+':'+counter.n}; }`);
+      if (moment.kind === 'human' && moment.text === 'ignore this ephemeral') return [{kind:'reminder',ephemeral:true,text:'IGNORED_EPHEMERAL'}];
+      return [{kind:'reminder',text:'RUNTIME_CALL:'+Label.text+':'+counter.n}]; }`);
 };
 const rows = (): { label: string; n: number; pid: number; kind: string }[] =>
   existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
@@ -115,16 +116,25 @@ try {
   assert.ok(a.length >= 2, `Shipped adapter actually executes perceptions: ${live.stderr()}`);
   assert.deepEqual(a.map((row) => row.n), a.map((_, index) => index + 1));
   assert.equal(new Set(a.map((row) => row.pid)).size, 1);
-  const visible = JSON.stringify(live.apiBodies.map((body) => body.messages));
-  assert.ok(visible.includes("RUNTIME_CALL:A:"), "perception enters a future actual request");
+  const expected = new Set(a.map(({ label, n }) => `RUNTIME_CALL:${label}:${n}`));
+  assert.ok(live.apiBodies.slice(1).some((body) => (body.messages as WireMessage[]).some((message) =>
+    message.role === "user" && wireNoteLines(message).some((line) => expected.has(line)))), "perception enters a future actual request");
   const ephemeralTurn = await live.send("ignore this ephemeral");
   assert.equal(ephemeralTurn.apiBodies.length, 1);
   assert.equal(rows().at(-1)?.kind, "human", "Claude ran the ephemeral perception");
   const nextTurn = await live.send("after ignored ephemeral");
-  assert.doesNotMatch(JSON.stringify([...ephemeralTurn.apiBodies, ...nextTurn.apiBodies]), /IGNORED_EPHEMERAL/);
+  const ignored = "IGNORED_EPHEMERAL";
+  for (const { messages } of [...ephemeralTurn.apiBodies, ...nextTurn.apiBodies]) {
+    assert.ok(!(messages as WireMessage[]).some((message) => wireNoteLines(message).includes(ignored)));
+  }
   const transcript = await live.transcript();
   assert.ok(transcript?.length);
-  assert.doesNotMatch(JSON.stringify(transcript), /IGNORED_EPHEMERAL/);
+  for (const row of transcript) {
+    const note = ownPluginNote(row);
+    const payload = [...(note?.held ?? []), ...(note?.delivered ?? [])].map(unwrapReminder);
+    const uttered = (row.type === "user" || row.type === "assistant") && row.message?.role === row.type ? wireNoteLines(row.message) : [];
+    assert.ok(!payload.includes(ignored) && !uttered.includes(ignored));
+  }
   a = rows().filter((row) => row.label === "A");
   const beforeSwitch = a.at(-1)!.n;
   await live.send("/soul @b"); await live.send("use B"); await live.send("observe B");

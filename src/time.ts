@@ -27,12 +27,12 @@ export function formatElapsed(ms: number): string {
 /** Refresh the watch on human moments, at most once an hour. */
 export function timePerception(lastNoteAt?: number): Perception {
   return (moment, world) => {
-    if (moment.kind !== "human" || !Number.isFinite(world.now)) return undefined;
-    if (lastNoteAt !== undefined && Number.isFinite(lastNoteAt) && world.now - lastNoteAt < HOUR_MS) return undefined;
+    if (moment.kind !== "human" || !Number.isFinite(world.now)) return [];
+    if (lastNoteAt !== undefined && Number.isFinite(lastNoteAt) && world.now - lastNoteAt < HOUR_MS) return [];
     const clock = `⌚ ${formatClock(new Date(world.now))}`;
     const away = world.absenceMs !== undefined && Number.isFinite(world.absenceMs) && world.absenceMs >= HOUR_MS
       ? formatElapsed(world.absenceMs)
       : undefined;
-    return { kind: "remind", text: away ? `${clock}\n(${away} since *human* was last present)` : clock };
+    return [{ kind: "reminder", text: away ? `${clock}\n(${away} since *human* was last present)` : clock }];
   };
 }

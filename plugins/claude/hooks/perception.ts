@@ -2,6 +2,7 @@ import type { EngineInterface, PluginOptions } from "claude-code";
 import { files } from "./files.ts";
 import { runPerception, type PerceptionRuntime } from "./perception-runtime.ts";
 import type { Moment, Utterance, World } from "../../../src/perception.ts";
+import { utterances } from "../../../src/utterance.ts";
 
 export type { Moment, Utterance, World };
 type Engine = Pick<EngineInterface, "env" | "session" | "clock" | "process" | "http">;
@@ -43,14 +44,13 @@ export async function worldFor($: Engine, name: string, previousHumanAt?: number
 }
 
 /** Discover fresh, then reuse the shared loader's cached closure in the session child. */
-export async function perceptionUtterance($: Engine, options: PluginOptions, runtime: PerceptionRuntime, generation: number, name: string, moment: Moment, world: World | Promise<World>, signal?: AbortSignal): Promise<Utterance | undefined> {
+export async function perceptionUtterances($: Engine, options: PluginOptions, runtime: PerceptionRuntime, generation: number, name: string, moment: Moment, world: World | Promise<World>, signal?: AbortSignal): Promise<readonly Utterance[]> {
   try {
     const facts = await world;
-    if (generation !== runtime.generation || signal?.aborted) return undefined;
+    if (generation !== runtime.generation || signal?.aborted) return [];
     const { path } = await files<{ path?: string }>($, options, { op: "perception", name });
-    if (!path || generation !== runtime.generation || signal?.aborted) return undefined;
-    const said = await runPerception($, runtime, { path, moment, world: facts }, signal) as Utterance | undefined;
-    if (generation !== runtime.generation || signal?.aborted) return undefined;
-    return said && (said.kind === "remind" || said.kind === "ephemeral") && typeof said.text === "string" && said.text.trim() ? said : undefined;
-  } catch { return undefined; }
+    if (!path || generation !== runtime.generation || signal?.aborted) return [];
+    const said = await runPerception($, runtime, { path, moment, world: facts }, signal);
+    return generation === runtime.generation && !signal?.aborted ? utterances(said) : [];
+  } catch { return []; }
 }

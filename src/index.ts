@@ -8,7 +8,8 @@ import { ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserM
 import { timePerception } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, readTransition, sameTransition, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
-import { humanPerception, loadPerception, PERCEPTION_MESSAGE_TYPE, sendReminder, toolCategory, toolFilePath, toolText, worldFor, wrapReminder, type Moment, type Perception, type Utterance } from "./perception.ts";
+import { humanPerception, loadPerception, PERCEPTION_MESSAGE_TYPE, toolCategory, toolFilePath, toolText, worldFor, type Moment, type Perception } from "./perception.ts";
+import { isUtteranceKind, wrapReminder, type EphemeralUtterance, type UtteranceKind } from "./utterance.ts";
 
 const home = homedir();
 const tilde = (path: string) => (path === home || path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
@@ -30,13 +31,59 @@ function describe(selection: Selection | undefined, model: ExtensionContext["mod
 }
 
 type Ephemeral = {
-  sessionId: string; soul: string; text: string; at: number; previousLeaf: string | null;
+  sessionId: string; soul: string; kind: UtteranceKind; text: string; at: number; previousLeaf: string | null;
   anchor: "next-user" | "visible-at-or-before"; priorVisibleIds: string[]; anchorId?: string | null;
   linger: number; sink: number;
 };
 const visibleMessage = (entry: ProjectedSessionEntry) => entry.messages.findLast((message) => message.role !== "system");
 const sunkAnchor = (ids: readonly string[], sink: number): string | null => ids[ids.length - 1 - sink] ?? null;
 const contentKey = (message: AgentMessage) => JSON.stringify("content" in message ? message.content : undefined);
+
+function spokenMessage(kind: UtteranceKind, text: string, timestamp: number): AgentMessage {
+  if (kind !== "assistant") return { role: "user", content: kind === "reminder" ? wrapReminder(text) : text, timestamp };
+  return {
+    role: "assistant", content: [{ type: "text", text }], timestamp,
+    api: "pi-souls", provider: "pi-souls", model: "synthetic", stopReason: "stop",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  };
+}
+
+function projectUtterance(message: AgentMessage, into: AgentMessage[]): boolean {
+  if (message.role !== "custom" || message.customType !== PERCEPTION_MESSAGE_TYPE) return false;
+  const details = message.details as { kind?: unknown; kinds?: unknown } | undefined;
+  const { content, timestamp } = message;
+  if (typeof content === "string" && isUtteranceKind(details?.kind)) {
+    into.push(spokenMessage(details.kind, content, timestamp));
+    return true;
+  }
+  const kinds = details?.kinds;
+  if (typeof content === "string" || !Array.isArray(kinds) || !kinds.length || kinds.length !== content.length
+    || !kinds.every(isUtteranceKind) || !content.every((block) => block.type === "text")) return false;
+  for (const [index, block] of content.entries()) into.push(spokenMessage(kinds[index]!, block.text, timestamp));
+  return true;
+}
+
+function toolBatches(messages: readonly AgentMessage[]) {
+  const batches: { start: number; end: number; closed: boolean }[] = [];
+  for (const [start, message] of messages.entries()) {
+    if (message.role !== "assistant") continue;
+    const calls = new Set(message.content.flatMap((block) => block.type === "toolCall" ? [block.id] : []));
+    if (!calls.size) continue;
+    const pending = new Set(calls);
+    let end = start, index = start + 1;
+    for (; index < messages.length; index++) {
+      const item = messages[index]!;
+      if (item.role === "user" || item.role === "assistant") break;
+      if (item.role === "toolResult" && calls.has(item.toolCallId)) {
+        pending.delete(item.toolCallId);
+        end = index;
+      }
+    }
+    // A new native turn ends ownership, even if a later batch reuses an ID.
+    batches.push({ start, end: pending.size ? index : end, closed: pending.size === 0 });
+  }
+  return batches;
+}
 
 export default function soulsExtension(pi: ExtensionAPI) {
   registerPresenceUI(pi);
@@ -50,6 +97,9 @@ export default function soulsExtension(pi: ExtensionAPI) {
   let options: BuildSystemPromptOptions | undefined;
   let running = false;
   let ephemerals: Ephemeral[] = [];
+  const sendReminder = (text: string, details: { model: NonNullable<Transition["model"]> } | { soul: string }) => {
+    pi.sendMessage({ customType: TRANSITION_MESSAGE_TYPE, content: wrapReminder(text), display: false, details: { version: 1, ...details } }, { triggerTurn: false });
+  };
   // What the projection handler learned for this request, read by the transition handler.
   let projection: { known: boolean; soul: string | null } | undefined;
   let forceReported = false;
@@ -92,46 +142,55 @@ export default function soulsExtension(pi: ExtensionAPI) {
       },
       directory: (moment: Moment) => {
         const target = resolvePerception(config, selection);
-        return target ? perceptionFor(target.path)(moment, world) : undefined;
+        return target ? perceptionFor(target.path)(moment, world) : [];
       },
       timeaware: config.timeaware,
     };
   };
-  const addEphemeral = ({ branch, now: at, sessionId, soul, previousLeaf }: NonNullable<ReturnType<typeof perceptionContext>>, anchor: Ephemeral["anchor"], said: Utterance) => {
-    // Capture visibility at the moment, not after steering or a later compaction.
+  type PerceptionContext = NonNullable<ReturnType<typeof perceptionContext>>;
+  const addEphemerals = ({ branch, now: at, sessionId, soul, previousLeaf }: PerceptionContext, anchor: Ephemeral["anchor"], batch: readonly EphemeralUtterance[]) => {
+    if (!batch.length) return;
+    // Capture visibility once for the whole batch, before any of its carriers are sent.
     const visible = new Set(buildSessionProjection(branch, previousLeaf).entries.filter(visibleMessage).map(({ sourceEntry }) => sourceEntry.id));
     const priorVisibleIds = branch.filter((entry) => visible.has(entry.id)).map((entry) => entry.id);
-    const { text, linger = 1, sink = 0 } = said;
-    const ephemeral: Ephemeral = { sessionId, soul, text, at, previousLeaf, anchor, priorVisibleIds, linger, sink };
-    if (anchor === "visible-at-or-before") ephemeral.anchorId = sunkAnchor(priorVisibleIds, sink);
-    ephemerals.push(ephemeral);
+    for (const { kind, text, linger = 1, sink = 0 } of batch) {
+      const ephemeral: Ephemeral = { sessionId, soul, kind, text, at, previousLeaf, anchor, priorVisibleIds, linger, sink };
+      if (anchor === "visible-at-or-before") ephemeral.anchorId = sunkAnchor(priorVisibleIds, sink);
+      ephemerals.push(ephemeral);
+    }
   };
   const perceive = async (moment: Exclude<Moment, { kind: "human" }>, ctx: ExtensionContext, customPrompt: string | undefined): Promise<void> => {
     try {
       const perception = perceptionContext(ctx, customPrompt);
       if (!perception) return;
-      const said = await perception.directory(moment);
-      if (said?.kind === "remind") sendReminder(pi, { text: said.text, details: { moment: moment.kind } });
-      if (said?.kind === "ephemeral") addEphemeral(perception, "visible-at-or-before", said);
+      const batch = await perception.directory(moment);
+      addEphemerals(perception, "visible-at-or-before", batch.filter((item) => item.ephemeral === true));
+      for (const item of batch) if (!item.ephemeral) pi.sendMessage({
+        customType: PERCEPTION_MESSAGE_TYPE, content: item.text, display: true,
+        details: { kind: item.kind, moment: moment.kind },
+      }, { triggerTurn: false });
     } catch {
       // A perception is decoration: a broken configuration never breaks the host.
     }
   };
-  const humanReminder = async (text: string, ctx: ExtensionContext, runOptions: BuildSystemPromptOptions) => {
+  const perceiveHuman = async (text: string, ctx: ExtensionContext, runOptions: BuildSystemPromptOptions) => {
     try {
       const perception = perceptionContext(ctx, runOptions.customPrompt);
       if (!perception) return;
       const moment = { kind: "human", text } as const;
       const [clock, directory] = await Promise.all([
-        perception.timeaware ? humanPerception(() => perception.clock(moment)) : undefined,
+        perception.timeaware ? humanPerception(() => perception.clock(moment)) : [],
         humanPerception(() => perception.directory(moment)),
       ]);
-      const content = [clock?.text, directory?.kind === "remind" ? directory.text : undefined].filter(Boolean).join("\n");
-      if (directory?.kind === "ephemeral" && running && options === runOptions) addEphemeral(perception, "next-user", directory);
-      if (content) return {
-        customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder(content), display: true,
-        details: { moment: "human", ...(clock ? { timestamp: perception.now } : {}) },
-      };
+      if (!running || options !== runOptions) return;
+      addEphemerals(perception, "next-user", directory.filter((item) => item.ephemeral === true));
+      const durable = [...clock, ...directory.filter((item) => !item.ephemeral)];
+      // The native hook accepts one message; unlike nextTurn, it belongs only to this preparation.
+      if (durable.length) return { message: {
+        customType: PERCEPTION_MESSAGE_TYPE, display: true,
+        content: durable.map(({ text }) => ({ type: "text" as const, text })),
+        details: { moment: "human", kinds: durable.map(({ kind }) => kind), ...(clock.length ? { timestamp: perception.now } : {}) },
+      } };
     } catch {
       // A broken configuration never prevents the prompt from starting.
     }
@@ -181,20 +240,17 @@ export default function soulsExtension(pi: ExtensionAPI) {
   pi.on("model_select", (event, ctx) => {
     refreshFooter(ctx, promptValue(), event.model);
     if (!event.previousModel || (event.previousModel.provider === event.model.provider && event.previousModel.id === event.model.id)) return;
-    sendReminder(pi, {
-      customType: TRANSITION_MESSAGE_TYPE, display: false, defer: true,
-      text: `new brain: ${event.model.id}`,
-      details: { version: 1, model: { provider: event.model.provider, id: event.model.id } },
-    });
+    sendReminder(`new brain: ${event.model.id}`, { model: { provider: event.model.provider, id: event.model.id } });
   });
   pi.on("session_tree", (_event, ctx) => refreshFooter(ctx, promptValue()));
   pi.on("before_agent_start", async (event, ctx) => {
     options = event.systemPromptOptions; running = true; forcedProjection = undefined;
     seenPrompt = options.customPrompt; promptKnown = true;
     refreshFooter(ctx, options.customPrompt);
+    // A preparation can fail without a settlement. Never rebind its untouched human anchors.
+    ephemerals = ephemerals.filter((ephemeral) => ephemeral.anchorId !== undefined);
     if ("messageType" in event && event.messageType !== "user") return;
-    const message = await humanReminder(event.prompt, ctx, event.systemPromptOptions);
-    if (message) return { message };
+    return perceiveHuman(event.prompt, ctx, event.systemPromptOptions);
   });
   pi.on("agent_settled", () => {
     running = false;
@@ -409,10 +465,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
     if (previous && sameTransition(previous, current)) return;
     pi.appendEntry(TRANSITION_ENTRY_TYPE, { version: 1, ...current });
     if (previous && previous.soul !== current.soul && current.soul) {
-      sendReminder(pi, {
-        customType: TRANSITION_MESSAGE_TYPE, display: false, defer: true,
-        text: `new soul: ${current.soul}`, details: { version: 1, soul: current.soul },
-      });
+      sendReminder(`new soul: ${current.soul}`, { soul: current.soul });
     }
   };
 
@@ -428,46 +481,59 @@ export default function soulsExtension(pi: ExtensionAPI) {
   };
 
   pi.on("context", (event, ctx) => {
-    if (!ephemerals.length) return;
     const session = ctx.sessionManager;
+    const inserts = new Map<number, AgentMessage[]>();
     try {
-      const { branch, selection } = perceptionSelection(ctx, options?.customPrompt);
-      const sessionId = session.getSessionId();
-      if (ephemerals.some((ephemeral) => selection?.name !== ephemeral.soul || sessionId !== ephemeral.sessionId)) {
-        ephemerals = [];
-        return;
+      if (ephemerals.length) {
+        const { branch, selection } = perceptionSelection(ctx, options?.customPrompt);
+        const sessionId = session.getSessionId();
+        const projected = session.buildSessionProjection();
+        const batches = toolBatches(event.messages);
+        ephemerals = ephemerals.filter((ephemeral) => {
+          if (selection?.name !== ephemeral.soul || sessionId !== ephemeral.sessionId) return false;
+          const id = anchorIdFor(ephemeral, branch);
+          if (id === undefined) return false;
+          let position = 0, timestamp = ephemeral.at;
+          if (id !== null) {
+            const entry = projected.entries.find(({ sourceEntry }) => sourceEntry.id === id);
+            const anchor = entry && visibleMessage(entry);
+            if (!anchor) return false;
+            // Context has cloned messages without entry ids; never guess on a collision.
+            const content = contentKey(anchor);
+            const matches = (message: AgentMessage) => message.role === anchor.role && message.timestamp === anchor.timestamp && contentKey(message) === content;
+            const index = event.messages.findIndex(matches);
+            if (index < 0 || index !== event.messages.findLastIndex(matches) || projected.messages.findIndex(matches) !== projected.messages.findLastIndex(matches)) return false;
+            position = index + 1;
+            const batch = batches.find(({ start, end }) => position > start && position <= end);
+            if (batch && !batch.closed) return true;
+            if (batch) position = batch.end + 1;
+            timestamp = anchor.timestamp;
+          }
+          const message = spokenMessage(ephemeral.kind, ephemeral.text, timestamp);
+          const group = inserts.get(position);
+          if (group) group.push(message);
+          else inserts.set(position, [message]);
+          return true;
+        });
       }
-      const projected = session.buildSessionProjection();
-      const inserts: { position: number; message: AgentMessage }[] = [];
-      ephemerals = ephemerals.filter((ephemeral) => {
-        const id = anchorIdFor(ephemeral, branch);
-        if (id === undefined) return false;
-        let position = 0, timestamp = ephemeral.at;
-        if (id !== null) {
-          const entry = projected.entries.find(({ sourceEntry }) => sourceEntry.id === id);
-          const anchor = entry && visibleMessage(entry);
-          if (!anchor) return false;
-          // Context has cloned messages without entry ids; never guess on a collision.
-          const content = contentKey(anchor);
-          const matches = (message: AgentMessage) => message.role === anchor.role && message.timestamp === anchor.timestamp && contentKey(message) === content;
-          const index = event.messages.findIndex(matches);
-          if (index < 0 || index !== event.messages.findLastIndex(matches) || projected.messages.findIndex(matches) !== projected.messages.findLastIndex(matches)) return false;
-          position = index + 1;
-          while (event.messages[position]?.role === "toolResult") position++;
-          timestamp = anchor.timestamp;
-        }
-        inserts.push({ position, message: { role: "user", content: wrapReminder(ephemeral.text), timestamp } });
-        return true;
-      });
-      if (!inserts.length) return;
-      const messages = [...event.messages];
-      // Work backwards, including within a position, so splicing preserves creation order.
-      for (const { position, message } of inserts.reverse().sort((a, b) => b.position - a.position)) messages.splice(position, 0, message);
-      return { messages };
     } catch {
       // A perception is decoration: never obstruct a request.
       ephemerals = [];
+      inserts.clear();
     }
+    // Anchor matching above uses the unmodified carriers. A single pass then emits
+    // each gap in creation order and maps the persistent carriers in place.
+    const messages: AgentMessage[] = [];
+    let changed = inserts.size > 0;
+    for (const [index, message] of event.messages.entries()) {
+      const gap = inserts.get(index);
+      if (gap) messages.push(...gap);
+      if (projectUtterance(message, messages)) changed = true;
+      else messages.push(message);
+    }
+    const tail = inserts.get(event.messages.length);
+    if (tail) messages.push(...tail);
+    if (changed) return { messages };
   });
 
   // First handler owns presence/projection and its existing error path, including the no-UI throw.

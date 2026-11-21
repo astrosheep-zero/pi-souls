@@ -15,7 +15,7 @@ test("Pi loads a changed perception after /soul reload without starting a model 
     const soul = join(dir, "faye");
     const marker = join(dir, "perception-output");
     const perception = join(soul, "perception.ts");
-    const code = (value: string) => `import { writeFileSync } from 'node:fs'; enum Marker { value = ${JSON.stringify(value)} } export function perception() { writeFileSync(${JSON.stringify(marker)}, Marker.value); }`;
+    const code = (value: string) => `import { writeFileSync } from 'node:fs'; enum Marker { value = ${JSON.stringify(value)} } export function perception() { writeFileSync(${JSON.stringify(marker)}, Marker.value); return []; }`;
     mkdirSync(soul);
     writeFileSync(join(soul, "SOUL.md"), "Faye");
     writeFileSync(perception, code("old"));
@@ -67,7 +67,7 @@ test("Pi loads a changed perception after /soul reload without starting a model 
 
     // Native ESM needs a fresh URL even when Pi loaded this extension through Jiti.
     const esm = join(soul, "perception.mjs");
-    const esmCode = (value: string) => `import { writeFileSync } from 'node:fs'; export function perception() { writeFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); }`;
+    const esmCode = (value: string) => `import { writeFileSync } from 'node:fs'; export function perception() { writeFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); return []; }`;
     rmSync(perception);
     writeFileSync(esm, esmCode("esm-old"));
     await session.prompt("/soul reload");

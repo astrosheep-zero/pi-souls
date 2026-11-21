@@ -36,12 +36,12 @@ function formatElapsed(ms) {
 }
 function timePerception(lastNoteAt) {
   return (moment, world) => {
-    if (moment.kind !== "human" || !Number.isFinite(world.now)) return void 0;
-    if (lastNoteAt !== void 0 && Number.isFinite(lastNoteAt) && world.now - lastNoteAt < HOUR_MS) return void 0;
+    if (moment.kind !== "human" || !Number.isFinite(world.now)) return [];
+    if (lastNoteAt !== void 0 && Number.isFinite(lastNoteAt) && world.now - lastNoteAt < HOUR_MS) return [];
     const clock = `\u231A ${formatClock(new Date(world.now))}`;
     const away = world.absenceMs !== void 0 && Number.isFinite(world.absenceMs) && world.absenceMs >= HOUR_MS ? formatElapsed(world.absenceMs) : void 0;
-    return { kind: "remind", text: away ? `${clock}
-(${away} since *human* was last present)` : clock };
+    return [{ kind: "reminder", text: away ? `${clock}
+(${away} since *human* was last present)` : clock }];
   };
 }
 
@@ -59,6 +59,35 @@ function encodeChoice(choice) {
   }
 }
 var CLOCK_LINE = new RegExp(`^\u231A (?:[01]\\d|2[0-3]):[0-5]\\d \xB7 (?:${DAYS.join("|")}), (?:${MONTHS.join("|")}) (?:[1-9]|[12]\\d|3[01])$`, "u");
+
+// src/utterance.ts
+function isUtteranceKind(kind) {
+  return kind === "reminder" || kind === "user" || kind === "assistant";
+}
+var REMINDER_OPEN = "<system-reminder>\n";
+var REMINDER_CLOSE = "\n</system-reminder>";
+function wrapReminder(text) {
+  return `${REMINDER_OPEN}${text}${REMINDER_CLOSE}`;
+}
+function utterances(value) {
+  if (!Array.isArray(value)) return [];
+  const batch = [];
+  for (let i = 0; i < value.length; i++) {
+    const item = value[i];
+    if (!item || typeof item !== "object" || Array.isArray(item) || "raw" in item) return [];
+    const { kind, text, ephemeral, linger, sink } = item;
+    if (!isUtteranceKind(kind) || typeof text !== "string" || !text.trim()) return [];
+    if (ephemeral === true) {
+      if ("linger" in item && (typeof linger !== "number" || !Number.isInteger(linger) || linger < 1)) return [];
+      if ("sink" in item && (typeof sink !== "number" || !Number.isInteger(sink) || sink < 0)) return [];
+      batch.push({ kind, text, ephemeral, ...linger === void 0 ? {} : { linger }, ...sink === void 0 ? {} : { sink } });
+    } else {
+      if ("ephemeral" in item && ephemeral !== false || "linger" in item || "sink" in item) return [];
+      batch.push({ kind, text, ...ephemeral === false ? { ephemeral } : {} });
+    }
+  }
+  return batch;
+}
 
 // plugins/claude/hooks/files.ts
 var RUNNER = `${import.meta.dir}/souls-runner.cjs`;
@@ -233,17 +262,16 @@ async function worldFor($, name, previousHumanAt) {
     ...absenceMs !== void 0 && Number.isFinite(absenceMs) && absenceMs >= 0 ? { absenceMs } : {}
   };
 }
-async function perceptionUtterance($, options, runtime, generation, name, moment, world, signal) {
+async function perceptionUtterances($, options, runtime, generation, name, moment, world, signal) {
   try {
     const facts = await world;
-    if (generation !== runtime.generation || signal?.aborted) return void 0;
+    if (generation !== runtime.generation || signal?.aborted) return [];
     const { path } = await files($, options, { op: "perception", name });
-    if (!path || generation !== runtime.generation || signal?.aborted) return void 0;
+    if (!path || generation !== runtime.generation || signal?.aborted) return [];
     const said = await runPerception($, runtime, { path, moment, world: facts }, signal);
-    if (generation !== runtime.generation || signal?.aborted) return void 0;
-    return said && (said.kind === "remind" || said.kind === "ephemeral") && typeof said.text === "string" && said.text.trim() ? said : void 0;
+    return generation === runtime.generation && !signal?.aborted ? utterances(said) : [];
   } catch {
-    return void 0;
+    return [];
   }
 }
 
@@ -326,13 +354,12 @@ async function append($, s, type, text) {
   s.journalHead = void 0;
   return true;
 }
-function wrapReminder(text) {
-  return `<system-reminder>
-${text}
-</system-reminder>`;
-}
 function reminder($, s, text) {
   return append($, s, "user", wrapReminder(text));
+}
+function noteText(item) {
+  if (item.ephemeral || item.kind === "assistant") return;
+  return item.kind === "reminder" ? wrapReminder(item.text) : item.text;
 }
 function invalidate($) {
   $.ui.invalidate("prompt.section");
@@ -363,29 +390,33 @@ async function perceiveActive($, s, options, moment, signal) {
   try {
     const world = await worldFor($, name, s.journal.lastHumanAt);
     if (generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
-    const said = await perceptionUtterance($, options, s.runtime, generation, name, moment, world, signal);
-    if (said?.kind !== "remind" || generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) return;
-    if (moment.kind === "tool") s.toolNotes.push({ text: said.text, generation });
-    else await reminder($, s, said.text);
+    const batch = await perceptionUtterances($, options, s.runtime, generation, name, moment, world, signal);
+    for (const item of batch) {
+      if (generation !== s.runtime.generation || s.applied?.soul !== name || signal?.aborted) break;
+      const text = noteText(item);
+      if (text === void 0) continue;
+      if (moment.kind === "tool") s.toolNotes.push({ text, generation });
+      else await append($, s, "user", text);
+    }
   } catch {
   }
 }
-async function boundedText($, pending) {
+async function boundedBatch($, pending) {
   let timer;
   try {
-    return (await Promise.race([
+    return await Promise.race([
       pending,
       new Promise((resolve) => {
-        timer = $.clock.after(2e3, () => resolve(void 0));
+        timer = $.clock.after(2e3, () => resolve([]));
       })
-    ]))?.trim();
+    ]);
   } catch {
-    return void 0;
+    return [];
   } finally {
     timer?.cancel();
   }
 }
-async function humanReminders($, s, options, text, signal) {
+async function perceiveHuman($, s, options, text, signal) {
   const model = await $.session.model().catch(() => void 0);
   const { sections } = await preview($, model);
   const proposal = matchingProposal(s, sections.flatMap((section) => section.text === "" ? [] : [section.text]));
@@ -395,13 +426,17 @@ async function humanReminders($, s, options, text, signal) {
   const moment = { kind: "human", text };
   const world = worldFor($, soul, s.journal.lastHumanAt);
   const clock = timePerception(s.journal.noteAt);
-  const texts = await Promise.all([
-    options.timeaware !== false ? boundedText($, world.then(async (facts) => (await clock(moment, facts))?.text)) : void 0,
-    // Claude does not support ephemeral delivery.
-    boundedText($, perceptionUtterance($, options, s.runtime, generation, soul, moment, world, signal).then((said) => said?.kind === "remind" ? said.text : void 0))
+  const [time, batch] = await Promise.all([
+    options.timeaware !== false ? boundedBatch($, world.then((facts) => clock(moment, facts))) : [],
+    boundedBatch($, perceptionUtterances($, options, s.runtime, generation, soul, moment, world, signal))
   ]);
-  if (generation !== s.runtime.generation || s.proposals.get(proposal.section)?.soul !== soul || signal?.aborted) return [];
-  return texts.flatMap((text2) => text2 ? [wrapReminder(text2)] : []);
+  const active = () => generation === s.runtime.generation && s.proposals.get(proposal.section)?.soul === soul && !signal?.aborted;
+  for (const item of batch) {
+    if (!active()) break;
+    const text2 = noteText(item);
+    if (text2 !== void 0) await append($, s, "user", text2);
+  }
+  return active() ? time.map((item) => wrapReminder(item.text)) : [];
 }
 function retainedMessages(before, after, handles) {
   const wanted = /* @__PURE__ */ new Set([...handles, ...after.flatMap((message) => message.handle ? [message.handle] : [])]);
@@ -649,7 +684,7 @@ ${following.text}` } : {} };
     }
     let extra = [];
     try {
-      extra = await humanReminders($, s, options, e.text, next.signal);
+      extra = await perceiveHuman($, s, options, e.text, next.signal);
     } catch {
     }
     return next(extra.length ? { ...e, context: [...e.context ?? [], ...extra] } : e);
@@ -672,7 +707,7 @@ ${following.text}` } : {} };
         warn($, s, `Claude is still using @${actual.soul}; turning off souls did not take effect. Start a new session, or use /soul reset if its default is a different soul.`);
       }
       for (const note of s.toolNotes.splice(0)) {
-        if (note.generation === s.runtime.generation && !next.signal?.aborted) await reminder($, s, note.text);
+        if (note.generation === s.runtime.generation && !next.signal?.aborted) await append($, s, "user", note.text);
       }
       if (s.pendingBrain && s.journal.model !== s.pendingBrain) {
         if (await reminder($, s, `new brain: ${s.pendingBrain}`)) s.pendingBrain = void 0;

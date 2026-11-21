@@ -5,36 +5,11 @@ import { join } from "node:path";
 import { clearTimeout, setTimeout } from "node:timers";
 import { pathToFileURL } from "node:url";
 import { createJiti } from "jiti";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { utterances, type Utterance } from "./utterance.ts";
+export { unwrapReminder, wrapReminder } from "./utterance.ts";
+export type { UtteranceKind, PersistentUtterance, EphemeralUtterance, Utterance } from "./utterance.ts";
 
 export const PERCEPTION_MESSAGE_TYPE = "pi-souls:perception";
-
-const REMINDER_OPEN = "<system-reminder>\n";
-const REMINDER_CLOSE = "\n</system-reminder>";
-
-export function wrapReminder(text: string): string {
-  return `${REMINDER_OPEN}${text}${REMINDER_CLOSE}`;
-}
-
-export function unwrapReminder(text: string): string {
-  return text.startsWith(REMINDER_OPEN) && text.endsWith(REMINDER_CLOSE)
-    ? text.slice(REMINDER_OPEN.length, -REMINDER_CLOSE.length)
-    : text;
-}
-
-/** Persist once and let Pi deliver it at the next safe boundary; never rebuild old reminders. */
-export function sendReminder(pi: Pick<ExtensionAPI, "sendMessage">, message: {
-  text: string; details?: unknown; customType?: string; display?: boolean;
-  /** State notices describe the next request: settle with this run instead of steering it. */
-  defer?: boolean;
-}): void {
-  pi.sendMessage({
-    customType: message.customType ?? PERCEPTION_MESSAGE_TYPE,
-    content: wrapReminder(message.text),
-    display: message.display ?? true,
-    details: message.details,
-  }, message.defer ? { triggerTurn: false } : undefined);
-}
 
 const perceptionRequire = createRequire(import.meta.url);
 const { importModule } = perceptionRequire("./perception-import.mjs") as { importModule: (url: string) => Promise<unknown> };
@@ -59,15 +34,6 @@ export type Moment =
       ok?: boolean;
     };
 
-export type UtteranceKind = "remind" | "ephemeral";
-
-export interface Utterance {
-  kind: UtteranceKind;
-  text: string;
-  linger?: number;
-  sink?: number;
-}
-
 export interface World {
   now: number;
   sessionId: string;
@@ -87,7 +53,7 @@ export interface World {
 }
 
 /** What a soul's `perception.ts` exports, by name or as the default. */
-export type Perception = (moment: Moment, world: World) => Utterance | undefined | Promise<Utterance | undefined>;
+export type Perception = (moment: Moment, world: World) => readonly Utterance[] | Promise<readonly Utterance[]>;
 
 const CATEGORIES: Readonly<Record<string, ToolCategory>> = {
   read: "reading",
@@ -178,23 +144,17 @@ export function worldFor(input: { now: number; sessionId: string; cwd: string; s
 }
 
 /** A human perception gets a short deadline and may never send a late answer. */
-export async function humanPerception(run: () => ReturnType<Perception>): Promise<Utterance | undefined> {
-  let cancel: (() => void) | undefined;
+export async function humanPerception(run: () => ReturnType<Perception>): Promise<readonly Utterance[]> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      new Promise<undefined>((resolve) => {
-        const timer = setTimeout(resolve, 2000);
-        cancel = () => clearTimeout(timer);
-      }),
-      Promise.resolve().then(run).then((value) => {
-        const said = utterance(value);
-        return said && { ...said, text: said.text.trim() };
-      }),
+      new Promise<readonly Utterance[]>((resolve) => { timer = setTimeout(() => resolve([]), 2000); }),
+      Promise.resolve().then(run),
     ]);
   } catch {
-    return undefined;
+    return [];
   } finally {
-    cancel?.();
+    clearTimeout(timer);
   }
 }
 
@@ -204,18 +164,6 @@ function pick(value: unknown): Perception | undefined {
   if (typeof record.perception === "function") return record.perception as Perception;
   if (typeof record.default === "function") return record.default as Perception;
   return typeof value === "function" ? value as Perception : undefined;
-}
-
-/** Require a known delivery kind, nonempty text, and valid ephemeral controls. */
-export function utterance(value: unknown): Utterance | undefined {
-  if (!object(value)) return undefined;
-  const { kind, text } = value;
-  if ((kind !== "remind" && kind !== "ephemeral") || typeof text !== "string" || !text.trim()) return undefined;
-  if (kind === "remind") return { kind, text };
-  const { linger, sink } = value;
-  if (linger !== undefined && (typeof linger !== "number" || !Number.isInteger(linger) || linger < 1)) return undefined;
-  if (sink !== undefined && (typeof sink !== "number" || !Number.isInteger(sink) || sink < 0)) return undefined;
-  return { kind, text, ...(linger === undefined ? {} : { linger }), ...(sink === undefined ? {} : { sink }) };
 }
 
 /**
@@ -234,11 +182,11 @@ export function loadPerception(perceptionPath: string): Perception {
     })().catch(() => undefined));
   return async (moment, world) => {
     const perception = await load();
-    if (!perception) return undefined;
+    if (!perception) return [];
     try {
-      return utterance(await perception(moment, world));
+      return utterances(await perception(moment, world));
     } catch {
-      return undefined;
+      return [];
     }
   };
 }

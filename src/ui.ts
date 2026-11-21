@@ -1,8 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { PERCEPTION_MESSAGE_TYPE, unwrapReminder } from "./perception.ts";
+import { PERCEPTION_MESSAGE_TYPE } from "./perception.ts";
 import { dividerText, FOOTER_KEY, PRESENCE_ENTRY_TYPE } from "./presence.ts";
 import { DAY_CHROMA, dayHue, lightness, oklch, type Rgb } from "./tint.ts";
+import { isUtteranceKind, unwrapReminder } from "./utterance.ts";
 
 /** Unwrap theatre bracket thoughts and keep the soul's own line breaks. */
 export function compactPerceptionLines(text: string): string[] {
@@ -61,9 +62,9 @@ export function registerPresenceUI(pi: ExtensionAPI): void {
     const raw = typeof message.content === "string"
       ? message.content
       : message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
-    const text = unwrapReminder(raw).trim();
-    if (!text) return undefined;
-    const lines = compactPerceptionLines(text);
+    const details = message.details as { kind?: unknown; kinds?: unknown } | undefined;
+    const storesRawText = isUtteranceKind(details?.kind) || Array.isArray(details?.kinds);
+    const lines = compactPerceptionLines(storesRawText ? raw : unwrapReminder(raw));
     if (!lines.length) return undefined;
     // No rule, no box: an indent and the day's ink are what set it apart from the reply.
     const indent = " ".repeat((options.outputPad ?? 1) + 2);

@@ -3,13 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type BeforeAgentStartEventResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
 import { applySoul, replaceForcedPreamble } from "../src/prompt.ts";
 import { ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulPerceptionPath, unmatchableModelKeys } from "../src/souls.ts";
 import { HOUR_MS, timePerception } from "../src/time.ts";
-import { PERCEPTION_MESSAGE_TYPE, worldFor, wrapReminder, type Moment } from "../src/perception.ts";
+import { PERCEPTION_MESSAGE_TYPE, worldFor, type Moment } from "../src/perception.ts";
 
 const model = { provider: "provider", id: "model" };
 const config = readConfig({ defaultSoul: "global", modelSouls: { "provider/model": "specific" } }, "/tmp");
@@ -202,11 +202,11 @@ test("a directory soul's perception is found by extension precedence and unsafe 
     writeFileSync(join(dir, "faye", "SOUL.md"), "Faye");
     assert.equal(soulPerceptionPath(dir, "faye"), undefined);
 
-    writeFileSync(join(dir, "faye", "perception.js"), "export const perception = () => undefined;");
+    writeFileSync(join(dir, "faye", "perception.js"), "export const perception = () => [];");
     assert.equal(soulPerceptionPath(dir, "faye"), join(dir, "faye", "perception.js"));
-    writeFileSync(join(dir, "faye", "perception.mjs"), "export const perception = () => undefined;");
+    writeFileSync(join(dir, "faye", "perception.mjs"), "export const perception = () => [];");
     assert.equal(soulPerceptionPath(dir, "faye"), join(dir, "faye", "perception.mjs"));
-    writeFileSync(join(dir, "faye", "perception.ts"), "export const perception = () => undefined;");
+    writeFileSync(join(dir, "faye", "perception.ts"), "export const perception = () => [];");
     assert.equal(soulPerceptionPath(dir, "faye"), join(dir, "faye", "perception.ts"));
 
     writeFileSync(join(dir, "flat.md"), "Flat");
@@ -463,19 +463,19 @@ test("builtin time perception returns reminders only for due human moments", asy
   const human: Moment = { kind: "human", text: "hi" };
   const say = (now: number, lastNoteAt?: number, absenceMs?: number, moment: Moment = human) =>
     timePerception(lastNoteAt)(moment, { ...worldFor({ now, sessionId: "s", cwd: "/", soul: "faye" }), absenceMs });
-  assert.deepEqual(await say(t0), { kind: "remind", text: "⌚ 02:14 · Tue, Oct 27" });
-  assert.equal(await say(t0 + HOUR_MS - 1, t0, 3 * HOUR_MS), undefined);
-  assert.deepEqual(await say(t0 + HOUR_MS, t0, 20 * 60_000), { kind: "remind", text: "⌚ 03:14 · Tue, Oct 27" });
+  assert.deepEqual(await say(t0), [{ kind: "reminder", text: "⌚ 02:14 · Tue, Oct 27" }]);
+  assert.deepEqual(await say(t0 + HOUR_MS - 1, t0, 3 * HOUR_MS), []);
+  assert.deepEqual(await say(t0 + HOUR_MS, t0, 20 * 60_000), [{ kind: "reminder", text: "⌚ 03:14 · Tue, Oct 27" }]);
   for (const [absenceMs, elapsed] of [[HOUR_MS, "1h"], [6 * HOUR_MS + 20 * 60_000, "6h 20m"], [74 * HOUR_MS, "3d 2h"]] as const) {
-    assert.deepEqual(await say(t0, undefined, absenceMs), { kind: "remind", text: `⌚ 02:14 · Tue, Oct 27\n(${elapsed} since *human* was last present)` });
+    assert.deepEqual(await say(t0, undefined, absenceMs), [{ kind: "reminder", text: `⌚ 02:14 · Tue, Oct 27\n(${elapsed} since *human* was last present)` }]);
   }
-  assert.equal(await say(t0, undefined, undefined, { kind: "wake", source: "resume" }), undefined);
-  assert.equal(await say(t0, undefined, undefined, { kind: "tool", phase: "before", category: "reading", toolName: "read" }), undefined);
+  assert.deepEqual(await say(t0, undefined, undefined, { kind: "wake", source: "resume" }), []);
+  assert.deepEqual(await say(t0, undefined, undefined, { kind: "tool", phase: "before", category: "reading", toolName: "read" }), []);
   for (const invalid of [NaN, Infinity, -Infinity]) {
-    assert.equal(await say(invalid), undefined);
-    assert.deepEqual(await say(t0, invalid, invalid), { kind: "remind", text: "⌚ 02:14 · Tue, Oct 27" });
+    assert.deepEqual(await say(invalid), []);
+    assert.deepEqual(await say(t0, invalid, invalid), [{ kind: "reminder", text: "⌚ 02:14 · Tue, Oct 27" }]);
   }
-  assert.equal(await say(t0, t0 + HOUR_MS), undefined);
+  assert.deepEqual(await say(t0, t0 + HOUR_MS), []);
 });
 
 test("time note replay ignores directory perceptions and follows branch entries", () => {
@@ -499,23 +499,21 @@ test("Pi time awareness sends visible perceptions, throttles hourly and follows 
     writeFileSync(join(dir, "faye.md"), "Faye");
     const session = SessionManager.inMemory();
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-    const sent: { customType: string; content: string; display: boolean; details: { moment: string; timestamp: number } }[] = [];
     let soullessFlag = false;
     let timeaware: boolean | undefined;
     const pi = {
       registerFlag: () => {}, getFlag: () => soullessFlag,
       getSettings: () => ({ soulsDir: dir, defaultSoul: "faye", timeaware }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
-      sendMessage: (message: typeof sent[number]) => sent.push(message),
+      sendMessage: () => assert.fail("a human perception must not enqueue an independent message"),
       registerEntryRenderer: () => {}, registerCommand: () => {},
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, callback); },
     } as unknown as ExtensionAPI;
     extension(pi);
     const ctx = { cwd: dir, model, sessionManager: session, hasUI: true, ui: { notify: () => {}, setStatus: () => {} } };
     const start = async (extra: Record<string, unknown> = {}) => {
-      const result = await handlers.get("before_agent_start")!({ messageType: "user", prompt: "hi", systemPromptOptions: { cwd: dir }, ...extra }, ctx) as { message: typeof sent[number] } | undefined;
+      const result = await handlers.get("before_agent_start")!({ messageType: "user", prompt: "hi", systemPromptOptions: { cwd: dir }, ...extra }, ctx) as BeforeAgentStartEventResult | undefined;
       const message = result?.message;
-      assert.equal(sent.length, 0, "human reminders are returned, not sent separately");
       if (message) session.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
       return message;
     };
@@ -525,7 +523,7 @@ test("Pi time awareness sends visible perceptions, throttles hourly and follows 
     assert.equal(await start(), undefined);
     timeaware = undefined;
     const first = await start();
-    assert.deepEqual(first, { customType: PERCEPTION_MESSAGE_TYPE, display: true, details: { moment: "human", timestamp: t0 }, content: wrapReminder("⌚ 02:14 · Tue, Oct 27") });
+    assert.deepEqual(first, { customType: PERCEPTION_MESSAGE_TYPE, display: true, details: { kinds: ["reminder"], moment: "human", timestamp: t0 }, content: [{ type: "text", text: "⌚ 02:14 · Tue, Oct 27" }] });
     const firstNoteId = session.getLeafId()!;
     assert.equal(await start({ messageType: "custom" }), undefined);
     session.appendMessage({ role: "user", content: "hi", timestamp: t0 });
@@ -536,10 +534,10 @@ test("Pi time awareness sends visible perceptions, throttles hourly and follows 
     // A recent non-time perception must not delay the hourly clock refresh.
     session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "directory", false, { moment: "human" });
     now = t0 + 80 * 60_000;
-    assert.equal((await start())?.content, wrapReminder("⌚ 03:34 · Tue, Oct 27"));
+    assert.deepEqual((await start())?.content, [{ type: "text", text: "⌚ 03:34 · Tue, Oct 27" }]);
     session.appendMessage({ role: "user", content: "back later", timestamp: now });
     now += 2 * HOUR_MS;
-    assert.match((await start())!.content, /\(2h since \*human\* was last present\)/);
+    assert.deepEqual((await start())?.content, [{ type: "text", text: "⌚ 05:34 · Tue, Oct 27\n(2h since *human* was last present)" }]);
     assert.equal(await start(), undefined);
     session.branch(firstNoteId);
     assert.equal(lastTimeNoteTimestamp(session.getBranch()), t0);
