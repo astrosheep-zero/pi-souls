@@ -1,25 +1,19 @@
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { useState } from "react";
-import { Platform, Pressable, Text, View, type LayoutChangeEvent } from "react-native";
+import { Pressable, Text, View, type LayoutChangeEvent } from "react-native";
 import type { PerceptionData } from "../shared/perception.ts";
 import { dayHue, dayPalette, lightness, type Rgb } from "../shared/tint.ts";
 
 const COLLAPSED_LINES = 3;
-const LINE_HEIGHT = 20;
+const LINE_HEIGHT = 19;
 const MAX_DEPTH_SLOTS = 7;
 const DEFAULT_CHARS_PER_LINE = 64;
 const MIST_STEPS: readonly [height: number, alpha: number][] = [
   [5, 0.12],
-  [6, 0.36],
+  [5, 0.36],
   [6, 0.68],
-  [7, 0.94],
+  [6, 0.94],
 ];
-
-const EDITORIAL_FONT = Platform.select({
-  ios: "Georgia",
-  web: '"New York", Georgia, "PingFang SC", "Hiragino Sans GB", "Songti SC", serif',
-  default: "serif",
-});
 
 const hexRgb = (color: string): Rgb | undefined => {
   const hex = /^#([0-9a-f]{6})$/i.exec(color.trim())?.[1];
@@ -80,25 +74,11 @@ export function PerceptionRow({ item, theme, timestamp }: PluginTimelineItemProp
       accessibilityLabel={isLong ? (expanded ? "Collapse perception" : "Expand perception") : undefined}
       aria-expanded={isLong ? expanded : undefined}
       style={({ pressed }) => ({
-        marginVertical: 8,
-        flexDirection: "row",
-        alignItems: "flex-start",
-        gap: 10,
-        paddingLeft: 2,
+        marginVertical: 2,
         opacity: isLong && pressed ? 0.78 : 1,
       })}
     >
-      <View style={{ width: 4, alignItems: "center", paddingTop: 4 }}>
-        <View
-          style={{
-            width: 3,
-            height: 13,
-            borderRadius: 1.5,
-            backgroundColor: ink.tab,
-          }}
-        />
-      </View>
-      <View style={{ flex: 1 }} onLayout={handleBodyLayout}>
+      <View onLayout={handleBodyLayout}>
         <View
           style={
             isLong && !expanded
@@ -109,10 +89,9 @@ export function PerceptionRow({ item, theme, timestamp }: PluginTimelineItemProp
           <Text
             style={{
               color: expanded ? ink.text : ink.softText,
-              fontFamily: EDITORIAL_FONT,
               fontSize: 13,
               lineHeight: LINE_HEIGHT,
-              letterSpacing: 0.15,
+              letterSpacing: 0.1,
             }}
             selectable={expanded}
           >
@@ -127,7 +106,7 @@ export function PerceptionRow({ item, theme, timestamp }: PluginTimelineItemProp
           ) : null}
         </View>
         {isLong ? (
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginTop: expanded ? 9 : 5 }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginTop: expanded ? 8 : 5 }}>
             {Array.from({ length: totalSlots }).map((_, i) => (
               <View
                 key={i}

@@ -73,14 +73,13 @@ function renderBlock(block: string, contentWidth: number, pad: string, ink: Ink,
   const fade = [ink.text, ink.softText, ink.fadeText];
   const out = visible.map((line, i) => {
     const body = expanded || !isLong ? ink.text : fade[Math.min(i, fade.length - 1)]!;
-    if (!line) return i === 0 ? `${pad}${ink.tab("┃")}` : "";
-    return `${pad}${i === 0 ? ink.tab("┃") : " "} ${body(line)}`;
+    return line ? `${pad}${body(line)}` : "";
   });
   if (isLong) {
     const totalSlots = Math.min(MAX_DEPTH_SLOTS, Math.max(2, Math.ceil(wrapped.length / COLLAPSED_LINES)));
     const litSlots = expanded ? totalSlots : 1;
     const gauge = `${ink.tab("━".repeat(litSlots * 2))}${ink.hair("─".repeat((totalSlots - litSlots) * 2))}${expanded ? ink.tab(" ▴") : ""}`;
-    out.push(`${pad}  ${truncateToWidth(gauge, contentWidth, "")}`);
+    out.push(`${pad}${truncateToWidth(gauge, contentWidth, "")}`);
   }
   return out;
 }
@@ -107,7 +106,7 @@ export function registerPresenceUI(pi: ExtensionAPI): void {
       invalidate() {},
       render(width: number): string[] {
         const ink = inkFor(theme, at);
-        const contentWidth = Math.max(1, width - (pad.length + 2));
+        const contentWidth = Math.max(1, width - pad.length);
         const out: string[] = [];
         for (const block of blocks) {
           if (out.length) out.push("");
