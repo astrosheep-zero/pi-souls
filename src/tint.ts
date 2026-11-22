@@ -2,23 +2,27 @@
  * A perception's day tint: one hue per local calendar day, calibrated in OKLCH so every
  * hue carries the same quiet editorial weight in both dark and light themes.
  */
-export const DAY_CHROMA = 0.052;
+export const DAY_CHROMA = 0.044;
 
 export interface DayPalette {
-  rule: Rgb;
+  tab: Rgb;
   text: Rgb;
+  softText: Rgb;
+  hair: Rgb;
   faint: Rgb;
 }
 
-const clampL = (L: number) => Math.min(0.95, Math.max(0.14, L));
+const clampL = (L: number) => Math.min(0.95, Math.max(0.12, L));
 
-/** Derive the quiet editorial palette from a theme's muted and foreground lightness. */
-export function dayPalette(mutedL: number, textL: number, hue: number): DayPalette {
-  const dir = textL - mutedL;
+/** Derive the index-tab editorial palette from a theme's background, muted, and foreground lightness. */
+export function dayPalette(bgL: number, mutedL: number, textL: number, hue: number): DayPalette {
+  const lerp = (t: number) => clampL(bgL + (mutedL - bgL) * t);
   return {
-    rule: oklch(clampL(mutedL - dir * 0.22), DAY_CHROMA, hue),
-    text: oklch(clampL(mutedL + dir * 0.16), 0.022, hue),
-    faint: oklch(clampL(mutedL - dir * 0.3), 0.028, hue),
+    tab: oklch(clampL(mutedL + (textL - mutedL) * 0.08), DAY_CHROMA, hue),
+    text: oklch(clampL(mutedL + (textL - mutedL) * 0.14), 0.011, hue),
+    softText: oklch(lerp(0.86), 0.011, hue),
+    hair: oklch(lerp(0.46), 0.024, hue),
+    faint: oklch(lerp(0.62), 0.016, hue),
   };
 }
 
