@@ -1,8 +1,26 @@
 /**
- * A perception's day tint: one hue per local calendar day, at a chroma too low to name.
- * OKLCH keeps every hue equally light and equally faint, so no day reads louder than another.
+ * A perception's day tint: one hue per local calendar day, calibrated in OKLCH so every
+ * hue carries the same quiet editorial weight in both dark and light themes.
  */
-export const DAY_CHROMA = 0.007;
+export const DAY_CHROMA = 0.052;
+
+export interface DayPalette {
+  rule: Rgb;
+  text: Rgb;
+  faint: Rgb;
+}
+
+const clampL = (L: number) => Math.min(0.95, Math.max(0.14, L));
+
+/** Derive the quiet editorial palette from a theme's muted and foreground lightness. */
+export function dayPalette(mutedL: number, textL: number, hue: number): DayPalette {
+  const dir = textL - mutedL;
+  return {
+    rule: oklch(clampL(mutedL - dir * 0.22), DAY_CHROMA, hue),
+    text: oklch(clampL(mutedL + dir * 0.16), 0.022, hue),
+    faint: oklch(clampL(mutedL - dir * 0.3), 0.028, hue),
+  };
+}
 
 /** FNV-1a over `YYYY-MM-DD`, finished with murmur's fmix32: neighbouring days land far apart. */
 export function dayHue(at: Date): number {
