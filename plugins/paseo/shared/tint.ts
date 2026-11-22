@@ -8,8 +8,8 @@ export interface DayPalette {
   tab: Rgb;
   text: Rgb;
   softText: Rgb;
+  fadeText: Rgb;
   hair: Rgb;
-  faint: Rgb;
 }
 
 const clampL = (L: number) => Math.min(0.95, Math.max(0.12, L));
@@ -21,8 +21,8 @@ export function dayPalette(bgL: number, mutedL: number, textL: number, hue: numb
     tab: oklch(clampL(mutedL + (textL - mutedL) * 0.08), DAY_CHROMA, hue),
     text: oklch(clampL(mutedL + (textL - mutedL) * 0.14), 0.011, hue),
     softText: oklch(lerp(0.86), 0.011, hue),
+    fadeText: oklch(lerp(0.46), 0.010, hue),
     hair: oklch(lerp(0.46), 0.024, hue),
-    faint: oklch(lerp(0.62), 0.016, hue),
   };
 }
 

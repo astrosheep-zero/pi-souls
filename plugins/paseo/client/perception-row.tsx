@@ -5,12 +5,19 @@ import type { PerceptionData } from "../shared/perception.ts";
 import { dayHue, dayPalette, lightness, type Rgb } from "../shared/tint.ts";
 
 const COLLAPSED_LINES = 3;
+const LINE_HEIGHT = 20;
 const MAX_DEPTH_SLOTS = 7;
 const DEFAULT_CHARS_PER_LINE = 64;
+const MIST_STEPS: readonly [height: number, alpha: number][] = [
+  [5, 0.12],
+  [6, 0.36],
+  [6, 0.68],
+  [7, 0.94],
+];
 
 const EDITORIAL_FONT = Platform.select({
   ios: "Georgia",
-  web: '"New York", Georgia, "Songti SC", "STSong", "Noto Serif SC", serif',
+  web: '"New York", Georgia, "PingFang SC", "Hiragino Sans GB", "Songti SC", serif',
   default: "serif",
 });
 
@@ -41,11 +48,11 @@ function inkFor(theme: PluginTimelineItemProps["theme"], at: Date) {
   const fg = hexRgb(theme.colors.foreground) ?? [244, 244, 245];
   const palette = dayPalette(lightness(bg), lightness(muted), lightness(fg), dayHue(at));
   return {
+    bg,
     tab: css(palette.tab),
     text: css(palette.text),
     softText: css(palette.softText),
     hair: css(palette.hair),
-    faint: css(palette.faint),
   };
 }
 
@@ -81,7 +88,7 @@ export function PerceptionRow({ item, theme, timestamp }: PluginTimelineItemProp
         opacity: isLong && pressed ? 0.78 : 1,
       })}
     >
-      <View style={{ width: 6, alignItems: "center", paddingTop: 4 }}>
+      <View style={{ width: 4, alignItems: "center", paddingTop: 4 }}>
         <View
           style={{
             width: 3,
@@ -90,32 +97,37 @@ export function PerceptionRow({ item, theme, timestamp }: PluginTimelineItemProp
             backgroundColor: ink.tab,
           }}
         />
-        {isLong ? (
-          <>
-            <View style={{ width: 2, height: 2, borderRadius: 1, backgroundColor: ink.hair, marginTop: 6 }} />
-            <View style={{ width: 2, height: 2, borderRadius: 1, backgroundColor: ink.hair, marginTop: 6 }} />
-            {expanded ? (
-              <View style={{ width: 2, height: 2, borderRadius: 1, backgroundColor: ink.hair, marginTop: 6 }} />
-            ) : null}
-          </>
-        ) : null}
       </View>
       <View style={{ flex: 1 }} onLayout={handleBodyLayout}>
-        <Text
-          style={{
-            color: expanded ? ink.text : ink.softText,
-            fontFamily: EDITORIAL_FONT,
-            fontSize: 13,
-            lineHeight: 20,
-            letterSpacing: 0.15,
-          }}
-          numberOfLines={expanded || !isLong ? undefined : COLLAPSED_LINES}
-          selectable={expanded}
+        <View
+          style={
+            isLong && !expanded
+              ? { position: "relative", maxHeight: COLLAPSED_LINES * LINE_HEIGHT, overflow: "hidden" }
+              : undefined
+          }
         >
-          {item.data.text}
-        </Text>
+          <Text
+            style={{
+              color: expanded ? ink.text : ink.softText,
+              fontFamily: EDITORIAL_FONT,
+              fontSize: 13,
+              lineHeight: LINE_HEIGHT,
+              letterSpacing: 0.15,
+            }}
+            selectable={expanded}
+          >
+            {item.data.text}
+          </Text>
+          {isLong && !expanded ? (
+            <View pointerEvents="none" style={{ position: "absolute", left: 0, right: 0, bottom: 0 }}>
+              {MIST_STEPS.map(([height, alpha], i) => (
+                <View key={i} style={{ height, backgroundColor: css(ink.bg, alpha) }} />
+              ))}
+            </View>
+          ) : null}
+        </View>
         {isLong ? (
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginTop: expanded ? 9 : 6 }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginTop: expanded ? 9 : 5 }}>
             {Array.from({ length: totalSlots }).map((_, i) => (
               <View
                 key={i}
@@ -128,7 +140,9 @@ export function PerceptionRow({ item, theme, timestamp }: PluginTimelineItemProp
                 }}
               />
             ))}
-            {expanded ? <Text style={{ color: ink.faint, fontSize: 10, marginLeft: 4 }}>▴</Text> : null}
+            {expanded ? (
+              <Text style={{ color: ink.tab, opacity: 0.78, fontSize: 10.5, marginLeft: 4 }}>▴</Text>
+            ) : null}
           </View>
         ) : null}
       </View>

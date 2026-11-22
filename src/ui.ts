@@ -17,8 +17,8 @@ type Ink = {
   tab(s: string): string;
   text(s: string): string;
   softText(s: string): string;
+  fadeText(s: string): string;
   hair(s: string): string;
-  faint(s: string): string;
 };
 
 const TRUECOLOR = /\x1b\[38;2;(\d+);(\d+);(\d+)m/;
@@ -39,8 +39,8 @@ function inkFor(theme: RenderTheme, at: Date): Ink {
       tab: (s) => theme.fg("borderMuted", s),
       text: (s) => theme.fg("muted", s),
       softText: (s) => theme.fg("muted", s),
+      fadeText: (s) => theme.fg("dim", s),
       hair: (s) => theme.fg("dim", s),
-      faint: (s) => theme.fg("dim", s),
     };
   }
   const mutedL = lightness(muted);
@@ -52,8 +52,8 @@ function inkFor(theme: RenderTheme, at: Date): Ink {
     tab: paint(palette.tab),
     text: paint(palette.text),
     softText: paint(palette.softText),
+    fadeText: paint(palette.fadeText),
     hair: paint(palette.hair),
-    faint: paint(palette.faint),
   };
 }
 
@@ -70,16 +70,16 @@ function renderBlock(block: string, contentWidth: number, pad: string, ink: Ink,
   }
   const isLong = wrapped.length > COLLAPSED_LINES;
   const visible = expanded || !isLong ? wrapped : wrapped.slice(0, COLLAPSED_LINES);
-  const body = expanded ? ink.text : ink.softText;
+  const fade = [ink.text, ink.softText, ink.fadeText];
   const out = visible.map((line, i) => {
-    const marker = i === 0 ? ink.tab("┃") : isLong && i % 2 === 1 ? ink.hair("·") : " ";
-    if (!line) return marker === " " ? "" : `${pad}${marker}`;
-    return `${pad}${marker} ${body(line)}`;
+    const body = expanded || !isLong ? ink.text : fade[Math.min(i, fade.length - 1)]!;
+    if (!line) return i === 0 ? `${pad}${ink.tab("┃")}` : "";
+    return `${pad}${i === 0 ? ink.tab("┃") : " "} ${body(line)}`;
   });
   if (isLong) {
     const totalSlots = Math.min(MAX_DEPTH_SLOTS, Math.max(2, Math.ceil(wrapped.length / COLLAPSED_LINES)));
     const litSlots = expanded ? totalSlots : 1;
-    const gauge = `${ink.tab("━".repeat(litSlots * 2))}${ink.hair("─".repeat((totalSlots - litSlots) * 2))}${expanded ? ink.faint(" ▴") : ""}`;
+    const gauge = `${ink.tab("━".repeat(litSlots * 2))}${ink.hair("─".repeat((totalSlots - litSlots) * 2))}${expanded ? ink.tab(" ▴") : ""}`;
     out.push(`${pad}  ${truncateToWidth(gauge, contentWidth, "")}`);
   }
   return out;

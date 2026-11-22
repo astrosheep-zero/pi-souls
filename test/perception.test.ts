@@ -805,7 +805,7 @@ test("Pi builtin and directory perceptions share a human moment and fail indepen
     );
     assert.deepEqual(folded.render(120).map((line: string) => line.trimEnd()), [
       "  ┃ [some other faye]",
-      "  ·",
+      "",
       "    *pokes screen* `` [too slow] ``",
       "    ━━──",
     ]);
@@ -816,9 +816,9 @@ test("Pi builtin and directory perceptions share a human moment and fail indepen
     );
     assert.deepEqual(unfolded.render(120).map((line: string) => line.trimEnd()), [
       "  ┃ [some other faye]",
-      "  ·",
+      "",
       "    *pokes screen* `` [too slow] ``",
-      "  · \"hey copy\"",
+      "    \"hey copy\"",
       "    line 4",
       "    ━━━━ ▴",
     ]);
