@@ -11,6 +11,16 @@ export function unwrapReminder(text: string): string {
     : text;
 }
 
+const isUtteranceKind = (value: unknown): boolean =>
+  value === "reminder" || value === "user" || value === "assistant";
+
+/** New pi-souls carriers store raw text and record `kind` (wake/tool) or `kinds` (human batch) in details. */
+export function storesRawPerceptionText(details: unknown): boolean {
+  if (!details || typeof details !== "object" || Array.isArray(details)) return false;
+  const { kind, kinds } = details as { kind?: unknown; kinds?: unknown };
+  return isUtteranceKind(kind) || (Array.isArray(kinds) && kinds.length > 0 && kinds.every(isUtteranceKind));
+}
+
 export const PERCEPTION_KIND = "perception";
 
 export const perceptionSchema = z.object({

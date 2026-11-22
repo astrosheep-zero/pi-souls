@@ -1,5 +1,5 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { PERCEPTION_KIND, PERCEPTION_MESSAGE_TYPE, unwrapReminder } from "../shared/perception.ts";
+import { PERCEPTION_KIND, PERCEPTION_MESSAGE_TYPE, storesRawPerceptionText, unwrapReminder } from "../shared/perception.ts";
 
 type Transformer = Extract<Parameters<PluginClientContext["addTimelineTransformer"]>[0], { query: { itemType: "tool_call" } }>;
 type Source = Parameters<Transformer["transform"]>[0];
@@ -16,7 +16,8 @@ export const perceptionTransformer = {
     ) {
       return undefined;
     }
-    const text = unwrapReminder(item.detail.text).trim();
+    const raw = item.detail.text;
+    const text = (storesRawPerceptionText(item.metadata.details) ? raw : unwrapReminder(raw)).trim();
     if (!text) return undefined;
     return {
       items: [{
