@@ -1,44 +1,38 @@
 /**
- * A perception's day tint: one hue per local calendar day, calibrated in OKLCH so every
- * hue carries the same quiet editorial weight in both dark and light themes.
+ * Circadian light tint for perceptions: smoothly drifts through dawn, daylight, dusk, and deep night
+ * in OKLCH space while bypassing muddy yellow/olive angles [62°, 162°).
  */
-export const DAY_CHROMA = 0.044;
-
-export interface DayPalette {
-  tab: Rgb;
-  text: Rgb;
-  softText: Rgb;
-  fadeText: Rgb;
-  hair: Rgb;
-}
-
-const clampL = (L: number) => Math.min(0.95, Math.max(0.12, L));
-
-/** Derive the index-tab editorial palette from a theme's background, muted, and foreground lightness. */
-export function dayPalette(bgL: number, mutedL: number, textL: number, hue: number): DayPalette {
-  const lerp = (t: number) => clampL(bgL + (mutedL - bgL) * t);
-  return {
-    tab: oklch(clampL(mutedL + (textL - mutedL) * 0.08), DAY_CHROMA, hue),
-    text: oklch(clampL(mutedL + (textL - mutedL) * 0.14), 0.011, hue),
-    softText: oklch(lerp(0.86), 0.011, hue),
-    fadeText: oklch(lerp(0.46), 0.010, hue),
-    hair: oklch(lerp(0.46), 0.024, hue),
-  };
-}
-
-/** FNV-1a over `YYYY-MM-DD`, finished with murmur's fmix32: neighbouring days land far apart. */
-export function dayHue(at: Date): number {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const day = `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
-  let h = 0x811c9dc5;
-  for (let i = 0; i < day.length; i++) h = Math.imul(h ^ day.charCodeAt(i), 0x01000193);
-  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b);
-  h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35);
-  h ^= h >>> 16;
-  return (h >>> 0) % 360;
-}
-
 export type Rgb = [number, number, number];
+
+// Keyframes [localHour, unwrappedHue] on [196°, 420°] (>360° wraps cleanly into [0°, 60°]).
+const CIRCADIAN_STOPS: readonly [hour: number, hue: number][] = [
+  [0, 248],    // 00:00 midnight sapphire
+  [2.5, 196],  // 02:30 deep-night ice cyan
+  [4.75, 276], // 04:45 pre-dawn indigo
+  [6.5, 344],  // 06:30 dawn sakura
+  [9, 400],    // 09:00 (40°) morning apricot
+  [12, 420],   // 12:00 (60°) midday warm gold
+  [15.5, 404], // 15:30 (44°) afternoon honey
+  [18, 368],   // 18:00 (8°) sunset rose-coral
+  [20, 322],   // 20:00 dusk orchid
+  [22, 284],   // 22:00 evening violet
+  [24, 248],   // 24:00 midnight wrap
+];
+
+/** Continuous 24-hour local circadian hue in [0, 360), never entering muddy [62°, 162°). */
+export function timeHue(at: Date): number {
+  const hour = at.getHours() + at.getMinutes() / 60 + at.getSeconds() / 3600;
+  for (let i = 0; i < CIRCADIAN_STOPS.length - 1; i++) {
+    const [h0, u0] = CIRCADIAN_STOPS[i]!;
+    const [h1, u1] = CIRCADIAN_STOPS[i + 1]!;
+    if (hour >= h0 && hour <= h1) {
+      const t = (hour - h0) / (h1 - h0);
+      const ease = 0.5 - 0.5 * Math.cos(Math.PI * t);
+      return (((u0 + (u1 - u0) * ease) % 360) + 360) % 360;
+    }
+  }
+  return 248;
+}
 
 const toLinear = (c: number) => (c /= 255) <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
 const toByte = (c: number) => Math.round(255 * Math.min(1, Math.max(0,

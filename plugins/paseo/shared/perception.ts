@@ -25,6 +25,7 @@ export const PERCEPTION_KIND = "perception";
 
 export const perceptionSchema = z.object({
   text: z.string().min(1),
+  at: z.number().finite().optional(),
 });
 
 export type PerceptionData = z.infer<typeof perceptionSchema>;

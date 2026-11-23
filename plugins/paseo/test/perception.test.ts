@@ -3,6 +3,7 @@ import test from "node:test";
 import { wrapReminder } from "../../../src/utterance.ts";
 import { perceptionTransformer } from "../client/perception-transformer.ts";
 import { PERCEPTION_MESSAGE_TYPE, perceptionSchema } from "../shared/perception.ts";
+import { timeHue } from "../shared/tint.ts";
 
 function makeItem(text: string, details?: Record<string, unknown>, customType = PERCEPTION_MESSAGE_TYPE) {
   return {
@@ -66,4 +67,33 @@ test("preserves literal <system-reminder> tags on raw-text utterance carriers", 
     perceptionTransformer.transform({ item: makeItem("   ", { kind: "user", moment: "wake" }) }),
     undefined,
   );
+});
+
+test("forwards finite details.timestamp as data.at and omits it when absent", () => {
+  const withTs = perceptionTransformer.transform({
+    item: makeItem("⌚ 07:47", { kind: "reminder", timestamp: 1761502440000 }),
+  });
+  assert.deepEqual(perceptionSchema.parse(withTs!.items[0]!.data), {
+    text: "⌚ 07:47",
+    at: 1761502440000,
+  });
+
+  const withoutTs = perceptionTransformer.transform({
+    item: makeItem("⌚ 07:47", { kind: "reminder" }),
+  });
+  assert.deepEqual(perceptionSchema.parse(withoutTs!.items[0]!.data), { text: "⌚ 07:47" });
+});
+
+test("timeHue drifts continuously across 24h while avoiding muddy yellow-green angles", () => {
+  for (let m = 0; m < 24 * 60; m += 15) {
+    const hue = timeHue(new Date(2026, 10, 23, Math.floor(m / 60), m % 60));
+    assert.ok(hue >= 0 && hue < 360, `out of range: ${hue}`);
+    assert.ok(hue < 62 || hue >= 162, `landed in muddy zone at ${m}m: ${hue}`);
+  }
+  const justBeforeMidnight = timeHue(new Date(2026, 10, 23, 23, 59, 59));
+  const midnight = timeHue(new Date(2026, 10, 24, 0, 0, 0));
+  assert.ok(Math.abs(justBeforeMidnight - midnight) < 1, "midnight wrap must be continuous");
+
+  const samples = [2, 6, 12, 18, 22].map((h) => Math.round(timeHue(new Date(2026, 10, 23, h, 30))));
+  assert.equal(new Set(samples).size, samples.length, "key phases of day must be distinct");
 });

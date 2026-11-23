@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { PERCEPTION_MESSAGE_TYPE } from "./perception.ts";
 import { dividerText, FOOTER_KEY, PRESENCE_ENTRY_TYPE } from "./presence.ts";
-import { dayHue, dayPalette, lightness, type Rgb } from "./tint.ts";
+import { lightness, oklch, timeHue, type Rgb } from "./tint.ts";
 import { isUtteranceKind, unwrapReminder } from "./utterance.ts";
 
 const COLLAPSED_LINES = 3;
@@ -28,7 +28,7 @@ const rgbOf = (ansi: string): Rgb | undefined => {
 };
 
 /**
- * Index-tab editorial ink: today's OKLCH hue calibrated to the theme's muted and foreground
+ * Circadian editorial ink: local-time OKLCH hue calibrated to the theme's muted and foreground
  * lightness. Falls back cleanly to theme roles when truecolor ANSI is unavailable.
  */
 function inkFor(theme: RenderTheme, at: Date): Ink {
@@ -46,14 +46,16 @@ function inkFor(theme: RenderTheme, at: Date): Ink {
   const mutedL = lightness(muted);
   const textL = text ? lightness(text) : mutedL < 0.55 ? 0.22 : 0.89;
   const bgL = textL > mutedL ? 0.19 : 0.98;
-  const palette = dayPalette(bgL, mutedL, textL, dayHue(at));
+  const clampL = (L: number) => Math.min(0.95, Math.max(0.12, L));
+  const lerp = (t: number) => clampL(bgL + (mutedL - bgL) * t);
+  const hue = timeHue(at);
   const paint = (rgb: Rgb) => (s: string) => `\x1b[38;2;${rgb.join(";")}m${s}\x1b[39m`;
   return {
-    tab: paint(palette.tab),
-    text: paint(palette.text),
-    softText: paint(palette.softText),
-    fadeText: paint(palette.fadeText),
-    hair: paint(palette.hair),
+    tab: paint(oklch(clampL(mutedL + (textL - mutedL) * 0.10), 0.068, hue)),
+    text: paint(oklch(clampL(mutedL + (textL - mutedL) * 0.14), 0.011, hue)),
+    softText: paint(oklch(lerp(0.86), 0.011, hue)),
+    fadeText: paint(oklch(lerp(0.46), 0.010, hue)),
+    hair: paint(oklch(lerp(0.46), 0.028, hue)),
   };
 }
 
@@ -90,7 +92,7 @@ export function registerPresenceUI(pi: ExtensionAPI): void {
     return text === undefined ? undefined : new Text(theme.fg("dim", text), 0, 0);
   });
   pi.registerMessageRenderer?.(PERCEPTION_MESSAGE_TYPE, (message, options, theme) => {
-    const details = message.details as { kind?: unknown; kinds?: unknown } | undefined;
+    const details = message.details as { kind?: unknown; kinds?: unknown; timestamp?: unknown } | undefined;
     const storesRawText = isUtteranceKind(details?.kind)
       || (Array.isArray(details?.kinds) && details.kinds.length > 0 && details.kinds.every(isUtteranceKind));
     const rawBlocks = typeof message.content === "string"
@@ -101,7 +103,12 @@ export function registerPresenceUI(pi: ExtensionAPI): void {
       .filter(Boolean);
     if (!blocks.length) return undefined;
     const pad = " ".repeat((options.outputPad ?? 1) + 1);
-    const at = new Date(typeof message.timestamp === "number" ? message.timestamp : Date.now());
+    const ts = typeof details?.timestamp === "number" && Number.isFinite(details.timestamp)
+      ? details.timestamp
+      : typeof message.timestamp === "number" && Number.isFinite(message.timestamp)
+        ? message.timestamp
+        : Date.now();
+    const at = new Date(ts);
     return {
       invalidate() {},
       render(width: number): string[] {
