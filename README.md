@@ -9,25 +9,31 @@ pi install npm:@astrosheep/pi-souls
 ## Usage
 
 ```text
-/soul          # current soul and list
-/soul @faye    # use faye for this session
-/soul clear    # disable souls for this session
-/soul reset    # follow defaults again
-/soul reload   # re-read the active SOUL and its perception
+/soul            # current soul and list
+/soul @faye      # use faye for this session
+/soul naked      # toggle naked mode (system prompt = soul only)
+/soul naked on   # enable naked mode for this session
+/soul naked off  # disable naked mode for this session
+/soul clear      # disable souls for this session
+/soul reset      # follow defaults again
+/soul reload     # re-read the active SOUL and its perception
 ```
 
-Tab-complete offers `@name`, `clear`, `reset`, and `reload`. Soul names matching commands are selected with `@`, such as `@clear` or `@reset`.
+Tab-complete offers `@name`, `naked` (plus `naked on` / `naked off`), `clear`, `reset`, and `reload`. Soul names matching commands are selected with `@`, such as `@naked`, `@clear`, or `@reset`.
 
-`/soul clear` keeps souls off for this session, including model changes, resume, and fork. `/soul reset` removes that override and any manual soul selection, restoring model and global defaults. `/soul @<name>` selects a soul again after clearing.
+`/soul clear` keeps souls off for this session, including model changes, resume, and fork. `/soul reset` removes that override, any manual soul selection, and any session naked override, restoring model, global, and CLI defaults. `/soul @<name>` selects a soul again after clearing.
 
 `/soul reload` validates the active body and Liquid fragments, refreshes the footer, and reloads its perception on the next moment. It changes no selection and starts no model request; the next request uses the current soul body.
 
 ```bash
 pi --soulless
 SOULLESS=1 pi
+pi --naked
 ```
 
-Skip settings souls for this process. `SOULLESS=1` or `true` enables it; `0`, `false`, or unset does not. A session `/soul @<name>` still wins, including resumed selections. `/soul clear` disables souls for the session; `/soul reset` follows defaults, which remain off while this flag is set.
+`--soulless` (`SOULLESS=1` or `true`) skips settings souls for this process; `0`, `false`, or unset does not. A session `/soul @<name>` still wins, including resumed selections. `/soul clear` disables souls for the session; `/soul reset` follows defaults, which remain off while this flag is set.
+
+`--naked` strips the request system prompt down to the active soul body only (dropping Pi's built-in sections, project context, skills, cwd, extension sections, and forced addenda while keeping tool declarations intact). When no soul is active, naked mode leaves Pi's prompt untouched. `/soul naked` (or `/soul naked on` / `/soul naked off`) overrides `--naked` for the active branch, including resume, fork, and tree navigation; `/soul reset` returns to the `--naked` default.
 
 ## Souls
 

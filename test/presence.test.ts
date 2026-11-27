@@ -32,7 +32,7 @@ function setup(files: Record<string, string>, settings: Record<string, unknown> 
 
   const pi = {
     registerFlag: () => {},
-    getFlag: () => flag,
+    getFlag: (name: string) => name === "soulless" && flag,
     getSettings: () => config,
     appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
     sendMessage: (message: { customType: string; content: string; display: boolean; details?: unknown }) => {

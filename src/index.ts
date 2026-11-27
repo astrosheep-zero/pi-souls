@@ -2,9 +2,9 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { buildSessionProjection, type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext, type ProjectedSessionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { applySoul, replaceForcedPreamble } from "./prompt.ts";
+import { applyNakedSoul, applySoul, replaceForcedPreamble } from "./prompt.ts";
 import { footerText, resolvePresence, resolvePerception, selectionPresence, type Presence } from "./presence.ts";
-import { ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveSoul, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
+import { ENTRY_TYPE, NAKED_ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveNaked, resolveSoul, sessionNaked, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
 import { timePerception } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, readTransition, sameTransition, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
@@ -24,10 +24,14 @@ const wakeSource = (reason: string): Extract<Moment, { kind: "wake" }>["source"]
   return undefined;
 };
 
-function describe(selection: Selection | undefined, model: ExtensionContext["model"], suppressed = false, soulless = false): string {
-  if (!selection) return soulless ? "none (soulless)" : suppressed ? "none (custom prompt)" : "none";
-  if (selection.source === "model") return `${selection.name} (${model?.provider}/${model?.id})`;
-  return `${selection.name} (${selection.source})`;
+function describe(selection: Selection | undefined, model: ExtensionContext["model"], suppressed = false, soulless = false, naked = false): string {
+  const suffix = (detail?: string) => {
+    const parts = [detail, naked ? "naked" : undefined].filter(Boolean);
+    return parts.length ? ` (${parts.join(", ")})` : "";
+  };
+  if (!selection) return `none${suffix(soulless ? "soulless" : suppressed ? "custom prompt" : undefined)}`;
+  const source = selection.source === "model" ? `${model?.provider}/${model?.id}` : selection.source;
+  return `${selection.name}${suffix(source)}`;
 }
 
 type Ephemeral = {
@@ -89,7 +93,10 @@ function toolBatches(messages: readonly AgentMessage[]) {
 export default function soulsExtension(pi: ExtensionAPI) {
   registerPresenceUI(pi);
   pi.registerFlag("soulless", { description: "Skip default souls (session /soul still wins)", type: "boolean", default: false });
+  pi.registerFlag("naked", { description: "Naked soul mode: system prompt contains only the soul", type: "boolean", default: false });
   const soulless = () => pi.getFlag("soulless") === true || /^(1|true)$/i.test(process.env.SOULLESS ?? "");
+  const nakedFlag = () => pi.getFlag("naked") === true;
+  const isNaked = (branch: readonly SessionEntry[]) => resolveNaked(sessionNaked(branch), nakedFlag());
   // Argument completion has no context; remember where the session runs for relative soulsDir.
   let cwd = process.cwd();
   // A problem is reported when it appears or changes, not on every request of a tool loop.
@@ -103,7 +110,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   };
   // What the projection handler learned for this request, read by the transition handler.
   let projection: { known: boolean; soul: string | null } | undefined;
-  let forceReported = false;
+  let forceReported: string | undefined;
   // ExtensionContext has no system-prompt options before a run or command; track what the host told us.
   let promptKnown = false;
   let seenPrompt: string | undefined;
@@ -216,19 +223,20 @@ export default function soulsExtension(pi: ExtensionAPI) {
   const refreshFooter = (ctx: ExtensionContext, customPrompt: string | undefined, model = ctx.model, known = promptKnown): void => {
     try {
       const config = readConfig(pi.getSettings(), ctx.cwd);
-      const selection = resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), model, soulless());
+      const branch = ctx.sessionManager.getBranch();
+      const selection = resolveSoul(config, sessionSoul(branch), model, soulless());
       // Before the host reports prompt options, only a session choice is provably effective.
       if (!known && selection && selection.source !== "session") {
         setFooter(ctx, undefined);
         return;
       }
-      setFooter(ctx, footerText(selectionPresence(config, effectiveSoul(selection, customPrompt), soulVariables(ctx))));
+      setFooter(ctx, footerText(selectionPresence(config, effectiveSoul(selection, customPrompt), soulVariables(ctx)), isNaked(branch)));
     } catch {
       setFooter(ctx, undefined);
     }
   };
   pi.on("session_start", (event, ctx) => {
-    cwd = ctx.cwd; reported = undefined; forceReported = false;
+    cwd = ctx.cwd; reported = undefined; forceReported = undefined;
     options = undefined; running = false; ephemerals = [];
     projection = undefined; forcedProjection = undefined;
     promptKnown = false; seenPrompt = undefined;
@@ -281,13 +289,17 @@ export default function soulsExtension(pi: ExtensionAPI) {
     const basePreamble = previous.basePreamble;
     try {
       const config = readConfig(pi.getSettings(), ctx.cwd);
-      const selection = effectiveSoul(resolveSoul(config, sessionSoul(ctx.sessionManager.getBranch()), ctx.model, soulless()), options.customPrompt);
-      if (!selection || basePreamble === undefined) {
+      const branch = ctx.sessionManager.getBranch();
+      const selection = effectiveSoul(resolveSoul(config, sessionSoul(branch), ctx.model, soulless()), options.customPrompt);
+      const naked = isNaked(branch);
+      if (!selection || (!naked && basePreamble === undefined)) {
         options.forceSystemPrompt = previous.original;
         return;
       }
       const body = readSoul(config.dir, selection.name, soulVariables(ctx)).body;
-      const projected = previous.original.includes(basePreamble) ? previous.original.replace(basePreamble, () => body) : previous.original;
+      const projected = naked
+        ? body
+        : previous.original.includes(basePreamble!) ? previous.original.replace(basePreamble!, () => body) : previous.original;
       options.forceSystemPrompt = projected;
       forcedProjection = { original: previous.original, projected, body, basePreamble };
     } catch {
@@ -297,12 +309,22 @@ export default function soulsExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("soul", {
-    description: "Soul: /soul [@name|clear|reset|reload]",
+    description: "Soul: /soul [@name|naked|clear|reset|reload]",
     getArgumentCompletions: (prefix) => {
       try {
+        const leading = prefix.trimStart();
+        if (leading.startsWith("naked ")) {
+          const modes = [
+            { value: "naked on", label: "naked on", description: "System prompt contains only the soul" },
+            { value: "naked off", label: "naked off", description: "Restore full system prompt" },
+          ];
+          const matches = modes.filter((item) => item.value.startsWith(leading));
+          return matches.length ? matches : null;
+        }
         const souls = listSouls(readConfig(pi.getSettings(), cwd).dir).map((name) => ({ value: `@${name}`, label: `@${name}` }));
         const items = [
           ...souls,
+          { value: "naked", label: "naked", description: "Toggle naked mode (system prompt = soul only)" },
           { value: "clear", label: "clear", description: "Disable souls for this session" },
           { value: "reset", label: "reset", description: "Follow defaults again" },
           { value: "reload", label: "reload", description: "Re-read the active soul and perception" },
@@ -327,6 +349,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         const override = () => sessionSoul(ctx.sessionManager.getBranch());
         const resolved = () => resolveSoul(config, override(), ctx.model, soulless());
         const active = () => effectiveSoul(resolved(), prompt);
+        const naked = () => isNaked(ctx.sessionManager.getBranch());
         const activeName = () => {
           try {
             return active()?.name;
@@ -347,23 +370,56 @@ export default function soulsExtension(pi: ExtensionAPI) {
         const now = () => {
           const configured = resolved();
           const selection = effectiveSoul(configured, prompt);
-          return describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null);
+          return describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null, naked());
         };
+
+        if (input === "naked" || input === "naked on" || input === "naked off") {
+          let current: boolean;
+          let corrupted = false;
+          try {
+            current = naked();
+          } catch {
+            current = nakedFlag();
+            corrupted = true;
+          }
+          const target = input === "naked" ? !current : input === "naked on";
+          if (!corrupted && current === target) {
+            refresh();
+            return notify(`${target ? "Already naked" : "Already not naked"}. Soul: ${now()}`);
+          }
+          pi.appendEntry(NAKED_ENTRY_TYPE, { version: 1, naked: target });
+          refresh();
+          const note = target && !active() ? " (no active soul)" : "";
+          return notify(`Naked: ${target ? "on" : "off"}${note}. Soul: ${now()}`);
+        }
 
         if (input === "clear" || input === "reset") {
           const target = input === "clear" ? null : undefined;
-          let unchanged = false;
+          let soulUnchanged = false;
           try {
-            unchanged = override() === target;
+            soulUnchanged = override() === target;
           } catch {
             // Either command can repair a damaged choice.
           }
-          if (unchanged) {
+          let nakedUnchanged = true;
+          if (input === "reset") {
+            try {
+              nakedUnchanged = sessionNaked(ctx.sessionManager.getBranch()) === undefined;
+            } catch {
+              nakedUnchanged = false;
+            }
+          }
+          if (soulUnchanged && nakedUnchanged) {
             refresh();
             return notify(`${input === "clear" ? "Already soulless" : "Already following defaults"}. Soul: ${now()}`);
           }
           const before = loadedName(activeName());
-          pi.appendEntry(ENTRY_TYPE, { version: 1, name: null, ...(input === "clear" ? { disabled: true } : {}) });
+          if (!soulUnchanged) {
+            pi.appendEntry(ENTRY_TYPE, { version: 1, name: null, ...(input === "clear" ? { disabled: true } : {}) });
+          }
+          if (!nakedUnchanged) {
+            pi.appendEntry(NAKED_ENTRY_TYPE, { version: 1, naked: null });
+          }
           const after = loadedName(active()?.name);
           if (before !== after) appendDivider(pi, after ?? null);
           refresh();
@@ -390,7 +446,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
           const missing = selection && !available.includes(selection.name) ? " (missing)" : "";
           const ignored = unmatchableModelKeys(config);
           return notify([
-            `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null)}${missing}`,
+            `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null, naked())}${missing}`,
             `Souls: ${available.map((name) => `@${name}`).join(", ") || "none"}`,
             `Dir: ${tilde(config.dir)}`,
             ...(ignored.length ? [`Ignored keys: ${ignored.join(", ")}`] : []),
@@ -398,7 +454,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         }
 
         if (!input.startsWith("@") || !isSoulName(input.slice(1))) {
-          ctx.ui.notify("Usage: /soul [@<name>|clear|reset|reload]", "warning");
+          ctx.ui.notify("Usage: /soul [@<name>|naked|clear|reset|reload]", "warning");
           return;
         }
 
@@ -424,25 +480,25 @@ export default function soulsExtension(pi: ExtensionAPI) {
     },
   });
 
-  const project = (messages: AgentMessage[], body: string, ctx: ExtensionContext): AgentMessage[] => {
+  const project = (messages: AgentMessage[], body: string, naked: boolean, ctx: ExtensionContext): AgentMessage[] => {
     const base = messages.findLast((message): message is Extract<AgentMessage, { role: "system" }> => message.role === "system" && typeof message.sections?.preamble === "string");
     const basePreamble = base?.sections?.preamble ?? undefined;
-    const projected = applySoul(messages, body);
+    const projected = naked ? applyNakedSoul(messages, body) : applySoul(messages, body);
     // Pi projects forced text after this hook; patch that too, not just its transcript sections.
     if (running && options?.forceSystemPrompt !== undefined) {
       const forced = options.forceSystemPrompt;
       const original = forced === forcedProjection?.projected ? forcedProjection.original : forced;
-      const patched = replaceForcedPreamble(messages, original, body);
+      const patched = naked ? body : replaceForcedPreamble(messages, original, body);
       forcedProjection = { original, projected: patched, body, basePreamble };
       options.forceSystemPrompt = patched;
-      if (!forceReported) {
-        const notice = "Soul: preamble replaced";
+      const notice = naked ? "Soul: naked prompt" : "Soul: preamble replaced";
+      if (forceReported !== notice) {
         if (ctx.hasUI) ctx.ui.notify(notice, "info");
         else console.warn(notice);
-        forceReported = true;
+        forceReported = notice;
       }
     } else {
-      forceReported = false;
+      forceReported = undefined;
     }
     return projected;
   };
@@ -543,29 +599,29 @@ export default function soulsExtension(pi: ExtensionAPI) {
       seenPrompt = options.customPrompt; promptKnown = true;
     }
     projection = undefined;
-    let presence: Presence | undefined;
+    let naked = false;
     try {
-      presence = presenceFor(ctx, options?.customPrompt);
+      naked = isNaked(ctx.sessionManager.getBranch());
     } catch (error) {
       restoreForcedProjection();
       projection = { known: false, soul: null };
       setFooter(ctx, undefined);
       return report(error, ctx);
     }
-    if (!presence) {
-      projection = { known: true, soul: null };
-      setFooter(ctx, undefined);
-      reported = undefined;
-      return;
-    }
     try {
-      const messages = project(event.messages, presence.body, ctx);
+      const presence = presenceFor(ctx, options?.customPrompt);
+      if (!presence) {
+        projection = { known: true, soul: null };
+        setFooter(ctx, undefined);
+        reported = undefined;
+        return;
+      }
+      const messages = project(event.messages, presence.body, naked, ctx);
       projection = { known: true, soul: presence.selection.name };
-      setFooter(ctx, footerText(presence));
+      setFooter(ctx, footerText(presence, naked));
       reported = undefined;
       return messages && { messages };
     } catch (error) {
-      // A failed re-render must not leave a previous soul in the forced prompt.
       restoreForcedProjection();
       projection = { known: false, soul: null };
       setFooter(ctx, undefined);

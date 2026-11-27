@@ -29,9 +29,10 @@ export function resolvePresence(config: SoulConfig, branch: readonly SessionEntr
   return selectionPresence(config, effectiveSoul(resolveSoul(config, sessionSoul(branch), model, soulless), customPrompt), variables);
 }
 
-export function footerText(presence: Presence | undefined): string | undefined {
+export function footerText(presence: Presence | undefined, naked = false): string | undefined {
   if (!presence) return undefined;
-  return presence.icon ?? presence.selection.name;
+  const label = presence.icon ?? presence.selection.name;
+  return naked ? `${label} (naked)` : label;
 }
 
 export function dividerText(data: unknown): string | undefined {

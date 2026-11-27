@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { SessionManager, type BeforeAgentStartEventResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
-import { applySoul, replaceForcedPreamble } from "../src/prompt.ts";
-import { ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveSoul, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulPerceptionPath, unmatchableModelKeys } from "../src/souls.ts";
+import { applyNakedSoul, applySoul, replaceForcedPreamble } from "../src/prompt.ts";
+import { ENTRY_TYPE, NAKED_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveNaked, resolveSoul, sessionNaked, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulPerceptionPath, unmatchableModelKeys } from "../src/souls.ts";
 import { HOUR_MS, timePerception } from "../src/time.ts";
 import { PERCEPTION_MESSAGE_TYPE, worldFor, type Moment } from "../src/perception.ts";
 
@@ -87,11 +88,12 @@ test("soulless via CLI or env skips defaults; selection wins and clear/reset rem
     const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
     let flag = false;
     let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
+    const registeredFlags = new Map<string, string>();
     const pi = {
       registerFlag: (name: string, options: { type: string }) => {
-        assert.equal(name, "soulless"); assert.equal(options.type, "boolean");
+        registeredFlags.set(name, options.type);
       },
-      getFlag: () => flag,
+      getFlag: (name: string) => name === "soulless" && flag,
       getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       registerCommand: (_name: string, registered: typeof command) => { command = registered; },
@@ -99,6 +101,8 @@ test("soulless via CLI or env skips defaults; selection wins and clear/reset rem
       on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
     } as unknown as ExtensionAPI;
     extension(pi);
+    assert.equal(registeredFlags.get("soulless"), "boolean");
+    assert.equal(registeredFlags.get("naked"), "boolean");
     const ctx = {
       cwd: dir, model, sessionManager: session, isIdle: () => true, hasUI: true,
       getSystemPromptOptions: () => ({ cwd: dir }),
@@ -345,14 +349,16 @@ test("registered command persists selection, refuses missing files, skips no-ops
     assert.deepEqual(command.getArgumentCompletions("f"), null); // Bare names cannot switch.
     assert.deepEqual(command.getArgumentCompletions("@")?.map((item) => item.value), ["@clear", "@faye", "@reload"]);
     assert.deepEqual(command.getArgumentCompletions("@c")?.map((item) => item.value), ["@clear"]);
-    assert.deepEqual(command.getArgumentCompletions("")?.map((item) => item.value), ["@clear", "@faye", "@reload", "clear", "reset", "reload"]);
+    assert.deepEqual(command.getArgumentCompletions("")?.map((item) => item.value), ["@clear", "@faye", "@reload", "naked", "clear", "reset", "reload"]);
+    assert.deepEqual(command.getArgumentCompletions("n")?.map((item) => item.value), ["naked"]);
+    assert.deepEqual(command.getArgumentCompletions("naked ")?.map((item) => item.value), ["naked on", "naked off"]);
     assert.deepEqual(command.getArgumentCompletions("r")?.map((item) => item.value), ["reset", "reload"]);
     assert.equal(command.getArgumentCompletions("zzz"), null);
 
     for (const input of ["faye", "@ faye"]) {
       await command.handler(input, ctx);
       assert.equal(sessionSoul(session.getBranch()), undefined);
-      assert.match(notices.at(-1)!, /Usage: \/soul \[@<name>\|clear\|reset\|reload\]/);
+      assert.match(notices.at(-1)!, /Usage: \/soul \[@<name>\|naked\|clear\|reset\|reload\]/);
     }
     assert.equal(entries(), 0);
     await command.handler("@faye", ctx);
@@ -502,7 +508,7 @@ test("Pi time awareness sends visible perceptions, throttles hourly and follows 
     let soullessFlag = false;
     let timeaware: boolean | undefined;
     const pi = {
-      registerFlag: () => {}, getFlag: () => soullessFlag,
+      registerFlag: () => {}, getFlag: (name: string) => name === "soulless" && soullessFlag,
       getSettings: () => ({ soulsDir: dir, defaultSoul: "faye", timeaware }),
       appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
       sendMessage: () => assert.fail("a human perception must not enqueue an independent message"),
@@ -556,3 +562,146 @@ test("Pi time awareness sends visible perceptions, throttles hourly and follows 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("naked projection leaves only the soul body and preserves tool declarations across system deltas", () => {
+  const toolA = { name: "read", description: "read", parameters: { type: "object", properties: {} } } as any;
+  const toolB = { name: "bash", description: "bash", parameters: { type: "object", properties: {} } } as any;
+  const messages: AgentMessage[] = [
+    { role: "system", content: "extra", sections: { preamble: "Pi", tools: "t", rules: "r", docs: "d", cwd: "/tmp", notesoup_protocol: "n" }, toolsAdded: [toolA], timestamp: 10 },
+    { role: "user", content: "hi", timestamp: 11 },
+    { role: "system", content: "more", sections: { rules: "r2", cwd: "/other" }, timestamp: 12 },
+    { role: "system", content: "", sections: { notesoup_tools: "x" }, toolsAdded: [toolB], toolsRemoved: [{ name: "read" }], timestamp: 13 },
+  ];
+  const original = structuredClone(messages);
+  const projected = applyNakedSoul(messages, "Faye only");
+  assert.deepEqual(messages, original);
+  assert.equal(getCurrentSystemPrompt(projected as any), "Faye only");
+  assert.deepEqual(getCurrentTools(projected as any).map((tool) => tool.name), ["bash"]);
+  // Section-only later system message is dropped; tool-bearing later system message stays anchored with empty text.
+  assert.equal(projected.length, 3);
+  assert.equal(projected[1], messages[1]);
+  assert.deepEqual(projected[0], { role: "system", content: "Faye only", toolsAdded: [toolA], timestamp: 10 });
+  assert.deepEqual(projected[2], { role: "system", content: "", toolsAdded: [toolB], toolsRemoved: [{ name: "read" }], timestamp: 13 });
+
+  // Plain system message without sections and transcripts without a system message both produce soul-only prompts.
+  const plain = applyNakedSoul([{ role: "system", content: "Plain", timestamp: 5 }, { role: "user", content: "yo", timestamp: 6 }], "Faye");
+  assert.equal(getCurrentSystemPrompt(plain as any), "Faye");
+  const headless = applyNakedSoul([{ role: "user", content: "yo", timestamp: 6 }], "Faye");
+  assert.equal(getCurrentSystemPrompt(headless as any), "Faye");
+});
+
+test("naked mode follows --naked and /soul naked overrides on the active branch, including reset, footer, and forced prompts", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-naked-"));
+  try {
+    writeFileSync(join(dir, "faye.md"), "---\nicon: 🦈\n---\nFaye body");
+    writeFileSync(join(dir, "naked.md"), "Literal naked soul");
+    const session = SessionManager.inMemory();
+    const notices: string[] = [];
+    const statuses: (string | undefined)[] = [];
+    const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
+    let nakedFlag = false;
+    let soullessFlag = false;
+    let command!: { handler: (args: string, ctx: unknown) => Promise<void> };
+    const pi = {
+      registerFlag: () => {},
+      getFlag: (name: string) => name === "naked" ? nakedFlag : name === "soulless" ? soullessFlag : false,
+      getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
+      appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
+      registerCommand: (_name: string, registered: typeof command) => { command = registered; },
+      registerEntryRenderer: () => {},
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
+    } as unknown as ExtensionAPI;
+    extension(pi);
+    const ctx = {
+      cwd: dir, model, sessionManager: session, isIdle: () => true, hasUI: true,
+      getSystemPromptOptions: () => ({ cwd: dir }),
+      ui: {
+        notify: (text: string) => notices.push(text),
+        setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+      },
+    } as unknown as ExtensionContext;
+    const system = (): AgentMessage[] => [{
+      role: "system", content: "", sections: { preamble: "Pi", tools: "<tools>", rules: "<rules>", cwd: dir }, timestamp: 0,
+    }];
+    const request = () => handlers.get("context_with_system")![0]({ messages: system() }, ctx) as { messages: AgentMessage[] } | undefined;
+
+    // Default: non-naked replaces only preamble.
+    const normal = request()!;
+    assert.ok(normal.messages[0].role === "system");
+    assert.equal(normal.messages[0].sections?.preamble, "Faye body");
+    assert.equal(normal.messages[0].sections?.rules, "<rules>");
+    assert.equal(statuses.at(-1), "🦈");
+
+    // CLI --naked strips everything down to soul body.
+    nakedFlag = true;
+    const fromFlag = request()!;
+    assert.equal(getCurrentSystemPrompt(fromFlag.messages as any), "Faye body");
+    assert.equal(statuses.at(-1), "🦈 (naked)");
+
+    // /soul naked toggles off for the session, overriding --naked.
+    const beforeToggle = session.getLeafId();
+    await command.handler("naked", ctx);
+    assert.equal(sessionNaked(session.getBranch()), false);
+    assert.equal(resolveNaked(sessionNaked(session.getBranch()), nakedFlag), false);
+    assert.match(notices.at(-1)!, /Naked: off/);
+    assert.equal(statuses.at(-1), "🦈");
+    const toggledOff = request()!;
+    assert.ok(toggledOff.messages[0].role === "system" && toggledOff.messages[0].sections?.rules === "<rules>");
+
+    // Explicit naked off is a no-op when already off; naked on enables it.
+    const countAfterOff = session.getBranch().length;
+    await command.handler("naked off", ctx);
+    assert.equal(session.getBranch().length, countAfterOff);
+    assert.match(notices.at(-1)!, /Already not naked/);
+
+    await command.handler("naked on", ctx);
+    assert.equal(sessionNaked(session.getBranch()), true);
+    assert.equal(statuses.at(-1), "🦈 (naked)");
+    assert.equal(getCurrentSystemPrompt(request()!.messages as any), "Faye body");
+
+    // Literal soul named @naked still selects the soul, independent of naked mode.
+    await command.handler("@naked", ctx);
+    assert.equal(getCurrentSystemPrompt(request()!.messages as any), "Literal naked soul");
+    assert.equal(statuses.at(-1), "naked (naked)");
+    await command.handler("", ctx);
+    assert.match(notices.at(-1)!, /Soul: naked \(session, naked\)/);
+
+    // Forced prompt in naked mode becomes only the soul body, and restores on failure.
+    const options: Record<string, unknown> = { cwd: dir, forceSystemPrompt: "Pi\n\nForced addendum" };
+    handlers.get("before_agent_start")![0]({ systemPromptOptions: options }, ctx);
+    assert.ok(request());
+    assert.equal(options.forceSystemPrompt, "Literal naked soul");
+    assert.equal(notices.at(-1), "Soul: naked prompt");
+    rmSync(join(dir, "naked.md"));
+    assert.equal(request(), undefined);
+    assert.equal(options.forceSystemPrompt, "Pi\n\nForced addendum");
+    handlers.get("agent_settled")![0]({ aborted: false }, ctx);
+
+    // /soul reset restores both soul selection and naked override back to CLI defaults (--naked = true).
+    await command.handler("reset", ctx);
+    assert.equal(sessionSoul(session.getBranch()), undefined);
+    assert.equal(sessionNaked(session.getBranch()), undefined);
+    assert.equal(resolveNaked(sessionNaked(session.getBranch()), nakedFlag), true);
+    assert.equal(getCurrentSystemPrompt(request()!.messages as any), "Faye body");
+
+    // When no soul is active (soulless), naked mode leaves Pi's prompt untouched.
+    soullessFlag = true;
+    assert.equal(request(), undefined);
+    soullessFlag = false;
+
+    // Corrupted naked entry is repaired by /soul reset and follows branch navigation.
+    if (beforeToggle) {
+      session.branch(beforeToggle);
+      assert.equal(sessionNaked(session.getBranch()), undefined);
+    }
+    session.appendCustomEntry(NAKED_ENTRY_TYPE, { version: 99 });
+    assert.throws(() => sessionNaked(session.getBranch()), /Corrupted naked entry/);
+    nakedFlag = false;
+    await command.handler("reset", ctx);
+    assert.equal(sessionNaked(session.getBranch()), undefined);
+    assert.equal(resolveNaked(sessionNaked(session.getBranch()), nakedFlag), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

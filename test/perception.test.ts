@@ -357,7 +357,7 @@ function setup(files: Record<string, string> = {}, settings: Record<string, unkn
   let now = new Date(2026, 9, 27, 2, 14, 0).getTime();
   const pi = {
     registerFlag: () => {},
-    getFlag: () => flag,
+    getFlag: (name: string) => name === "soulless" && flag,
     getSettings: () => ({ soulsDir: dir, defaultSoul: "faye", timeaware: false, ...settings }),
     appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
     registerCommand: (_name: string, registered: typeof command) => { command = registered; },

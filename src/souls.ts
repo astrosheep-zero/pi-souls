@@ -7,6 +7,7 @@ export { listSouls, loadSoul, readConfig, readSoul, soulFile, soulPerceptionPath
 export { isSoulName } from "./soul-selection.ts";
 
 export const ENTRY_TYPE = "pi-souls:selection";
+export const NAKED_ENTRY_TYPE = "pi-souls:naked";
 export interface Selection {
   name: string;
   source: "session" | "model" | "default";
@@ -23,6 +24,25 @@ export function unmatchableModelKeys(config: SoulConfig): string[] {
 
 /** A name selects a soul, null explicitly disables souls, undefined follows defaults. */
 export type SoulOverride = string | null | undefined;
+/** true/false overrides naked mode for the session; undefined follows the --naked flag. */
+export type NakedOverride = boolean | undefined;
+
+/** Read a boolean session toggle from the active branch, never a second in-memory authority. */
+function sessionToggle(branch: readonly SessionEntry[], customType: string, field: string, error: string): boolean | undefined {
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry.type !== "custom" || entry.customType !== customType) continue;
+    const value = object(entry.data) && entry.data.version === 1 ? entry.data[field] : undefined;
+    if (value !== null && typeof value !== "boolean") throw new Error(error);
+    return value ?? undefined;
+  }
+  return undefined;
+}
+
+export const sessionNaked = (branch: readonly SessionEntry[]): NakedOverride =>
+  sessionToggle(branch, NAKED_ENTRY_TYPE, "naked", "Corrupted naked entry. Run /soul reset");
+export const resolveNaked = (override: NakedOverride, flag = false): boolean => override ?? flag;
+
 
 /** Read the active branch, never the whole session file or a second in-memory authority. */
 export function sessionSoul(branch: readonly SessionEntry[]): SoulOverride {
