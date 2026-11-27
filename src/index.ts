@@ -2,9 +2,9 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { buildSessionProjection, type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext, type ProjectedSessionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { applyNakedSoul, applySoul, replaceForcedPreamble } from "./prompt.ts";
+import { applyNakedSoul, applyNoTools, applySoul, replaceForcedPreamble } from "./prompt.ts";
 import { footerText, resolvePresence, resolvePerception, selectionPresence, type Presence } from "./presence.ts";
-import { ENTRY_TYPE, NAKED_ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveNaked, resolveSoul, sessionNaked, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
+import { ENTRY_TYPE, NAKED_ENTRY_TYPE, NOTOOLS_ENTRY_TYPE, effectiveSoul, isSoulName, lastTimeNoteTimestamp, lastUserMessageTimestamp, listSouls, readConfig, readSoul, resolveNaked, resolveNoTools, resolveSoul, sessionNaked, sessionNoTools, sessionSoul, unmatchableModelKeys, type Selection, type SoulVariables } from "./souls.ts";
 import { timePerception } from "./time.ts";
 import { TRANSITION_ENTRY_TYPE, TRANSITION_MESSAGE_TYPE, readTransition, sameTransition, type Transition } from "./transitions.ts";
 import { appendDivider, registerPresenceUI, setFooter } from "./ui.ts";
@@ -24,9 +24,9 @@ const wakeSource = (reason: string): Extract<Moment, { kind: "wake" }>["source"]
   return undefined;
 };
 
-function describe(selection: Selection | undefined, model: ExtensionContext["model"], suppressed = false, soulless = false, naked = false): string {
+function describe(selection: Selection | undefined, model: ExtensionContext["model"], suppressed = false, soulless = false, naked = false, notools = false): string {
   const suffix = (detail?: string) => {
-    const parts = [detail, naked ? "naked" : undefined].filter(Boolean);
+    const parts = [detail, naked ? "naked" : undefined, notools ? "notools" : undefined].filter(Boolean);
     return parts.length ? ` (${parts.join(", ")})` : "";
   };
   if (!selection) return `none${suffix(soulless ? "soulless" : suppressed ? "custom prompt" : undefined)}`;
@@ -97,6 +97,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   const soulless = () => pi.getFlag("soulless") === true || /^(1|true)$/i.test(process.env.SOULLESS ?? "");
   const nakedFlag = () => pi.getFlag("naked") === true;
   const isNaked = (branch: readonly SessionEntry[]) => resolveNaked(sessionNaked(branch), nakedFlag());
+  const isNoTools = (branch: readonly SessionEntry[]) => resolveNoTools(sessionNoTools(branch));
   // Argument completion has no context; remember where the session runs for relative soulsDir.
   let cwd = process.cwd();
   // A problem is reported when it appears or changes, not on every request of a tool loop.
@@ -225,12 +226,13 @@ export default function soulsExtension(pi: ExtensionAPI) {
       const config = readConfig(pi.getSettings(), ctx.cwd);
       const branch = ctx.sessionManager.getBranch();
       const selection = resolveSoul(config, sessionSoul(branch), model, soulless());
+      const notools = isNoTools(branch);
       // Before the host reports prompt options, only a session choice is provably effective.
       if (!known && selection && selection.source !== "session") {
-        setFooter(ctx, undefined);
+        setFooter(ctx, footerText(undefined, false, notools));
         return;
       }
-      setFooter(ctx, footerText(selectionPresence(config, effectiveSoul(selection, customPrompt), soulVariables(ctx)), isNaked(branch)));
+      setFooter(ctx, footerText(selectionPresence(config, effectiveSoul(selection, customPrompt), soulVariables(ctx)), isNaked(branch), notools));
     } catch {
       setFooter(ctx, undefined);
     }
@@ -308,6 +310,49 @@ export default function soulsExtension(pi: ExtensionAPI) {
     }
   });
 
+  pi.registerCommand("notools", {
+    description: "Toggle tool declarations: /notools [on|off]",
+    getArgumentCompletions: (prefix) => {
+      const modes = [
+        { value: "on", label: "on", description: "Strip all tool declarations" },
+        { value: "off", label: "off", description: "Restore tool declarations" },
+      ];
+      const matches = modes.filter((item) => item.value.startsWith(prefix.trim()));
+      return matches.length ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      if (!ctx.isIdle()) {
+        ctx.ui.notify("Busy. Try again after this run.", "warning");
+        return;
+      }
+      try {
+        const input = args.trim();
+        if (input !== "" && input !== "on" && input !== "off") {
+          ctx.ui.notify("Usage: /notools [on|off]", "warning");
+          return;
+        }
+        let current = false;
+        let corrupted = false;
+        try {
+          current = isNoTools(ctx.sessionManager.getBranch());
+        } catch {
+          corrupted = true;
+        }
+        const target = input === "" ? !current : input === "on";
+        if (!corrupted && current === target) {
+          refreshFooter(ctx, promptValue());
+          ctx.ui.notify(`No tools: already ${target ? "on" : "off"}`, "info");
+          return;
+        }
+        pi.appendEntry(NOTOOLS_ENTRY_TYPE, { version: 1, notools: target });
+        refreshFooter(ctx, promptValue());
+        ctx.ui.notify(`No tools: ${target ? "on" : "off"}`, "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    },
+  });
+
   pi.registerCommand("soul", {
     description: "Soul: /soul [@name|naked|clear|reset|reload]",
     getArgumentCompletions: (prefix) => {
@@ -350,6 +395,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         const resolved = () => resolveSoul(config, override(), ctx.model, soulless());
         const active = () => effectiveSoul(resolved(), prompt);
         const naked = () => isNaked(ctx.sessionManager.getBranch());
+        const notools = () => isNoTools(ctx.sessionManager.getBranch());
         const activeName = () => {
           try {
             return active()?.name;
@@ -370,7 +416,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
         const now = () => {
           const configured = resolved();
           const selection = effectiveSoul(configured, prompt);
-          return describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null, naked());
+          return describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null, naked(), notools());
         };
 
         if (input === "naked" || input === "naked on" || input === "naked off") {
@@ -446,7 +492,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
           const missing = selection && !available.includes(selection.name) ? " (missing)" : "";
           const ignored = unmatchableModelKeys(config);
           return notify([
-            `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null, naked())}${missing}`,
+            `Soul: ${describe(selection, ctx.model, selection === undefined && configured !== undefined, soulless() || override() === null, naked(), notools())}${missing}`,
             `Souls: ${available.map((name) => `@${name}`).join(", ") || "none"}`,
             `Dir: ${tilde(config.dir)}`,
             ...(ignored.length ? [`Ignored keys: ${ignored.join(", ")}`] : []),
@@ -600,8 +646,11 @@ export default function soulsExtension(pi: ExtensionAPI) {
     }
     projection = undefined;
     let naked = false;
+    let notools = false;
     try {
-      naked = isNaked(ctx.sessionManager.getBranch());
+      const branch = ctx.sessionManager.getBranch();
+      naked = isNaked(branch);
+      notools = isNoTools(branch);
     } catch (error) {
       restoreForcedProjection();
       projection = { known: false, soul: null };
@@ -612,20 +661,23 @@ export default function soulsExtension(pi: ExtensionAPI) {
       const presence = presenceFor(ctx, options?.customPrompt);
       if (!presence) {
         projection = { known: true, soul: null };
-        setFooter(ctx, undefined);
+        setFooter(ctx, footerText(undefined, false, notools));
         reported = undefined;
-        return;
+        return notools ? { messages: applyNoTools(event.messages) } : undefined;
       }
-      const messages = project(event.messages, presence.body, naked, ctx);
+      const projected = project(event.messages, presence.body, naked, ctx);
+      const messages = notools ? applyNoTools(projected) : projected;
       projection = { known: true, soul: presence.selection.name };
-      setFooter(ctx, footerText(presence, naked));
+      setFooter(ctx, footerText(presence, naked, notools));
       reported = undefined;
       return messages && { messages };
     } catch (error) {
+      // A failed soul load or re-render must neither leave a previous soul in the forced prompt nor re-enable tools.
       restoreForcedProjection();
       projection = { known: false, soul: null };
-      setFooter(ctx, undefined);
+      setFooter(ctx, footerText(undefined, false, notools));
       report(error, ctx);
+      return notools ? { messages: applyNoTools(event.messages) } : undefined;
     }
   });
 

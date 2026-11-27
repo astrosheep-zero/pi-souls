@@ -54,3 +54,36 @@ export function applyNakedSoul(messages: AgentMessage[], body: string): AgentMes
   return result;
 }
 
+/**
+ * Notools request-only projection: remove every tool declaration from every system message,
+ * whether the transcript already contains tool calls or not. The leading system prompt keeps its
+ * sections (with an empty tools tag) so the model still sees where tools used to be documented;
+ * later deltas shrink to whatever real instructions they carried.
+ */
+export function applyNoTools(messages: AgentMessage[]): AgentMessage[] {
+  let seenSystem = false;
+  let seenTools = false;
+  const result: AgentMessage[] = [];
+  for (const message of messages) {
+    if (message.role !== "system") {
+      result.push(message);
+      continue;
+    }
+    const { toolsAdded: _added, toolsRemoved: _removed, ...rest } = message;
+    const sections = message.sections ? { ...message.sections } : undefined;
+    if (sections) {
+      delete sections.skills;
+      if (!seenTools && sections.tools !== undefined && sections.tools !== null) {
+        sections.tools = "<tools>\n(none)\n</tools>";
+        seenTools = true;
+      } else {
+        delete sections.tools;
+      }
+    }
+    const emptyText = rest.content === "" || (Array.isArray(rest.content) && rest.content.length === 0);
+    if (seenSystem && emptyText && (!sections || Object.keys(sections).length === 0)) continue;
+    result.push(sections ? { ...rest, sections } : rest);
+    seenSystem = true;
+  }
+  return result;
+}

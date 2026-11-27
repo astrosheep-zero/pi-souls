@@ -7,8 +7,8 @@ import { SessionManager, type BeforeAgentStartEventResult, type ExtensionAPI, ty
 import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import extension from "../src/index.ts";
-import { applyNakedSoul, applySoul, replaceForcedPreamble } from "../src/prompt.ts";
-import { ENTRY_TYPE, NAKED_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveNaked, resolveSoul, sessionNaked, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulPerceptionPath, unmatchableModelKeys } from "../src/souls.ts";
+import { applyNakedSoul, applyNoTools, applySoul, replaceForcedPreamble } from "../src/prompt.ts";
+import { ENTRY_TYPE, NAKED_ENTRY_TYPE, NOTOOLS_ENTRY_TYPE, effectiveSoul, lastTimeNoteTimestamp, lastUserMessageTimestamp, readConfig, resolveNaked, resolveNoTools, resolveSoul, sessionNaked, sessionNoTools, sessionSoul, loadSoul, listSouls, readSoul, soulFile, soulPerceptionPath, unmatchableModelKeys } from "../src/souls.ts";
 import { HOUR_MS, timePerception } from "../src/time.ts";
 import { PERCEPTION_MESSAGE_TYPE, worldFor, type Moment } from "../src/perception.ts";
 
@@ -705,3 +705,163 @@ test("naked mode follows --naked and /soul naked overrides on the active branch,
   }
 });
 
+test("notools projection strips every tool declaration, skills and tool deltas without touching history", () => {
+  const toolA = { name: "read", description: "read", parameters: { type: "object", properties: {} } } as any;
+  const toolB = { name: "bash", description: "bash", parameters: { type: "object", properties: {} } } as any;
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const messages: AgentMessage[] = [
+    { role: "system", content: "extra", sections: { preamble: "Pi", tools: "<tools>read</tools>", rules: "r", skills: "s", cwd: "/tmp" }, toolsAdded: [toolA], timestamp: 10 },
+    { role: "user", content: "hi", timestamp: 11 },
+    { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }], api: "test", provider: "test", model: "test", stopReason: "toolUse", usage, timestamp: 12 },
+    { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "result" }], isError: false, timestamp: 13 },
+    { role: "system", content: "more", sections: { rules: "r2" }, timestamp: 14 },
+    { role: "system", content: "", sections: { skills: "x" }, toolsAdded: [toolB], toolsRemoved: [{ name: "read" }], timestamp: 15 },
+  ];
+  const original = structuredClone(messages);
+  const projected = applyNoTools(messages);
+  assert.deepEqual(messages, original);
+  // Prior tool calls and results never block the strip.
+  assert.deepEqual(getCurrentTools(projected as any), []);
+  const prompt = getCurrentSystemPrompt(projected as any);
+  assert.ok(prompt.includes("<tools>\n(none)\n</tools>"));
+  assert.ok(!prompt.includes("<tools>read</tools>"));
+  assert.ok(!prompt.includes("<skills>"));
+  assert.equal(projected.length, 5);
+  assert.equal(projected[1], messages[1]);
+  assert.equal(projected[2], messages[2]);
+  assert.equal(projected[3], messages[3]);
+  const head = projected[0];
+  assert.ok(head.role === "system");
+  assert.equal(head.content, "extra");
+  assert.deepEqual(head.sections, { preamble: "Pi", tools: "<tools>\n(none)\n</tools>", rules: "r", cwd: "/tmp" });
+  assert.equal(head.toolsAdded, undefined);
+  assert.deepEqual(projected[4], { role: "system", content: "more", sections: { rules: "r2" }, timestamp: 14 });
+
+  const headless = applyNoTools([{ role: "user", content: "yo", timestamp: 6 }]);
+  assert.deepEqual(headless, [{ role: "user", content: "yo", timestamp: 6 }]);
+});
+
+test("notools command toggles a session strip that survives /soul reset, soulless mode and naked mode", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "souls-notools-"));
+  try {
+    writeFileSync(join(dir, "faye.md"), "---\nicon: 🦈\n---\nFaye body");
+    const session = SessionManager.inMemory();
+    const notices: string[] = [];
+    const statuses: (string | undefined)[] = [];
+    const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
+    let nakedFlag = false;
+    let soullessFlag = false;
+    type Command = { handler: (args: string, ctx: unknown) => Promise<void>; getArgumentCompletions: (prefix: string) => { value: string }[] | null; description: string };
+    const commands = new Map<string, Command>();
+    const pi = {
+      registerFlag: () => {},
+      getFlag: (name: string) => name === "naked" ? nakedFlag : name === "soulless" ? soullessFlag : false,
+      getSettings: () => ({ soulsDir: dir, defaultSoul: "faye" }),
+      appendEntry: (type: string, data: unknown) => session.appendCustomEntry(type, data),
+      registerCommand: (name: string, registered: Command) => { commands.set(name, registered); },
+      registerEntryRenderer: () => {},
+      on: (name: string, callback: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, [...(handlers.get(name) ?? []), callback]); },
+    } as unknown as ExtensionAPI;
+    extension(pi);
+    const notools = commands.get("notools")!;
+    const soul = commands.get("soul")!;
+    assert.equal(notools.description, "Toggle tool declarations: /notools [on|off]");
+    assert.deepEqual(notools.getArgumentCompletions("")?.map((item) => item.value), ["on", "off"]);
+    assert.deepEqual(notools.getArgumentCompletions("o")?.map((item) => item.value), ["on", "off"]);
+    assert.equal(notools.getArgumentCompletions("x"), null);
+    const ctx = {
+      cwd: dir, model, sessionManager: session, isIdle: () => true, hasUI: true,
+      getSystemPromptOptions: () => ({ cwd: dir }),
+      ui: {
+        notify: (text: string) => notices.push(text),
+        setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+      },
+    } as unknown as ExtensionContext;
+    const tool = { name: "read", description: "read", parameters: { type: "object", properties: {} } } as any;
+    const system = (): AgentMessage[] => [{
+      role: "system", content: "base", sections: { preamble: "Pi", tools: "<tools>read</tools>", rules: "<rules>", skills: "<skills>" }, toolsAdded: [tool], timestamp: 0,
+    }];
+    const request = () => handlers.get("context_with_system")![0]({ messages: system() }, ctx) as { messages: AgentMessage[] } | undefined;
+
+    handlers.get("before_agent_start")![0]({ systemPromptOptions: { cwd: dir } }, ctx);
+    assert.equal(getCurrentTools(request()!.messages as any).length, 1);
+    assert.equal(statuses.at(-1), "🦈");
+
+    await notools.handler("on", ctx);
+    assert.equal(sessionNoTools(session.getBranch()), true);
+    assert.equal(resolveNoTools(sessionNoTools(session.getBranch())), true);
+    assert.equal(statuses.at(-1), "🦈 (notools)");
+    const stripped = request()!;
+    assert.deepEqual(getCurrentTools(stripped.messages as any), []);
+    const head = stripped.messages[0];
+    assert.ok(head.role === "system");
+    assert.equal(head.content, "base");
+    assert.equal(head.sections?.tools, "<tools>\n(none)\n</tools>");
+    assert.equal(head.sections?.skills, undefined);
+    assert.equal(head.sections?.rules, "<rules>");
+    assert.equal(head.sections?.preamble, "Faye body");
+    assert.equal(head.toolsAdded, undefined);
+    assert.ok(getCurrentSystemPrompt(stripped.messages as any).includes("<tools>\n(none)\n</tools>"));
+
+    const afterOn = session.getBranch().length;
+    await notools.handler("on", ctx);
+    assert.equal(session.getBranch().length, afterOn);
+    assert.match(notices.at(-1)!, /No tools: already on/);
+
+    await notools.handler("off", ctx);
+    assert.equal(sessionNoTools(session.getBranch()), false);
+    assert.equal(statuses.at(-1), "🦈");
+    assert.equal(getCurrentTools(request()!.messages as any).length, 1);
+
+    await notools.handler("", ctx);
+    assert.match(notices.at(-1)!, /No tools: on/);
+    const onLeaf = session.getLeafId()!;
+    await notools.handler("off", ctx);
+    assert.equal(sessionNoTools(session.getBranch()), false);
+    session.branch(onLeaf);
+    assert.equal(sessionNoTools(session.getBranch()), true);
+
+    const beforeInvalid = session.getBranch().length;
+    await notools.handler("maybe", ctx);
+    assert.match(notices.at(-1)!, /Usage: \/notools \[on\|off\]/);
+    assert.equal(session.getBranch().length, beforeInvalid);
+
+    // Corrupted entries fail closed, and /notools off repairs them.
+    session.appendCustomEntry(NOTOOLS_ENTRY_TYPE, { version: 99 });
+    assert.throws(() => sessionNoTools(session.getBranch()), /Corrupted notools entry/);
+    assert.equal(request(), undefined);
+    await notools.handler("off", ctx);
+    assert.equal(sessionNoTools(session.getBranch()), false);
+    assert.equal(getCurrentTools(request()!.messages as any).length, 1);
+
+    // Orthogonal to /soul: /soul reset clears soul and naked state, never notools.
+    await notools.handler("on", ctx);
+    await soul.handler("@faye", ctx);
+    await soul.handler("reset", ctx);
+    assert.equal(sessionSoul(session.getBranch()), undefined);
+    assert.equal(sessionNaked(session.getBranch()), undefined);
+    assert.equal(sessionNoTools(session.getBranch()), true);
+    assert.equal(statuses.at(-1), "🦈 (notools)");
+
+    // With no active soul the strip still applies and the footer says so.
+    soullessFlag = true;
+    assert.deepEqual(getCurrentTools(request()!.messages as any), []);
+    assert.equal(statuses.at(-1), "notools");
+    await soul.handler("", ctx);
+    assert.match(notices.at(-1)!, /Soul: none \(soulless, notools\)/);
+    soullessFlag = false;
+
+    // Combined with naked mode: only the soul body remains, tools are still stripped.
+    nakedFlag = true;
+    const options: Record<string, unknown> = { cwd: dir, forceSystemPrompt: "Pi\n\nForced addendum" };
+    handlers.get("before_agent_start")![0]({ systemPromptOptions: options }, ctx);
+    const nakedStripped = request()!;
+    assert.equal(statuses.at(-1), "🦈 (naked, notools)");
+    assert.equal(getCurrentSystemPrompt(nakedStripped.messages as any), "Faye body");
+    assert.deepEqual(getCurrentTools(nakedStripped.messages as any), []);
+    assert.equal(options.forceSystemPrompt, "Faye body");
+    handlers.get("agent_settled")![0]({ aborted: false }, ctx);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -29,10 +29,11 @@ export function resolvePresence(config: SoulConfig, branch: readonly SessionEntr
   return selectionPresence(config, effectiveSoul(resolveSoul(config, sessionSoul(branch), model, soulless), customPrompt), variables);
 }
 
-export function footerText(presence: Presence | undefined, naked = false): string | undefined {
-  if (!presence) return undefined;
+export function footerText(presence: Presence | undefined, naked = false, notools = false): string | undefined {
+  if (!presence) return notools ? "notools" : undefined;
   const label = presence.icon ?? presence.selection.name;
-  return naked ? `${label} (naked)` : label;
+  const modes = [naked ? "naked" : undefined, notools ? "notools" : undefined].filter(Boolean);
+  return modes.length ? `${label} (${modes.join(", ")})` : label;
 }
 
 export function dividerText(data: unknown): string | undefined {

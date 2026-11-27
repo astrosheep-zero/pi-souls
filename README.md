@@ -17,6 +17,9 @@ pi install npm:@astrosheep/pi-souls
 /soul clear      # disable souls for this session
 /soul reset      # follow defaults again
 /soul reload     # re-read the active SOUL and its perception
+/notools         # toggle tool declarations (on/off)
+/notools on      # strip all tool declarations for this session
+/notools off     # restore tool declarations
 ```
 
 Tab-complete offers `@name`, `naked` (plus `naked on` / `naked off`), `clear`, `reset`, and `reload`. Soul names matching commands are selected with `@`, such as `@naked`, `@clear`, or `@reset`.
@@ -34,6 +37,8 @@ pi --naked
 `--soulless` (`SOULLESS=1` or `true`) skips settings souls for this process; `0`, `false`, or unset does not. A session `/soul @<name>` still wins, including resumed selections. `/soul clear` disables souls for the session; `/soul reset` follows defaults, which remain off while this flag is set.
 
 `--naked` strips the request system prompt down to the active soul body only (dropping Pi's built-in sections, project context, skills, cwd, extension sections, and forced addenda while keeping tool declarations intact). When no soul is active, naked mode leaves Pi's prompt untouched. `/soul naked` (or `/soul naked on` / `/soul naked off`) overrides `--naked` for the active branch, including resume, fork, and tree navigation; `/soul reset` returns to the `--naked` default.
+
+`/notools` strips every tool declaration from the request at request time, unconditionally, even when earlier turns in the history contain tool calls or tool results. It rewrites the leading `<tools>` section to an empty declaration, drops skill declarations and later tool/skill update deltas, and leaves durable history untouched. `/notools` toggles the per-session override, `/notools on` and `/notools off` set it explicitly, and branch navigation replays the choice. `/notools` is orthogonal to `/soul` and `/soul naked`: `/soul reset` leaves it alone, and it keeps stripping while no soul is active. Each request rebuilds the strip, so nothing durable is removed.
 
 ## Souls
 
