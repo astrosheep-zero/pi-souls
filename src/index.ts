@@ -36,7 +36,8 @@ type Ephemeral = {
   linger: number; sink: number;
 };
 const visibleMessage = (entry: ProjectedSessionEntry) => entry.messages.findLast((message) => message.role !== "system");
-const sunkAnchor = (ids: readonly string[], sink: number): string | null => ids[ids.length - 1 - sink] ?? null;
+const sunkAnchor = (ids: readonly string[], sink: number): string | null =>
+  sink < 0 ? null : (ids[ids.length - 1 - sink] ?? null);
 const contentKey = (message: AgentMessage) => JSON.stringify("content" in message ? message.content : undefined);
 
 function spokenMessage(kind: UtteranceKind, text: string, timestamp: number): AgentMessage {
@@ -254,7 +255,7 @@ export default function soulsExtension(pi: ExtensionAPI) {
   });
   pi.on("agent_settled", () => {
     running = false;
-    ephemerals = ephemerals.filter((ephemeral) => --ephemeral.linger > 0);
+    ephemerals = ephemerals.filter((ephemeral) => ephemeral.linger < 0 || --ephemeral.linger > 0);
     projection = undefined;
   });
   pi.on("tool_call", (event, ctx) => {

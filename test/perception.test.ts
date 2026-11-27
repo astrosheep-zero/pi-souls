@@ -287,6 +287,28 @@ test("Pi SDK pins sunk human ephemerals across tool loops and expires them indep
   assert.deepEqual(errors, []);
 });
 
+test("Pi SDK supports sink: -1 (head) and linger: -1 (session-long) ephemerals", async (t) => {
+  const { session, sessionManager, requests, errors } = await setupSdk(t, `
+    export function perception(moment) {
+      if (moment.kind !== 'human' || moment.text !== 'plant') return [];
+      return [
+        { kind: 'user', ephemeral: true, text: 'head-user', linger: -1, sink: -1 },
+        { kind: 'assistant', ephemeral: true, text: 'head-assistant', linger: -1, sink: -1 },
+      ];
+    }
+  `);
+  await session.prompt("seed");
+  for (const prompt of ["plant", "turn-2", "turn-3", "turn-4"]) {
+    await session.prompt(prompt);
+    const text = requestText(requests.at(-1)!.filter((message) => message.role !== "system"));
+    assert.deepEqual(text.slice(0, 3), ["head-user", "head-assistant", "seed"]);
+    assert.equal(text.filter((item) => item === "head-user").length, 1);
+    assert.equal(text.filter((item) => item === "head-assistant").length, 1);
+  }
+  assert.deepEqual(spoken(sessionManager.buildSessionContext().messages).filter((text) => text === "head-user" || text === "head-assistant"), []);
+  assert.deepEqual(errors, []);
+});
+
 test("Pi SDK sinks tool ephemerals without separating a call from its result", async (t) => {
   const { session, requests, errors, readNext } = await setupSdk(t, `
     export function perception(moment) {
@@ -557,13 +579,16 @@ test("world carries the soul's own store and omits an unknown absence", () => {
 test("one invalid utterance rejects the whole batch", () => {
   const persistent = { kind: "user", text: "kept", ephemeral: false };
   const ephemeral = { kind: "assistant", text: "temporary", ephemeral: true, linger: 2, sink: 0 };
-  assert.deepEqual(utterances([persistent, ephemeral]), [persistent, ephemeral]);
+  const headPersistent = { kind: "assistant", text: "pinned-head", ephemeral: true, linger: -1, sink: -1 };
+  assert.deepEqual(utterances([persistent, ephemeral, headPersistent]), [persistent, ephemeral, headPersistent]);
   assert.deepEqual(utterances(persistent), []);
   assert.deepEqual(utterances(undefined), []);
   for (const invalid of [
     { kind: "unknown", text: "hi" }, { ...persistent, text: "  " },
     { ...persistent, ephemeral: "true" }, { ...persistent, linger: 1 },
-    { kind: "reminder", text: "hi", sink: 1 }, { ...ephemeral, linger: 0 }, { ...ephemeral, sink: 0.5 },
+    { ...persistent, linger: -1 }, { ...persistent, sink: -1 },
+    { kind: "reminder", text: "hi", sink: 1 }, { ...ephemeral, linger: 0 }, { ...ephemeral, linger: -2 },
+    { ...ephemeral, sink: -2 }, { ...ephemeral, sink: 0.5 }, { ...ephemeral, sink: Infinity }, { ...ephemeral, linger: Infinity },
     { ...persistent, raw: undefined }, Object.assign(Object.create({ raw: false }), ephemeral),
   ]) assert.deepEqual(utterances([persistent, invalid]), []);
   const hiddenInvalid = [persistent, { ...ephemeral, raw: true }];

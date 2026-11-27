@@ -45,8 +45,8 @@ export function utterances(value: unknown): readonly Utterance[] {
     const { kind, text, ephemeral, linger, sink } = item;
     if (!isUtteranceKind(kind) || typeof text !== "string" || !text.trim()) return [];
     if (ephemeral === true) {
-      if ("linger" in item && (typeof linger !== "number" || !Number.isInteger(linger) || linger < 1)) return [];
-      if ("sink" in item && (typeof sink !== "number" || !Number.isInteger(sink) || sink < 0)) return [];
+      if ("linger" in item && (typeof linger !== "number" || !Number.isInteger(linger) || (linger < 1 && linger !== -1))) return [];
+      if ("sink" in item && (typeof sink !== "number" || !Number.isInteger(sink) || sink < -1)) return [];
       batch.push({ kind, text, ephemeral, ...(linger === undefined ? {} : { linger }), ...(sink === undefined ? {} : { sink }) });
     } else {
       if (("ephemeral" in item && ephemeral !== false) || "linger" in item || "sink" in item) return [];
