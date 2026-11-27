@@ -1,8 +1,10 @@
 {
   "name": "pi-souls",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Souls with model-specific defaults for Claude Code.",
-  "author": { "name": "AstroSheep" },
+  "author": {
+    "name": "AstroSheep"
+  },
   "userConfig": {
     "soulsDir": {
       "type": "string",
