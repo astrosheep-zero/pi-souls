@@ -818,21 +818,36 @@ test("Pi builtin and directory perceptions share a human moment and fail indepen
       { fg: (_tone: string, text: string) => text },
     );
     assert.deepEqual(rendered.render(80).map((line: string) => line.trimEnd()), [
-      "  ⌚ 02:14 · Tue, Oct 27",
-      "  (1h since *human* was last present)",
+      " ╷ ⌚ 02:14 · Tue, Oct 27",
+      " ╵ (1h since *human* was last present)",
     ]);
 
-    const multiLine = wrapReminder("[some other faye]\n\n*pokes screen* `` [too slow] ``\n\"hey copy\"\nline 4");
+    const fiveLines = wrapReminder("[some other faye]\n\n*pokes screen* `` [too slow] ``\n\"hey copy\"\nline 4");
+    const unfoldedFive = renderer(
+      { customType: PERCEPTION_MESSAGE_TYPE, content: fiveLines },
+      { expanded: false, outputPad: 1 },
+      { fg: (_tone: string, text: string) => text },
+    );
+    assert.deepEqual(unfoldedFive.render(120).map((line: string) => line.trimEnd()), [
+      " ╷ [some other faye]",
+      " │",
+      " │ *pokes screen* `` [too slow] ``",
+      " │ \"hey copy\"",
+      " ╵ line 4",
+    ]);
+
+    const multiLine = wrapReminder("[some other faye]\n\n*pokes screen* `` [too slow] ``\n\"hey copy\"\nline 4\nline 5");
     const folded = renderer(
       { customType: PERCEPTION_MESSAGE_TYPE, content: multiLine },
       { expanded: false, outputPad: 1 },
       { fg: (_tone: string, text: string) => text },
     );
     assert.deepEqual(folded.render(120).map((line: string) => line.trimEnd()), [
-      "  [some other faye]",
-      "",
-      "  *pokes screen* `` [too slow] ``",
-      "  ━━──",
+      " ╷ [some other faye]",
+      " │",
+      " │ *pokes screen* `` [too slow] ``",
+      " ╵ \"hey copy\"",
+      "   ⌄",
     ]);
     const unfolded = renderer(
       { customType: PERCEPTION_MESSAGE_TYPE, content: multiLine },
@@ -840,12 +855,13 @@ test("Pi builtin and directory perceptions share a human moment and fail indepen
       { fg: (_tone: string, text: string) => text },
     );
     assert.deepEqual(unfolded.render(120).map((line: string) => line.trimEnd()), [
-      "  [some other faye]",
-      "",
-      "  *pokes screen* `` [too slow] ``",
-      "  \"hey copy\"",
-      "  line 4",
-      "  ━━━━ ▴",
+      " ╷ [some other faye]",
+      " │",
+      " │ *pokes screen* `` [too slow] ``",
+      " │ \"hey copy\"",
+      " │ line 4",
+      " ╵ line 5",
+      "   ⌃",
     ]);
     // A failed soul render suppresses the clock, while its independent module can still answer.
     h.write("faye/SOUL.md", "{{ missing }}");
@@ -869,7 +885,10 @@ test("Pi renders literal reminder tags from each text block in a human batch", a
     assert.ok(carrier);
     const render = h.messageRenderers.get(PERCEPTION_MESSAGE_TYPE)!;
     const component = render(carrier, { expanded: true }, { fg: (_tone: string, text: string) => text });
-    const formatShort = (text: string) => text.split("\n");
+    const formatShort = (text: string) => {
+      const lines = text.split("\n");
+      return lines.map((line, i) => `${i === 0 ? "╷" : i === lines.length - 1 ? "╵" : "│"} ${line}`);
+    };
     assert.deepEqual(
       component.render(80).map((line: string) => line.trim()),
       [
