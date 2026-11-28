@@ -302,7 +302,7 @@ test("continuity comes from delivered rows and the latest prompt snapshot", () =
     user("older", null, "older", 0),
     user("human", "older", "hello", 1),
     assistant("assistant", "human", "claude-backend-alias-5", 2),
-    pluginReminder("note", "assistant", "⌚ 11:30 · Mon, Nov 17", 3),
+    pluginReminder("note", "assistant", "⌚ 11:30 · Mon, Nov 17, 2026", 3),
     pluginReminder("brain", "note", "new brain: claude-sonnet-5-5", 4),
     system("divider", "brain", "── soul: faye ──", 5),
     snapshot,
@@ -325,7 +325,6 @@ test("continuity comes from delivered rows and the latest prompt snapshot", () =
 test("submit attachment clocks retain their human carrier; settings hooks and nonclock text do not count", () => {
   const reminder = (text: string) => `<system-reminder>\n${text}\n</system-reminder>`;
   const clock = "⌚ 11:30 · Mon, Nov 17, 2026";
-  const legacyClock = "⌚ 11:30 · Mon, Nov 17";
   const attach = (uuid: string, parentUuid: string, hookName: string, time: number, ...parts: string[]) => ({
     uuid, parentUuid, timestamp: at(time), type: "attachment", isSidechain: false,
     attachment: { type: "hook_additional_context", hookName, hookEvent: "UserPromptSubmit", toolUseID: "hook-id", content: parts },
@@ -336,7 +335,7 @@ test("submit attachment clocks retain their human carrier; settings hooks and no
     assistant("answer", "clock", "opus", 2),
     user("followup", "answer", "still here", 3),
     attach("settings", "followup", "UserPromptSubmit", 4, reminder(clock)),
-    attach("other", "settings", "prompt.submit", 5, reminder(`new soul: fake\nnew brain: fake\n${clock} prose\n⌚ 29:88 · Mon, Nov 17, 2026\n⌚ 11:30 · Mon, Nov 17, 26`)),
+    attach("other", "settings", "prompt.submit", 5, reminder(`new soul: fake\nnew brain: fake\n${clock} prose\n⌚ 11:30 · Mon, Nov 17\n⌚ 29:88 · Mon, Nov 17, 2026\n⌚ 11:30 · Mon, Nov 17, 26`)),
   ];
   const read = readClaudeSession(jsonl(rows), "other", ["prompt", "answer", "followup"]);
   assert.equal(read.noteAt, Date.parse(at(1)));
@@ -344,12 +343,12 @@ test("submit attachment clocks retain their human carrier; settings hooks and no
   assert.equal(read.soul, undefined);
   assert.equal(read.model, "opus");
 
-  const legacy = readClaudeSession(jsonl([
+  const yearless = readClaudeSession(jsonl([
     user("prompt", null, "human prompt", 0),
-    attach("clock", "prompt", "prompt.submit", 1, reminder(legacyClock)),
+    attach("clock", "prompt", "prompt.submit", 1, reminder("⌚ 11:30 · Mon, Nov 17")),
   ]), "clock", ["prompt"]);
-  assert.equal(legacy.noteAt, Date.parse(at(1)));
-  assert.deepEqual(legacy.retainHandles, ["prompt"]);
+  assert.equal(yearless.noteAt, undefined);
+  assert.deepEqual(yearless.retainHandles, []);
 });
 
 test("soulless divider and new-soul reminders restore observed identity", () => {
@@ -472,7 +471,7 @@ test("actual captured row shape: system choice/divider, plugin wrapper, snapshot
       uuid: "fa832199-0381-429c-9fac-d77b2c4e1f7a", parentUuid: "8af4db0d-0e1b-418e-993d-3420ca5ed9c1",
       type: "user", timestamp: "2026-11-17T11:58:01.432Z", isSidechain: false, isMeta: true,
       origin: { kind: "plugin", name: "pi-souls" },
-      message: { role: "user", content: [{ type: "text", text: "<system-reminder>\n⌚ 19:58 · Tue, Nov 17\n</system-reminder>" }] },
+      message: { role: "user", content: [{ type: "text", text: "<system-reminder>\n⌚ 19:58 · Tue, Nov 17, 2026\n</system-reminder>" }] },
     },
     {
       uuid: "acada73f-025a-422e-83e9-743ae64eb63d", parentUuid: "fa832199-0381-429c-9fac-d77b2c4e1f7a",

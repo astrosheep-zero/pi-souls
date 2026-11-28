@@ -163,14 +163,17 @@ function reminderText(text: string): string {
   return (match ? match[1]! : text).trim();
 }
 
-const CLOCK_LINE = new RegExp(`^⌚ (?:[01]\\d|2[0-3]):[0-5]\\d · (?:${DAYS.join("|")}), (?:${MONTHS.join("|")}) (?:[1-9]|[12]\\d|3[01])(?:, \\d{4})?$`, "u");
+const CLOCK_LINE = new RegExp(`^⌚ (?:[01]\\d|2[0-3]):[0-5]\\d · (?:${DAYS.join("|")}), (?:${MONTHS.join("|")}) (?:[1-9]|[12]\\d|3[01]), \\d{4}$`, "u");
+
+const hasClockLine = (text: string): boolean =>
+  text.split(/\r?\n/).some((line) => CLOCK_LINE.test(line));
 
 function hasSubmitClock(row: Row): boolean {
   // Claude stores the submit hook name but no plugin origin on these attachments.
   const attachment = row.type === "attachment" && record(row.attachment) ? row.attachment : undefined;
   return attachment?.type === "hook_additional_context" && attachment.hookName === "prompt.submit"
     && Array.isArray(attachment.content) && attachment.content.some((part) =>
-      typeof part === "string" && reminderText(part).split(/\r?\n/).some((line) => CLOCK_LINE.test(line)));
+      typeof part === "string" && hasClockLine(reminderText(part)));
 }
 
 /** Selection and divider records are owned informational system notices. */
@@ -256,7 +259,7 @@ function inspect(row: Row, reading: Reading): Used {
       }
     }
   }
-  if (result.noteAt === undefined && at !== undefined && (reminder?.startsWith("⌚") || hasSubmitClock(row))) {
+  if (result.noteAt === undefined && at !== undefined && ((reminder !== undefined && hasClockLine(reminder)) || hasSubmitClock(row))) {
     result.noteAt = at;
     used.clock = true;
   }

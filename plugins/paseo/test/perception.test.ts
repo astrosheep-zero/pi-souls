@@ -23,14 +23,14 @@ function makeItem(text: string, details?: Record<string, unknown>, customType = 
 
 test("transforms legacy wrapped pi-souls perception tool_call into a stripped plugin timeline item", () => {
   const item = makeItem(
-    wrapReminder("⌚ 02:14 · Tue, Oct 27\n(1h since *human* was last present)"),
+    wrapReminder("⌚ 02:14 · Tue, Oct 27, 2026\n(1h since *human* was last present)"),
     { moment: "human", timestamp: 1761502440000 },
   );
   const result = perceptionTransformer.transform({ item });
   assert.equal(result?.items.length, 1);
   assert.equal(
     perceptionSchema.parse(result!.items[0]!.data).text,
-    "⌚ 02:14 · Tue, Oct 27\n(1h since *human* was last present)",
+    "⌚ 02:14 · Tue, Oct 27, 2026\n(1h since *human* was last present)",
   );
   assert.deepEqual(perceptionTransformer.transform({ item }), result);
   assert.equal(
