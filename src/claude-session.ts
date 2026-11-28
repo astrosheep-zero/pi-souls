@@ -163,7 +163,7 @@ function reminderText(text: string): string {
   return (match ? match[1]! : text).trim();
 }
 
-const CLOCK_LINE = new RegExp(`^⌚ (?:[01]\\d|2[0-3]):[0-5]\\d · (?:${DAYS.join("|")}), (?:${MONTHS.join("|")}) (?:[1-9]|[12]\\d|3[01])$`, "u");
+const CLOCK_LINE = new RegExp(`^⌚ (?:[01]\\d|2[0-3]):[0-5]\\d · (?:${DAYS.join("|")}), (?:${MONTHS.join("|")}) (?:[1-9]|[12]\\d|3[01])(?:, \\d{4})?$`, "u");
 
 function hasSubmitClock(row: Row): boolean {
   // Claude stores the submit hook name but no plugin origin on these attachments.

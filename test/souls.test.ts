@@ -469,17 +469,17 @@ test("builtin time perception returns reminders only for due human moments", asy
   const human: Moment = { kind: "human", text: "hi" };
   const say = (now: number, lastNoteAt?: number, absenceMs?: number, moment: Moment = human) =>
     timePerception(lastNoteAt)(moment, { ...worldFor({ now, sessionId: "s", cwd: "/", soul: "faye" }), absenceMs });
-  assert.deepEqual(await say(t0), [{ kind: "reminder", text: "⌚ 02:14 · Tue, Oct 27" }]);
+  assert.deepEqual(await say(t0), [{ kind: "reminder", text: "⌚ 02:14 · Tue, Oct 27, 2026" }]);
   assert.deepEqual(await say(t0 + HOUR_MS - 1, t0, 3 * HOUR_MS), []);
-  assert.deepEqual(await say(t0 + HOUR_MS, t0, 20 * 60_000), [{ kind: "reminder", text: "⌚ 03:14 · Tue, Oct 27" }]);
+  assert.deepEqual(await say(t0 + HOUR_MS, t0, 20 * 60_000), [{ kind: "reminder", text: "⌚ 03:14 · Tue, Oct 27, 2026" }]);
   for (const [absenceMs, elapsed] of [[HOUR_MS, "1h"], [6 * HOUR_MS + 20 * 60_000, "6h 20m"], [74 * HOUR_MS, "3d 2h"]] as const) {
-    assert.deepEqual(await say(t0, undefined, absenceMs), [{ kind: "reminder", text: `⌚ 02:14 · Tue, Oct 27\n(${elapsed} since *human* was last present)` }]);
+    assert.deepEqual(await say(t0, undefined, absenceMs), [{ kind: "reminder", text: `⌚ 02:14 · Tue, Oct 27, 2026\n(${elapsed} since *human* was last present)` }]);
   }
   assert.deepEqual(await say(t0, undefined, undefined, { kind: "wake", source: "resume" }), []);
   assert.deepEqual(await say(t0, undefined, undefined, { kind: "tool", phase: "before", category: "reading", toolName: "read" }), []);
   for (const invalid of [NaN, Infinity, -Infinity]) {
     assert.deepEqual(await say(invalid), []);
-    assert.deepEqual(await say(t0, invalid, invalid), [{ kind: "reminder", text: "⌚ 02:14 · Tue, Oct 27" }]);
+    assert.deepEqual(await say(t0, invalid, invalid), [{ kind: "reminder", text: "⌚ 02:14 · Tue, Oct 27, 2026" }]);
   }
   assert.deepEqual(await say(t0, t0 + HOUR_MS), []);
 });
@@ -529,7 +529,7 @@ test("Pi time awareness sends visible perceptions, throttles hourly and follows 
     assert.equal(await start(), undefined);
     timeaware = undefined;
     const first = await start();
-    assert.deepEqual(first, { customType: PERCEPTION_MESSAGE_TYPE, display: true, details: { kinds: ["reminder"], moment: "human", timestamp: t0 }, content: [{ type: "text", text: "⌚ 02:14 · Tue, Oct 27" }] });
+    assert.deepEqual(first, { customType: PERCEPTION_MESSAGE_TYPE, display: true, details: { kinds: ["reminder"], moment: "human", timestamp: t0 }, content: [{ type: "text", text: "⌚ 02:14 · Tue, Oct 27, 2026" }] });
     const firstNoteId = session.getLeafId()!;
     assert.equal(await start({ messageType: "custom" }), undefined);
     session.appendMessage({ role: "user", content: "hi", timestamp: t0 });
@@ -540,10 +540,10 @@ test("Pi time awareness sends visible perceptions, throttles hourly and follows 
     // A recent non-time perception must not delay the hourly clock refresh.
     session.appendCustomMessageEntry(PERCEPTION_MESSAGE_TYPE, "directory", false, { moment: "human" });
     now = t0 + 80 * 60_000;
-    assert.deepEqual((await start())?.content, [{ type: "text", text: "⌚ 03:34 · Tue, Oct 27" }]);
+    assert.deepEqual((await start())?.content, [{ type: "text", text: "⌚ 03:34 · Tue, Oct 27, 2026" }]);
     session.appendMessage({ role: "user", content: "back later", timestamp: now });
     now += 2 * HOUR_MS;
-    assert.deepEqual((await start())?.content, [{ type: "text", text: "⌚ 05:34 · Tue, Oct 27\n(2h since *human* was last present)" }]);
+    assert.deepEqual((await start())?.content, [{ type: "text", text: "⌚ 05:34 · Tue, Oct 27, 2026\n(2h since *human* was last present)" }]);
     assert.equal(await start(), undefined);
     session.branch(firstNoteId);
     assert.equal(lastTimeNoteTimestamp(session.getBranch()), t0);

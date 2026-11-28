@@ -21,7 +21,7 @@ var DAY_MS = 24 * HOUR_MS;
 function formatClock(date) {
   const hours = String(date.getHours()).padStart(2, "0");
   const minutes = String(date.getMinutes()).padStart(2, "0");
-  return `${hours}:${minutes} \xB7 ${DAYS[date.getDay()]}, ${MONTHS[date.getMonth()]} ${date.getDate()}`;
+  return `${hours}:${minutes} \xB7 ${DAYS[date.getDay()]}, ${MONTHS[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`;
 }
 function formatElapsed(ms) {
   if (ms >= DAY_MS) {
@@ -58,7 +58,7 @@ function encodeChoice(choice) {
       return `${CHOICE_PREFIX} defaults`;
   }
 }
-var CLOCK_LINE = new RegExp(`^\u231A (?:[01]\\d|2[0-3]):[0-5]\\d \xB7 (?:${DAYS.join("|")}), (?:${MONTHS.join("|")}) (?:[1-9]|[12]\\d|3[01])$`, "u");
+var CLOCK_LINE = new RegExp(`^\u231A (?:[01]\\d|2[0-3]):[0-5]\\d \xB7 (?:${DAYS.join("|")}), (?:${MONTHS.join("|")}) (?:[1-9]|[12]\\d|3[01])(?:, \\d{4})?$`, "u");
 
 // src/utterance.ts
 function isUtteranceKind(kind) {

@@ -813,12 +813,12 @@ test("Pi builtin and directory perceptions share a human moment and fail indepen
     assert.equal(said.base.now, now);
     const renderer = h.messageRenderers.get(PERCEPTION_MESSAGE_TYPE)!;
     const rendered = renderer(
-      { customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder("⌚ 02:14 · Tue, Oct 27\n(1h since *human* was last present)") },
+      { customType: PERCEPTION_MESSAGE_TYPE, content: wrapReminder("⌚ 02:14 · Tue, Oct 27, 2026\n(1h since *human* was last present)") },
       { expanded: false, outputPad: 1 },
       { fg: (_tone: string, text: string) => text },
     );
     assert.deepEqual(rendered.render(80).map((line: string) => line.trimEnd()), [
-      " ╷ ⌚ 02:14 · Tue, Oct 27",
+      " ╷ ⌚ 02:14 · Tue, Oct 27, 2026",
       " ╵ (1h since *human* was last present)",
     ]);
 

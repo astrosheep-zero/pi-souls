@@ -5,11 +5,11 @@ export const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "
 export const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 
-/** Watch-face style: big time first, then the small date window. No year, like a real watch. */
+/** Watch-face style: big time first, then the calendar date with year. */
 export function formatClock(date: Date): string {
   const hours = String(date.getHours()).padStart(2, "0");
   const minutes = String(date.getMinutes()).padStart(2, "0");
-  return `${hours}:${minutes} · ${DAYS[date.getDay()]}, ${MONTHS[date.getMonth()]} ${date.getDate()}`;
+  return `${hours}:${minutes} · ${DAYS[date.getDay()]}, ${MONTHS[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`;
 }
 
 export function formatElapsed(ms: number): string {
